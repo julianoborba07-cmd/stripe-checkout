@@ -6,67 +6,92 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-
-// ✅ Inicializa Stripe com chave secreta
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// ✅ Middlewares
 app.use(cors({
-  origin: ["https://lltouch.com", "http://localhost:3000"] // seu site + testes locais
+  origin: ["https://lltouch.com", "http://localhost:3000"]
 }));
 app.use(express.json());
 
 /* ==============================
-  ✅ Rota raiz (teste de vida)
+  TABELA DE PREÇOS (ÚNICA FONTE)
+  valores em CENTAVOS
 ============================== */
-app.get("/", (req, res) => {
-  res.send("API Stripe Checkout funcionando 🚀");
-});
+const PRICE_TABLE = {
+  "single": {
+    name: "LL Signature – Single Session",
+    price: 16500
+  },
+  "three": {
+    name: "LL Signature – 3 Sessions",
+    price: 46500
+  },
+  addons: {
+    none: null,
+    led10: { name: "LED (10 min)", price: 3000 },
+    led20: { name: "LED (20 min)", price: 5000 },
+    peel: { name: "Peel", price: 6500 }
+  }
+};
 
 /* ==============================
-  1️⃣ Create Stripe Checkout Session
+  ROTA DE CHECKOUT
 ============================== */
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { items } = req.body;
+    const { packageId, addonId } = req.body;
 
-    if (!items || items.length === 0) {
-      return res.status(400).json({ error: "Cart is empty" });
+    if (!PRICE_TABLE[packageId]) {
+      return res.status(400).json({ error: "Invalid package" });
     }
 
-    // Mapeia itens para o formato Stripe
-    const line_items = items.map(item => ({
-      price_data: {
-        currency: "usd", // Moeda em USD
-        product_data: {
-          name: item.name,
-          description: item.description || ""
+    const line_items = [
+      {
+        price_data: {
+          currency: "usd",
+          product_data: {
+            name: PRICE_TABLE[packageId].name
+          },
+          unit_amount: PRICE_TABLE[packageId].price
         },
-        unit_amount: Math.round(item.price * 100) // converte para centavos
-      },
-      quantity: item.quantity
-    }));
+        quantity: 1
+      }
+    ];
 
-    // Cria sessão de checkout
+    if (addonId && addonId !== "none") {
+      const addon = PRICE_TABLE.addons[addonId];
+      if (!addon) {
+        return res.status(400).json({ error: "Invalid addon" });
+      }
+
+      line_items.push({
+        price_data: {
+          currency: "usd",
+          product_data: { name: addon.name },
+          unit_amount: addon.price
+        },
+        quantity: 1
+      });
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items,
       success_url: "https://lltouch.com/success",
-      cancel_url: "https://lltouch.com/cancel",
-      locale: "en"
+      cancel_url: "https://lltouch.com/cancel"
     });
 
-    // Retorna URL para redirecionamento
     res.json({ url: session.url });
 
-  } catch (error) {
-    console.error("Stripe error:", error);
-    res.status(500).json({ error: "Error creating checkout session" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Stripe error" });
   }
 });
 
-/* ==============================
-  2️⃣ Start Server
-============================== */
+app.get("/", (_, res) => {
+  res.send("Stripe API running 🚀");
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log("Server running on port", PORT));
