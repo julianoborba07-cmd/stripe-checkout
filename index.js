@@ -6,10 +6,20 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
+
+// ✅ Inicializa o Stripe com a chave secreta
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// ✅ Middlewares
 app.use(cors());
 app.use(express.json());
+
+/* ==============================
+  ✅ Rota raiz (teste de vida)
+============================== */
+app.get("/", (req, res) => {
+  res.send("API Stripe Checkout funcionando 🚀");
+});
 
 /* ==============================
   1️⃣ Create Stripe Checkout Session
@@ -29,29 +39,29 @@ app.post("/create-checkout-session", async (req, res) => {
           name: item.name,
           description: item.description || ""
         },
-        unit_amount: Math.round(item.price * 100) // Stripe expects cents
+        unit_amount: Math.round(item.price * 100) // Stripe usa centavos
       },
       quantity: item.quantity
     }));
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      line_items: line_items,
+      line_items,
       success_url: "https://lltouch.com/success",
       cancel_url: "https://lltouch.com/cancel",
-      locale: "en" // checkout in English
+      locale: "en"
     });
 
     res.json({ url: session.url });
 
   } catch (error) {
-    console.error(error);
+    console.error("Stripe error:", error);
     res.status(500).json({ error: "Error creating checkout session" });
   }
 });
 
 /* ==============================
-  2️⃣ Start Server
+  2️⃣ Start Server (Render)
 ============================== */
 const PORT = process.env.PORT || 3000;
 
