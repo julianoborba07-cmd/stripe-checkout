@@ -22,7 +22,7 @@ const PRICE_TABLE = {
   "single-led20": "price_1StqhLLVWAMw3iFesS17pRjR",
   "single-peel": "price_1StqhlLVWAMw3iFemTTki7vK",
   "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
-  "3-led10": "price_1StioLVWAMw3iFeAm59s0Xt",
+  "3-led10": "price_1StqioLVWAMw3iFeAm59s0Xt",
   "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
   "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF"
 };
@@ -39,17 +39,16 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     // Mapear itens do carrinho para line_items usando Price IDs
-    const line_items = items.map(item => {
-      const key = `${item.packageId}-${item.addonId}`;
-      const priceId = PRICE_TABLE[key];
+const line_items = items.map(item => {
+  if (!item.price || !item.quantity) {
+    throw new Error("Invalid item format");
+  }
 
-      if (!priceId) throw new Error(`Invalid item key: ${key}`);
-
-      return {
-        price: priceId,
-        quantity: item.quantity || 1
-      };
-    });
+  return {
+    price: item.price,
+    quantity: item.quantity
+  };
+});
 
     // Criar sessão de checkout Stripe
     const session = await stripe.checkout.sessions.create({
