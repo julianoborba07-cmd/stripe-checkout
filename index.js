@@ -14,18 +14,17 @@ app.use(cors({
 app.use(express.json());
 
 /* ==============================
-  TABELA DE PREÇOS (ÚNICA FONTE)
-  valores em CENTAVOS
+  TABELA DE PREÇOS (Stripe Price IDs)
 ============================== */
 const PRICE_TABLE = {
-  "single": { name: "LL Signature – Single Session", price: 16500 },
-  "three": { name: "LL Signature – 3 Sessions", price: 46500 },
-  addons: {
-    none: null,
-    led10: { name: "LED (10 min)", price: 3000 },
-    led20: { name: "LED (20 min)", price: 5000 },
-    peel: { name: "Peel", price: 6500 }
-  }
+  "single-none": "price_1StqevLVWAMw3iFer0kW5wBq",
+  "single-led10": "price_1StqgqLVWAMw3iFe9k2tD5rT",
+  "single-led20": "price_1StqhLLVWAMw3iFesS17pRjR",
+  "single-peel": "price_1StqhlLVWAMw3iFemTTki7vK",
+  "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
+  "3-led10": "price_1StioLVWAMw3iFeAm59s0Xt",
+  "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
+  "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF"
 };
 
 /* ==============================
@@ -39,40 +38,20 @@ app.post("/create-checkout-session", async (req, res) => {
       return res.status(400).json({ error: "No items provided" });
     }
 
-    const line_items = [];
+    // Mapear itens do carrinho para line_items usando Price IDs
+    const line_items = items.map(item => {
+      const key = `${item.packageId}-${item.addonId}`;
+      const priceId = PRICE_TABLE[key];
 
-    // Processa cada item do carrinho
-    items.forEach(item => {
-      const { packageId, addonId, quantity } = item;
+      if (!priceId) throw new Error(`Invalid item key: ${key}`);
 
-      if (!PRICE_TABLE[packageId]) throw new Error(`Invalid package: ${packageId}`);
-
-      // Pacote
-      line_items.push({
-        price_data: {
-          currency: "usd",
-          product_data: { name: PRICE_TABLE[packageId].name },
-          unit_amount: PRICE_TABLE[packageId].price
-        },
-        quantity: quantity || 1
-      });
-
-      // Add-on
-      if (addonId && addonId !== "none") {
-        const addon = PRICE_TABLE.addons[addonId];
-        if (!addon) throw new Error(`Invalid addon: ${addonId}`);
-
-        line_items.push({
-          price_data: {
-            currency: "usd",
-            product_data: { name: addon.name },
-            unit_amount: addon.price
-          },
-          quantity: quantity || 1
-        });
-      }
+      return {
+        price: priceId,
+        quantity: item.quantity || 1
+      };
     });
 
+    // Criar sessão de checkout Stripe
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items,
