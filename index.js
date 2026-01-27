@@ -16,15 +16,37 @@ app.use(express.json());
 /* ==============================
   TABELA DE PREÇOS (Stripe Price IDs)
 ============================== */
-const PRICE_TABLE = {
-  "single-none": "price_1StqevLVWAMw3iFer0kW5wBq",
-  "single-led10": "price_1StqgqLVWAMw3iFe9k2tD5rT",
-  "single-led20": "price_1StqhLLVWAMw3iFesS17pRjR",
-  "single-peel": "price_1StqhlLVWAMw3iFemTTki7vK",
-  "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
-  "3-led10": "price_1StqioLVWAMw3iFeAm59s0Xt",
-  "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
-  "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF"
+const priceMap = {
+  "ll-signature": {
+    "single-none": "price_1StqevLVWAMw3iFer0kW5wBq",
+    "single-led10": "price_1StqgqLVWAMw3iFe9k2tD5rT",
+    "single-led20": "price_1StqhLLVWAMw3iFesS17pRjR",
+    "single-peel": "price_1StqhlLVWAMw3iFemTTki7vK",
+    "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
+    "3-led10": "price_1StqioLVWAMw3iFeAm59s0Xt",
+    "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
+    "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF"
+  },
+  "classic-deluxe": {
+    "single-none": "price_1SuEXILVWAMw3iFeEzZhwlVJ",
+    "single-led10": "price_1SuEYELVWAMw3iFefiIqcGFR",
+    "single-led20": "price_1SuEYnLVWAMw3iFewE4dpv9l",
+    "single-peel": "price_1SuEZPLVWAMw3iFe7tYRV0oU",
+    "3-none": "price_1SuEbGLVWAMw3iFeeieTxip5",
+    "3-led10": "price_1SuEc1LVWAMw3iFey3J96baH",
+    "3-led20": "price_1SuEd6LVWAMw3iFebVOUfGLQ",
+    "3-peel": "price_1SuEdmLVWAMw3iFeJLmbA2Q0"
+  },
+  "ll-teen": {
+    "single-none": "price_1SuEejLVWAMw3iFedQAwSrU6",
+    "single-led10": "price_1SuEfLLVWAMw3iFermWmmr34",
+    "single-led20": "price_1SuEfvLVWAMw3iFe3kb7eqUJ",
+    "single-peel": "price_1SuEgGLVWAMw3iFeVHNgvu91",
+    "3-none": "price_1SuEgsLVWAMw3iFeILBNpjT1",
+    "3-led10": "price_1SuEhaLVWAMw3iFew6XXmiTM",
+    "3-led20": "price_1SuEi5LVWAMw3iFewusx6G2v",
+    "3-peel": "price_1SuEiLLVWAMw3iFe8YD0gUZy"
+  }
 };
 
 /* ==============================
@@ -32,23 +54,25 @@ const PRICE_TABLE = {
 ============================== */
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { items } = req.body; // espera array [{ packageId, addonId, quantity }]
+    const { items } = req.body; // espera array [{ service, key, quantity }]
 
-    if (!items || !Array.isArray(items) || items.length === 0) {
+    if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "No items provided" });
     }
 
-    // Mapear itens do carrinho para line_items usando Price IDs
-const line_items = items.map(item => {
-  if (!item.price || !item.quantity) {
-    throw new Error("Invalid item format");
-  }
+    // Mapear itens do carrinho para line_items usando priceMap
+    const line_items = items.map(item => {
+      const priceId = priceMap[item.service]?.[item.key];
 
-  return {
-    price: item.price,
-    quantity: item.quantity
-  };
-});
+      if (!priceId || !item.quantity || item.quantity < 1) {
+        throw new Error(`Invalid item: service=${item.service}, key=${item.key}`);
+      }
+
+      return {
+        price: priceId,
+        quantity: item.quantity
+      };
+    });
 
     // Criar sessão de checkout Stripe
     const session = await stripe.checkout.sessions.create({
@@ -59,7 +83,6 @@ const line_items = items.map(item => {
     });
 
     res.json({ url: session.url });
-
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || "Stripe error" });
