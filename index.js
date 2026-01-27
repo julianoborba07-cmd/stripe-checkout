@@ -62,17 +62,15 @@ app.post("/create-checkout-session", async (req, res) => {
 
     // Mapear itens do carrinho para line_items usando priceMap
     const line_items = items.map(item => {
-      const priceId = priceMap[item.service]?.[item.key];
+  if (!item.price || !item.quantity) {
+    throw new Error("Invalid item data");
+  }
 
-      if (!priceId || !item.quantity || item.quantity < 1) {
-        throw new Error(`Invalid item: service=${item.service}, key=${item.key}`);
-      }
-
-      return {
-        price: priceId,
-        quantity: item.quantity
-      };
-    });
+  return {
+    price: item.price,
+    quantity: item.quantity
+  };
+});
 
     // Criar sessão de checkout Stripe
     const session = await stripe.checkout.sessions.create({
