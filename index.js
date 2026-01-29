@@ -17,6 +17,28 @@ app.use(express.json());
   TABELA DE PREÇOS (Stripe Price IDs)
 ============================== */
 const priceMap = {
+  laser: {
+    small: {
+      single: "price_1Sv2ExLVWAMw3iFedZ6vFjav",
+      6: "price_1Sv2GKLVWAMw3iFeN9zMligM",
+      8: "price_1Sv2GkLVWAMw3iFe5JQYNmyz"
+    },
+    medium: {
+      single: "price_1Sv2IcLVWAMw3iFeoadLWZQa",
+      6: "price_1Sv2JmLVWAMw3iFe7xLMmPow",
+      8: "price_1Sv2KALVWAMw3iFen8mPo7yZ"
+    },
+    large: {
+      single: "price_1Sv2M2LVWAMw3iFe3BavpQJO",
+      6: "price_1Sv2MaLVWAMw3iFeHcHi1TLZ",
+      8: "price_1Sv2N4LVWAMw3iFePan3vdsc"
+    },
+    xlarge: {
+      single: "price_1Sv2NvLVWAMw3iFe73PwJ0u4",
+      6: "price_1Sv2OwLVWAMw3iFeY7kKQSzl",
+      8: "price_1Sv2PQLVWAMw3iFeYiWPlDxM"
+    }
+  },
   "ll-signature": {
     "single-none": "price_1StqevLVWAMw3iFer0kW5wBq",
     "single-led10": "price_1StqgqLVWAMw3iFe9k2tD5rT",
@@ -48,7 +70,22 @@ const priceMap = {
     "3-peel": "price_1SuEiLLVWAMw3iFe8YD0gUZy"
   }
 };
+function getAllValidPrices(priceMap) {
+  const prices = [];
 
+  function extract(obj) {
+    Object.values(obj).forEach(value => {
+      if (typeof value === "string") {
+        prices.push(value);
+      } else if (typeof value === "object") {
+        extract(value);
+      }
+    });
+  }
+
+  extract(priceMap);
+  return prices;
+}
 /* ==============================
   ROTA DE CHECKOUT (MULTI-ITEM)
 ============================== */
@@ -61,15 +98,42 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     // Mapear itens do carrinho para line_items usando priceMap
-    const line_items = items.map(item => {
-  if (!item.price || !item.quantity) {
-    throw new Error("Invalid item data");
+const line_items = items.map(item => {
+  // ======================
+  // LASER
+  // ======================
+  if (item.type === "laser") {
+    const price =
+      priceMap.laser?.[item.area]?.[item.package];
+
+    if (!price) {
+      throw new Error("Invalid laser item");
+    }
+
+    return {
+      price,
+      quantity: item.quantity
+    };
   }
 
-  return {
-    price: item.price,
-    quantity: item.quantity
-  };
+  // ======================
+  // FACIAL
+  // ======================
+  if (item.type === "facial") {
+    const price =
+      priceMap?.[item.service]?.[item.key];
+
+    if (!price) {
+      throw new Error("Invalid facial item");
+    }
+
+    return {
+      price,
+      quantity: item.quantity
+    };
+  }
+
+  throw new Error("Invalid item type");
 });
 
     // Criar sessão de checkout Stripe
