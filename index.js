@@ -39,6 +39,20 @@ const priceMap = {
       8: "price_1Sv2PQLVWAMw3iFeYiWPlDxM"
     }
   },
+  "full-body": {
+  single: {
+    none: "price_1SvmuWLVWAMw3iFe6G7zVtgQ",
+    fullface: "price_1SvmwjLVWAMw3iFenlsJHaWU"
+  },
+  6: {
+    none: "price_1SvmxsLVWAMw3iFe7DU1aRwk",
+    fullface: "price_1Svn0ULVWAMw3iFebOifqGLa"
+  },
+  8: {
+    none: "price_1Svn24LVWAMw3iFep1e0Mpmb",
+    fullface: "price_1Svn2qLVWAMw3iFew7lsbArO"
+  }
+},
   "ll-signature": {
     "single-none": "price_1StqevLVWAMw3iFer0kW5wBq",
     "single-led10": "price_1StqgqLVWAMw3iFe9k2tD5rT",
@@ -133,6 +147,34 @@ const line_items = items.map(item => {
     };
   }
 
+  // ======================
+  // FULL BODY 👇👇👇
+  // ======================
+  // ======================
+// FULL BODY
+// ======================
+if (item.type === "full-body") {
+  const price =
+    priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
+
+  if (!price) {
+    throw new Error("Invalid full body item");
+  }
+
+  return {
+    price,
+    quantity: item.quantity,
+    metadata: {
+      services: Array.isArray(item.services)
+        ? item.services
+            .map(s => s.name || s.service || s.title || "")
+            .filter(Boolean)
+            .join(", ")
+        : ""
+    }
+  };
+}
+  // ❗️SE NÃO FOR NENHUM DOS ACIMA
   throw new Error("Invalid item type");
 });
 
