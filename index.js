@@ -40,19 +40,19 @@ const priceMap = {
     }
   },
   "full-body": {
-  single: {
-    none: "price_1SvmuWLVWAMw3iFe6G7zVtgQ",
-    fullface: "price_1SvmwjLVWAMw3iFenlsJHaWU"
+    single: {
+      none: "price_1SvmuWLVWAMw3iFe6G7zVtgQ",
+      fullface: "price_1SvmwjLVWAMw3iFenlsJHaWU"
+    },
+    6: {
+      none: "price_1SvmxsLVWAMw3iFe7DU1aRwk",
+      fullface: "price_1Svn0ULVWAMw3iFebOifqGLa"
+    },
+    8: {
+      none: "price_1Svn24LVWAMw3iFep1e0Mpmb",
+      fullface: "price_1Svn2qLVWAMw3iFew7lsbArO"
+    }
   },
-  6: {
-    none: "price_1SvmxsLVWAMw3iFe7DU1aRwk",
-    fullface: "price_1Svn0ULVWAMw3iFebOifqGLa"
-  },
-  8: {
-    none: "price_1Svn24LVWAMw3iFep1e0Mpmb",
-    fullface: "price_1Svn2qLVWAMw3iFew7lsbArO"
-  }
-},
   "ll-signature": {
     "single-none": "price_1StqevLVWAMw3iFer0kW5wBq",
     "single-led10": "price_1StqgqLVWAMw3iFe9k2tD5rT",
@@ -82,8 +82,59 @@ const priceMap = {
     "3-led10": "price_1SuEhaLVWAMw3iFew6XXmiTM",
     "3-led20": "price_1SuEi5LVWAMw3iFewusx6G2v",
     "3-peel": "price_1SuEiLLVWAMw3iFe8YD0gUZy"
+  },
+  "med-spa": {
+    microneedling: {
+      single: {
+        none: "price_1SxA01LVWAMw3iFesKpaxZvz",
+        exosomes: "price_1SxA0VLVWAMw3iFeDjB6cXS9",
+        neck: "price_1SxA1bLVWAMw3iFeENwK7Pjo",
+        "exo-neck": "price_1SxAu4LVWAMw3iFe0xzdQLj6"
+      },
+      3: {
+        none: "price_1SxA2lLVWAMw3iFeOfMnlep9",
+        exosomes: "price_1SxA3LLVWAMw3iFeJWCBn4w9",
+        neck: "price_1SxA4pLVWAMw3iFekvmzRRtg",
+        "exo-neck": "price_1SxAvcLVWAMw3iFemyVhJy70"
+      }
+    },
+    llumigold: {
+      single: {
+        none: "price_1SxA5mLVWAMw3iFeifsFKOFW",
+        exosomes: "price_1SxA6YLVWAMw3iFe3Rv6fPhS",
+        neck: "price_1SxA7FLVWAMw3iFeBJydTb8W",
+        "exo-neck": "price_1SxAwrLVWAMw3iFew3fsdrha"
+      },
+      3: {
+        none: "price_1SxA85LVWAMw3iFeG1JZ19Lu",
+        exosomes: "price_1SxA8eLVWAMw3iFeGKRTsEEX",
+        neck: "price_1SxA9LLVWAMw3iFeShWxtdjh",
+        "exo-neck": "price_1SxAy7LVWAMw3iFeS4ctcll6"
+      }
+    },
+    "laser-facial": {
+      single: {
+        none: "price_1SxABRLVWAMw3iFe7vYyqaVW"
+      },
+      3: {
+        none: "price_1SxAEuLVWAMw3iFeNSwQFrR5"
+      }
+    },
+    "glow-up-laser-facial": {
+      single: {
+        none: "price_1SxAKsLVWAMw3iFeyKH4OSTl",
+        decollete: "price_1SxASrLVWAMw3iFeieILAe3T",
+        neck: "price_1SxATvLVWAMw3iFeu78Ak5Xr"
+      },
+      3: {
+        none: "price_1SxAUjLVWAMw3iFeTVxGy05w",
+        decollete: "price_1SxAVeLVWAMw3iFeXpnKTDlr",
+        neck: "price_1SxAWsLVWAMw3iFesU5eyyWC"
+      }
+    }
   }
 };
+
 function getAllValidPrices(priceMap) {
   const prices = [];
 
@@ -100,83 +151,99 @@ function getAllValidPrices(priceMap) {
   extract(priceMap);
   return prices;
 }
+
 /* ==============================
   ROTA DE CHECKOUT (MULTI-ITEM)
 ============================== */
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { items } = req.body; // espera array [{ service, key, quantity }]
+    const { items } = req.body; // espera array [{ service, key, quantity, type, package, addon }]
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "No items provided" });
     }
 
     // Mapear itens do carrinho para line_items usando priceMap
-const line_items = items.map(item => {
-  // ======================
-  // LASER
-  // ======================
-  if (item.type === "laser") {
-    const price =
-      priceMap.laser?.[item.area]?.[item.package];
+    const line_items = items.map(item => {
+      // ======================
+      // LASER
+      // ======================
+      if (item.type === "laser") {
+        const price =
+          priceMap.laser?.[item.area]?.[item.package];
 
-    if (!price) {
-      throw new Error("Invalid laser item");
-    }
+        if (!price) {
+          throw new Error("Invalid laser item");
+        }
 
-    return {
-      price,
-      quantity: item.quantity
-    };
-  }
+        return {
+          price,
+          quantity: item.quantity
+        };
+      }
 
-  // ======================
-  // FACIAL
-  // ======================
-  if (item.type === "facial") {
-    const price =
-      priceMap?.[item.service]?.[item.key];
+      // ======================
+      // FACIAL
+      // ======================
+      if (item.type === "facial") {
+        const price =
+          priceMap?.[item.service]?.[item.key];
 
-    if (!price) {
-      throw new Error("Invalid facial item");
-    }
+        if (!price) {
+          throw new Error("Invalid facial item");
+        }
 
-    return {
-      price,
-      quantity: item.quantity
-    };
-  }
+        return {
+          price,
+          quantity: item.quantity
+        };
+      }
 
-  // ======================
-  // FULL BODY 👇👇👇
-  // ======================
-  // ======================
-// FULL BODY
-// ======================
-if (item.type === "full-body") {
-  const price =
-    priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
+      // ======================
+      // FULL BODY
+      // ======================
+      if (item.type === "full-body") {
+        const price =
+          priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
 
-  if (!price) {
-    throw new Error("Invalid full body item");
-  }
+        if (!price) {
+          throw new Error("Invalid full body item");
+        }
 
-  return {
-    price,
-    quantity: item.quantity,
-    metadata: {
-      services: Array.isArray(item.services)
-        ? item.services
-            .map(s => s.name || s.service || s.title || "")
-            .filter(Boolean)
-            .join(", ")
-        : ""
-    }
-  };
-}
-  // ❗️SE NÃO FOR NENHUM DOS ACIMA
-  throw new Error("Invalid item type");
-});
+        return {
+          price,
+          quantity: item.quantity,
+          metadata: {
+            services: Array.isArray(item.services)
+              ? item.services
+                  .map(s => s.name || s.service || s.title || "")
+                  .filter(Boolean)
+                  .join(", ")
+              : ""
+          }
+        };
+      }
+
+      // ======================
+      // MED SPA
+      // ======================
+      if (item.type === "med-spa") {
+        const price =
+          priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
+
+        if (!price) {
+          throw new Error("Invalid med-spa item");
+        }
+
+        return {
+          price,
+          quantity: item.quantity
+        };
+      }
+
+      // ❗️SE NÃO FOR NENHUM DOS ACIMA
+      throw new Error("Invalid item type");
+    });
 
     // Criar sessão de checkout Stripe
     const session = await stripe.checkout.sessions.create({
@@ -197,3 +264,4 @@ app.get("/", (_, res) => res.send("Stripe API running 🚀"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
+
