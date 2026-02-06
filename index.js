@@ -135,133 +135,96 @@ const priceMap = {
   }
 };
 
-function getAllValidPrices(priceMap) {
-  const prices = [];
-
-  function extract(obj) {
-    Object.values(obj).forEach(value => {
-      if (typeof value === "string") {
-        prices.push(value);
-      } else if (typeof value === "object") {
-        extract(value);
-      }
-    });
-  }
-
-  extract(priceMap);
-  return prices;
-}
-
 /* ==============================
-  ROTA DE CHECKOUT (MULTI-ITEM)
+  ROTA DE CHECKOUT
 ============================== */
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { items } = req.body; // espera array [{ service, key, quantity, type, package, addon }]
+    const { items } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "No items provided" });
     }
 
-    // Mapear itens do carrinho para line_items usando priceMap
     const line_items = items.map(item => {
-      // ======================
-      // LASER
-      // ======================
       if (item.type === "laser") {
-        const price =
-          priceMap.laser?.[item.area]?.[item.package];
-
-        if (!price) {
-          throw new Error("Invalid laser item");
-        }
-
-        return {
-          price,
-          quantity: item.quantity
-        };
+        const price = priceMap.laser?.[item.area]?.[item.package];
+        if (!price) throw new Error("Invalid laser item");
+        return { price, quantity: item.quantity };
       }
 
-      // ======================
-      // FACIAL
-      // ======================
       if (item.type === "facial") {
-        const price =
-          priceMap?.[item.service]?.[item.key];
-
-        if (!price) {
-          throw new Error("Invalid facial item");
-        }
-
-        return {
-          price,
-          quantity: item.quantity
-        };
+        const price = priceMap?.[item.service]?.[item.key];
+        if (!price) throw new Error("Invalid facial item");
+        return { price, quantity: item.quantity };
       }
 
-      // ======================
-      // FULL BODY
-      // ======================
       if (item.type === "full-body") {
-        const price =
-          priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
-
-        if (!price) {
-          throw new Error("Invalid full body item");
-        }
-
-        return {
-          price,
-          quantity: item.quantity,
-          metadata: {
-            services: Array.isArray(item.services)
-              ? item.services
-                  .map(s => s.name || s.service || s.title || "")
-                  .filter(Boolean)
-                  .join(", ")
-              : ""
-          }
-        };
+        const price = priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
+        if (!price) throw new Error("Invalid full body item");
+        return { price, quantity: item.quantity };
       }
 
-      // ======================
-      // MED SPA
-      // ======================
       if (item.type === "med-spa") {
-        const price =
-          priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
-
-        if (!price) {
-          throw new Error("Invalid med-spa item");
-        }
-
-        return {
-          price,
-          quantity: item.quantity
-        };
+        const price = priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
+        if (!price) throw new Error("Invalid med-spa item");
+        return { price, quantity: item.quantity };
       }
 
-      // ❗️SE NÃO FOR NENHUM DOS ACIMA
       throw new Error("Invalid item type");
     });
 
-    // Criar sessão de checkout Stripe
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items,
-      success_url: "https://lltouch.com/success",
+      success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel"
     });
 
     res.json({ url: session.url });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message || "Stripe error" });
+    res.status(500).json({ error: err.message });
   }
 });
 
+/* ==============================
+  ROTA PARA CONFIRMAÇÃO DE PAGAMENTO
+============================== */
+app.get("/checkout-session/:sessionId", async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.retrieve(
+      req.params.sessionId,
+      { expand: ["line_items.data.price.product"] }
+    );
+
+    if (session.payment_status !== "paid") {
+      return res.status(400).json({ error: "Pagamento não confirmado" });
+    }
+
+    const items = session.line_items.data.map(item => ({
+      name: item.price.product.name,
+      description: item.price.product.description,
+      quantity: item.quantity,
+      amount: item.amount_total / 100
+    }));
+
+    res.json({
+      id: session.id,
+      email: session.customer_details?.email,
+      total: session.amount_total / 100,
+      items
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro ao buscar sessão" });
+  }
+});
+
+/* ==============================
+  ROTA TESTE
+============================== */
 app.get("/", (_, res) => res.send("Stripe API running 🚀"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
-
