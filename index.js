@@ -17,6 +17,18 @@ app.use(express.json());
   TABELA DE PREÇOS (Stripe Price IDs)
 ============================== */
 const priceMap = {
+  membership: {
+    platinum: {
+      "6": "price_1SyuFlLVWAMw3iFeAAU7GR1e"
+    },
+    gold: {
+      "6": "price_1SyuGnLVWAMw3iFe3U8Y81SF"
+    },
+    teen: {
+      "6": "price_1SyuHuLVWAMw3iFetbcoodh2"
+    }
+  },
+
   laser: {
     small: {
       single: "price_1Sv2ExLVWAMw3iFedZ6vFjav",
@@ -147,32 +159,40 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     const line_items = items.map(item => {
-      if (item.type === "laser") {
-        const price = priceMap.laser?.[item.area]?.[item.package];
-        if (!price) throw new Error("Invalid laser item");
-        return { price, quantity: item.quantity };
-      }
+  if (item.type === "laser") {
+    const price = priceMap.laser?.[item.area]?.[item.package];
+    if (!price) throw new Error("Invalid laser item");
+    return { price, quantity: item.quantity };
+  }
 
-      if (item.type === "facial") {
-        const price = priceMap?.[item.service]?.[item.key];
-        if (!price) throw new Error("Invalid facial item");
-        return { price, quantity: item.quantity };
-      }
+  if (item.type === "facial") {
+    const price = priceMap?.[item.service]?.[item.key];
+    if (!price) throw new Error("Invalid facial item");
+    return { price, quantity: item.quantity };
+  }
 
-      if (item.type === "full-body") {
-        const price = priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
-        if (!price) throw new Error("Invalid full body item");
-        return { price, quantity: item.quantity };
-      }
+  if (item.type === "full-body") {
+    const price = priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
+    if (!price) throw new Error("Invalid full body item");
+    return { price, quantity: item.quantity };
+  }
 
-      if (item.type === "med-spa") {
-        const price = priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
-        if (!price) throw new Error("Invalid med-spa item");
-        return { price, quantity: item.quantity };
-      }
+  if (item.type === "med-spa") {
+    const price = priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
+    if (!price) throw new Error("Invalid med-spa item");
+    return { price, quantity: item.quantity };
+  }
 
-      throw new Error("Invalid item type");
-    });
+  // ✅ Novo bloco membership
+  if (item.type === "membership") {
+    const price = priceMap.membership?.[item.plan]?.[item.package];
+    if (!price) throw new Error("Invalid membership item");
+    return { price, quantity: item.quantity };
+  }
+
+  throw new Error("Invalid item type");
+});
+
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
