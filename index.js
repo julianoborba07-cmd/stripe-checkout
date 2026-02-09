@@ -143,6 +143,13 @@ const priceMap = {
         decollete: "price_1SxAVeLVWAMw3iFeXpnKTDlr",
         neck: "price_1SxAWsLVWAMw3iFesU5eyyWC"
       }
+    },
+    "peel": {
+      single: {
+        none: "price_1Syx4ULVWAMw3iFevqsTAPJj"
+      },
+      3: {
+        none: "price_1Syx58LVWAMw3iFe2rmfw0VF"
     }
   }
 };
