@@ -150,8 +150,9 @@ const priceMap = {
       },
       3: {
         none: "price_1Syx58LVWAMw3iFe2rmfw0VF"
-    }
-  }
+      }
+    }  
+  },  
 };
 
 /* ==============================
