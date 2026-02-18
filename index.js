@@ -2,18 +2,61 @@ import express from "express";
 import Stripe from "stripe";
 import cors from "cors";
 import dotenv from "dotenv";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// ==============================
+// SUPABASE
+// ==============================
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
+
+// ==============================
+// FUNÇÃO GET OR CREATE CUSTOMER
+// ==============================
+async function getOrCreateCustomer(email) {
+  let { data: customer } = await supabase
+    .from("customers")
+    .select("*")
+    .eq("email", email)
+    .single();
+
+  if (!customer) {
+    const { data } = await supabase
+      .from("customers")
+      .insert([
+        {
+          email,
+          lifetime_total: 0,
+          laser_total: 0,
+          cashback_balance: 0,
+          laser_tier: 0
+        }
+      ])
+      .select()
+      .single();
+
+    customer = data;
+  }
+
+  return customer;
+}
+
+// ==============================
 // CORS
+// ==============================
 app.use(
   cors({
     origin: ["https://lltouch.com", "http://localhost:3000"],
   })
 );
+
 app.use(express.json());
 
 /* ==============================
@@ -161,12 +204,7 @@ const otherServicesPrices = {
 };
 
 // ==============================
-// MOCK DE EMAILS USADOS (substituir por DB real)
-// ==============================
-const usedPromoEmails = new Set();
-
-// ==============================
-// ROTA DE CHECKOUT
+// CHECKOUT
 // ==============================
 app.post("/create-checkout-session", async (req, res) => {
   try {
@@ -175,7 +213,8 @@ app.post("/create-checkout-session", async (req, res) => {
     if (!Array.isArray(items) || items.length === 0)
       return res.status(400).json({ error: "No items provided" });
 
-    // ✅ Cria ou encontra customer no Stripe
+    const categories = [...new Set(items.map(item => item.type))];
+
     let customer;
     if (email) {
       const existingCustomers = await stripe.customers.list({ email, limit: 1 });
@@ -186,7 +225,6 @@ app.post("/create-checkout-session", async (req, res) => {
       }
     }
 
-    // ✅ Mapeia line_items
     const line_items = items.map((item) => {
       if (item.type === "laser") {
         const price = priceMap.laser?.[item.area]?.[item.package];
@@ -227,23 +265,20 @@ app.post("/create-checkout-session", async (req, res) => {
       throw new Error("Invalid item type");
     });
 
-    // ✅ Aplica cupom somente se não usado
-    const applyDiscount =
-      promoCode && !usedPromoEmails.has(email)
-        ? [{ promotion_code: promoCode }]
-        : [];
-
-    // ✅ Cria sessão
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer: customer?.id,
       line_items,
-      discounts: applyDiscount,
+      discounts: promoCode ? [{ promotion_code: promoCode }] : [],
+      metadata: {
+        categories: JSON.stringify(categories)
+      },
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel",
     });
 
     res.json({ url: session.url });
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -251,45 +286,15 @@ app.post("/create-checkout-session", async (req, res) => {
 });
 
 // ==============================
-// ROTA PARA CONFIRMAÇÃO DE PAGAMENTO
+// WEBHOOK
 // ==============================
-app.get("/checkout-session/:sessionId", async (req, res) => {
-  try {
-    const session = await stripe.checkout.sessions.retrieve(req.params.sessionId, {
-      expand: ["line_items.data.price.product"],
-    });
+app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
 
-    if (session.payment_status !== "paid") {
-      return res.status(400).json({ error: "Pagamento não confirmado" });
-    }
-
-    const items = session.line_items.data.map((item) => ({
-      name: item.price.product.name,
-      description: item.price.product.description,
-      quantity: item.quantity,
-      amount: item.amount_total / 100,
-    }));
-
-    res.json({
-      id: session.id,
-      email: session.customer_details?.email,
-      total: session.amount_total / 100,
-      items,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro ao buscar sessão" });
-  }
-});
-
-// ==============================
-// WEBHOOK PARA MARCAR EMAILS USADOS
-// ==============================
-app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
   const sig = req.headers["stripe-signature"];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
   let event;
+
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err) {
@@ -298,24 +303,95 @@ app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
   }
 
   if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-    if (session.customer_email) {
-      usedPromoEmails.add(session.customer_email);
-      console.log(`Promo applied to: ${session.customer_email}`);
+
+    const session = await stripe.checkout.sessions.retrieve(
+      event.data.object.id,
+      { expand: ["line_items.data.price"] }
+    );
+
+    const email = session.customer_details?.email;
+    if (!email) return res.json({ received: true });
+
+    const total = session.amount_total / 100;
+    const categories = JSON.parse(session.metadata?.categories || "[]");
+
+    const customer = await getOrCreateCustomer(email);
+
+    // =========================
+    // CALCULAR TOTAL POR CATEGORIA
+    // =========================
+    let laserTotal = 0;
+    let facialTotal = 0;
+
+    session.line_items.data.forEach(item => {
+      const category = item.price.metadata?.category;
+      const amount = item.amount_total / 100;
+
+      if (category === "laser") laserTotal += amount;
+      if (category === "facial") facialTotal += amount;
+    });
+
+    // =========================
+    // ATUALIZA LIFETIME
+    // =========================
+    await supabase.from("customers").update({
+      lifetime_total: (customer.lifetime_total || 0) + total
+    }).eq("email", email);
+
+    // =========================
+    // LASER CASHBACK
+    // =========================
+    if (laserTotal > 0) {
+
+      const newLaserTotal = (customer.laser_total || 0) + laserTotal;
+
+      let tier = 0;
+      if (newLaserTotal >= 3000) tier = 10;
+      else if (newLaserTotal >= 1500) tier = 7;
+      else if (newLaserTotal >= 500) tier = 5;
+
+      const cashbackEarned = (laserTotal * tier) / 100;
+
+      await supabase.from("customers").update({
+        laser_total: newLaserTotal,
+        laser_tier: tier,
+        cashback_balance: (customer.cashback_balance || 0) + cashbackEarned
+      }).eq("email", email);
+
+      await supabase.from("cashback_transactions").insert([
+        {
+          email,
+          amount: cashbackEarned,
+          type: "earned",
+          source: "laser purchase"
+        }
+      ]);
     }
+
+    // =========================
+    // FACIAL DESCONTO PROGRESSIVO
+    // =========================
+    if (facialTotal > 0) {
+
+      let discountTier = 0;
+      if (facialTotal >= 1500) discountTier = 10;
+      else if (facialTotal >= 600) discountTier = 7;
+      else if (facialTotal >= 300) discountTier = 5;
+
+      await supabase.from("customers").update({
+        facial_discount_next: discountTier
+      }).eq("email", email);
+    }
+
+    console.log(`Checkout processed for: ${email}`);
   }
 
   res.json({ received: true });
 });
 
 // ==============================
-// ROTA TESTE
-// ==============================
 app.get("/", (_, res) => res.send("Stripe API running 🚀"));
 
-// ==============================
-// START SERVER
-// ==============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
 
