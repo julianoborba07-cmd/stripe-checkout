@@ -290,7 +290,7 @@ app.post("/create-checkout-session", async (req, res) => {
     else if (facialTotal >= 300 * 100) discountPercent = 5;
 
     if (discountPercent > 0) {
-      const couponMap = { 5: "LLTOUCH_5_OFF", 7: "LLTOUCH_7_OFF", 10: "LLTOUCH_10_OFF" };
+      const couponMap = { 5: "pvJpxT7h", 7: "qQVDq1Hd", 10: "LBNKguNqk" };
       const couponId = couponMap[discountPercent];
       discounts.push({ coupon: couponId });
     }
