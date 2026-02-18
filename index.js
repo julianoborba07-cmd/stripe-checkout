@@ -225,6 +225,9 @@ app.post("/create-checkout-session", async (req, res) => {
       }
     }
 
+    // =========================
+    // CONSTRUINDO OS LINE ITEMS
+    // =========================
     const line_items = items.map((item) => {
       if (item.type === "laser") {
         const price = priceMap.laser?.[item.area]?.[item.package];
@@ -265,11 +268,39 @@ app.post("/create-checkout-session", async (req, res) => {
       throw new Error("Invalid item type");
     });
 
+    // =========================
+    // APLICANDO DESCONTO PROGRESSIVO FACIAL
+    // =========================
+    let discounts = [];
+
+    if (email) {
+      const { data: customerData } = await supabase
+        .from("customers")
+        .select("facial_discount_next")
+        .eq("email", email)
+        .single();
+
+      if (customerData && customerData.facial_discount_next > 0) {
+        // Mapeia percentual para coupon ID criado no Stripe
+        const couponMap = {
+          5: "LLTOUCH_5_OFF",
+          7: "LLTOUCH_7_OFF",
+          10: "LLTOUCH_10_OFF",
+        };
+
+        const couponId = couponMap[customerData.facial_discount_next];
+        if (couponId) discounts.push({ coupon: couponId });
+      }
+    }
+
+    // =========================
+    // CRIAR SESSÃO STRIPE CHECKOUT
+    // =========================
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer: customer?.id,
       line_items,
-      discounts: promoCode ? [{ promotion_code: promoCode }] : [],
+      discounts: promoCode ? [{ promotion_code: promoCode }, ...discounts] : discounts,
       metadata: {
         categories: JSON.stringify(categories)
       },
@@ -284,6 +315,7 @@ app.post("/create-checkout-session", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ==============================
 // WEBHOOK
