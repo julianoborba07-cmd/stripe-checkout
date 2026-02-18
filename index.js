@@ -229,66 +229,63 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     // =========================
-    // MONTAR LINE ITEMS
+    // MONTAR LINE ITEMS E PEGAR PREÇOS DO STRIPE
     // =========================
-    const line_items = items.map((item) => {
-      if (item.type === "laser") {
-        const price = priceMap.laser?.[item.area]?.[item.package];
-        if (!price) throw new Error("Invalid laser item");
-        return { price, quantity: item.quantity };
+    const line_items = [];
+    let facialTotal = 0; // valor total em centavos
+
+    for (const item of items) {
+      let priceId;
+
+      switch (item.type) {
+        case "laser":
+          priceId = priceMap.laser?.[item.area]?.[item.package];
+          if (!priceId) throw new Error("Invalid laser item");
+          break;
+
+        case "facial":
+          priceId = priceMap?.[item.service]?.[item.key];
+          if (!priceId) throw new Error("Invalid facial item");
+          break;
+
+        case "full-body":
+          priceId = priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
+          if (!priceId) throw new Error("Invalid full body item");
+          break;
+
+        case "med-spa":
+          priceId = priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
+          if (!priceId) throw new Error("Invalid med-spa item");
+          break;
+
+        case "membership":
+          priceId = priceMap.membership?.[item.plan]?.[item.package];
+          if (!priceId) throw new Error("Invalid membership item");
+          break;
+
+        case "other-service":
+          priceId = otherServicesPrices[item.serviceKey];
+          if (!priceId) throw new Error("Invalid other-service item");
+          break;
+
+        default:
+          throw new Error("Invalid item type");
       }
 
-      if (item.type === "facial") {
-        const price = priceMap?.[item.service]?.[item.key];
-        if (!price) throw new Error("Invalid facial item");
-        return { price, quantity: item.quantity };
-      }
+      // Pega o preço real do Stripe para calcular total facial
+      const priceData = await stripe.prices.retrieve(priceId);
+      if (item.type === "facial") facialTotal += (priceData.unit_amount || 0) * item.quantity;
 
-      if (item.type === "full-body") {
-        const price = priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
-        if (!price) throw new Error("Invalid full body item");
-        return { price, quantity: item.quantity };
-      }
-
-      if (item.type === "med-spa") {
-        const price = priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
-        if (!price) throw new Error("Invalid med-spa item");
-        return { price, quantity: item.quantity };
-      }
-
-      if (item.type === "membership") {
-        const price = priceMap.membership?.[item.plan]?.[item.package];
-        if (!price) throw new Error("Invalid membership item");
-        return { price, quantity: item.quantity };
-      }
-
-      if (item.type === "other-service") {
-        const price = otherServicesPrices[item.serviceKey];
-        if (!price) throw new Error("Invalid other-service item");
-        return { price, quantity: item.quantity };
-      }
-
-      throw new Error("Invalid item type");
-    });
+      line_items.push({ price: priceId, quantity: item.quantity });
+    }
 
     // =========================
     // CALCULAR DESCONTO FACIAL IMEDIATO
     // =========================
     let discounts = [];
 
-    // Filtrar itens faciais do pedido
-    const facialTotal = items
-      .filter(item => item.type === "facial")
-      .reduce((sum, item) => {
-        // Pega o preço em centavos do priceMap
-        const priceId = priceMap?.[item.service]?.[item.key];
-        // Stripe Price IDs não têm valor direto, então normalmente você precisaria buscar via API Stripe
-        // Aqui assumimos que cada item tem priceAmount em centavos para simplificar
-        return sum + (item.priceAmount || 0) * item.quantity;
-      }, 0);
-
     let discountPercent = 0;
-    if (facialTotal >= 1500 * 100) discountPercent = 10; // convertendo para centavos
+    if (facialTotal >= 1500 * 100) discountPercent = 10;
     else if (facialTotal >= 600 * 100) discountPercent = 7;
     else if (facialTotal >= 300 * 100) discountPercent = 5;
 
@@ -325,6 +322,7 @@ app.post("/create-checkout-session", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ==============================
 // WEBHOOK
