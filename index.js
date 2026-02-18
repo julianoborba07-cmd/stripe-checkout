@@ -297,7 +297,7 @@ app.post("/create-checkout-session", async (req, res) => {
       const couponMap = {
         5: "pvJpxT7h",   // 5% OFF
         7: "qQVDq1Hd",   // 7% OFF
-        10: "LBNKguNqk"  // 10% OFF
+        10: "BNKguNqk"  // 10% OFF
       };
       discounts.push({ coupon: couponMap[discountPercent] });
     }
