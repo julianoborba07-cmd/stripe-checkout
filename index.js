@@ -206,6 +206,9 @@ const otherServicesPrices = {
 // ==============================
 // CHECKOUT
 // ==============================
+// =========================
+// CHECKOUT
+// =========================
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { items, email, promoCode } = req.body;
@@ -282,7 +285,7 @@ app.post("/create-checkout-session", async (req, res) => {
     // =========================
     // CALCULAR DESCONTO FACIAL IMEDIATO
     // =========================
-    let discounts = [];
+    const discounts = [];
 
     let discountPercent = 0;
     if (facialTotal >= 1500 * 100) discountPercent = 10;
@@ -290,9 +293,13 @@ app.post("/create-checkout-session", async (req, res) => {
     else if (facialTotal >= 300 * 100) discountPercent = 5;
 
     if (discountPercent > 0) {
-      const couponMap = { 5: "pvJpxT7h", 7: "qQVDq1Hd", 10: "LBNKguNqk" };
-      const couponId = couponMap[discountPercent];
-      discounts.push({ coupon: couponId });
+      // IDs reais dos cupons criados no Stripe
+      const couponMap = {
+        5: "pvJpxT7h",   // 5% OFF
+        7: "qQVDq1Hd",   // 7% OFF
+        10: "LBNKguNqk"  // 10% OFF
+      };
+      discounts.push({ coupon: couponMap[discountPercent] });
     }
 
     // =========================
@@ -308,9 +315,7 @@ app.post("/create-checkout-session", async (req, res) => {
       customer: customer?.id,
       line_items,
       discounts,
-      metadata: {
-        categories: JSON.stringify(categories),
-      },
+      metadata: { categories: JSON.stringify(categories) },
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel",
     });
@@ -322,7 +327,6 @@ app.post("/create-checkout-session", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 // ==============================
 // WEBHOOK
