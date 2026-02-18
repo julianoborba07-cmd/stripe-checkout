@@ -215,6 +215,9 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const categories = [...new Set(items.map(item => item.type))];
 
+    // =========================
+    // CRIAR OU PEGAR CUSTOMER STRIPE
+    // =========================
     let customer;
     if (email) {
       const existingCustomers = await stripe.customers.list({ email, limit: 1 });
@@ -226,7 +229,7 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     // =========================
-    // CONSTRUINDO OS LINE ITEMS
+    // MONTAR LINE ITEMS
     // =========================
     const line_items = items.map((item) => {
       if (item.type === "laser") {
@@ -269,40 +272,47 @@ app.post("/create-checkout-session", async (req, res) => {
     });
 
     // =========================
-    // APLICANDO DESCONTO PROGRESSIVO FACIAL
+    // CALCULAR DESCONTO FACIAL IMEDIATO
     // =========================
     let discounts = [];
 
-    if (email) {
-      const { data: customerData } = await supabase
-        .from("customers")
-        .select("facial_discount_next")
-        .eq("email", email)
-        .single();
+    // Filtrar itens faciais do pedido
+    const facialTotal = items
+      .filter(item => item.type === "facial")
+      .reduce((sum, item) => {
+        // Pega o preço em centavos do priceMap
+        const priceId = priceMap?.[item.service]?.[item.key];
+        // Stripe Price IDs não têm valor direto, então normalmente você precisaria buscar via API Stripe
+        // Aqui assumimos que cada item tem priceAmount em centavos para simplificar
+        return sum + (item.priceAmount || 0) * item.quantity;
+      }, 0);
 
-      if (customerData && customerData.facial_discount_next > 0) {
-        // Mapeia percentual para coupon ID criado no Stripe
-        const couponMap = {
-          5: "LLTOUCH_5_OFF",
-          7: "LLTOUCH_7_OFF",
-          10: "LLTOUCH_10_OFF",
-        };
+    let discountPercent = 0;
+    if (facialTotal >= 1500 * 100) discountPercent = 10; // convertendo para centavos
+    else if (facialTotal >= 600 * 100) discountPercent = 7;
+    else if (facialTotal >= 300 * 100) discountPercent = 5;
 
-        const couponId = couponMap[customerData.facial_discount_next];
-        if (couponId) discounts.push({ coupon: couponId });
-      }
+    if (discountPercent > 0) {
+      const couponMap = { 5: "LLTOUCH_5_OFF", 7: "LLTOUCH_7_OFF", 10: "LLTOUCH_10_OFF" };
+      const couponId = couponMap[discountPercent];
+      discounts.push({ coupon: couponId });
     }
 
     // =========================
-    // CRIAR SESSÃO STRIPE CHECKOUT
+    // INCLUIR PROMO CODE SE HOUVER
+    // =========================
+    if (promoCode) discounts.push({ promotion_code: promoCode });
+
+    // =========================
+    // CRIAR SESSÃO STRIPE
     // =========================
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer: customer?.id,
       line_items,
-      discounts: promoCode ? [{ promotion_code: promoCode }, ...discounts] : discounts,
+      discounts,
       metadata: {
-        categories: JSON.stringify(categories)
+        categories: JSON.stringify(categories),
       },
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel",
@@ -315,7 +325,6 @@ app.post("/create-checkout-session", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 // ==============================
 // WEBHOOK
