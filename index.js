@@ -115,7 +115,7 @@ const priceMap = {
     "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
     "3-led10": "price_1StqioLVWAMw3iFeAm59s0Xt",
     "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
-    "3-peel": "price_1SxrmDLVWAMw3iFeLxauW07O",
+    "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF",
   },
 
   "classic-deluxe": {
