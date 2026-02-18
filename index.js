@@ -8,6 +8,7 @@ dotenv.config();
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// CORS
 app.use(
   cors({
     origin: ["https://lltouch.com", "http://localhost:3000"],
@@ -159,17 +160,33 @@ const otherServicesPrices = {
   "combo-full-face": "price_1SziCULVWAMw3iFeKQ7lsdNk",
 };
 
-/* ==============================
-  ROTA DE CHECKOUT
-============================== */
+// ==============================
+// MOCK DE EMAILS USADOS (substituir por DB real)
+// ==============================
+const usedPromoEmails = new Set();
+
+// ==============================
+// ROTA DE CHECKOUT
+// ==============================
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { items } = req.body;
+    const { items, email, promoCode } = req.body;
 
-    if (!Array.isArray(items) || items.length === 0) {
+    if (!Array.isArray(items) || items.length === 0)
       return res.status(400).json({ error: "No items provided" });
+
+    // ✅ Cria ou encontra customer no Stripe
+    let customer;
+    if (email) {
+      const existingCustomers = await stripe.customers.list({ email, limit: 1 });
+      if (existingCustomers.data.length > 0) {
+        customer = existingCustomers.data[0];
+      } else {
+        customer = await stripe.customers.create({ email });
+      }
     }
 
+    // ✅ Mapeia line_items
     const line_items = items.map((item) => {
       if (item.type === "laser") {
         const price = priceMap.laser?.[item.area]?.[item.package];
@@ -184,15 +201,13 @@ app.post("/create-checkout-session", async (req, res) => {
       }
 
       if (item.type === "full-body") {
-        const price =
-          priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
+        const price = priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
         if (!price) throw new Error("Invalid full body item");
         return { price, quantity: item.quantity };
       }
 
       if (item.type === "med-spa") {
-        const price =
-          priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
+        const price = priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
         if (!price) throw new Error("Invalid med-spa item");
         return { price, quantity: item.quantity };
       }
@@ -212,9 +227,18 @@ app.post("/create-checkout-session", async (req, res) => {
       throw new Error("Invalid item type");
     });
 
+    // ✅ Aplica cupom somente se não usado
+    const applyDiscount =
+      promoCode && !usedPromoEmails.has(email)
+        ? [{ promotion_code: promoCode }]
+        : [];
+
+    // ✅ Cria sessão
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
+      customer: customer?.id,
       line_items,
+      discounts: applyDiscount,
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel",
     });
@@ -226,9 +250,9 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
-/* ==============================
-  ROTA PARA CONFIRMAÇÃO DE PAGAMENTO
-============================== */
+// ==============================
+// ROTA PARA CONFIRMAÇÃO DE PAGAMENTO
+// ==============================
 app.get("/checkout-session/:sessionId", async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.retrieve(req.params.sessionId, {
@@ -258,10 +282,40 @@ app.get("/checkout-session/:sessionId", async (req, res) => {
   }
 });
 
-/* ==============================
-  ROTA TESTE
-============================== */
+// ==============================
+// WEBHOOK PARA MARCAR EMAILS USADOS
+// ==============================
+app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+  } catch (err) {
+    console.log("Webhook signature verification failed.", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    if (session.customer_email) {
+      usedPromoEmails.add(session.customer_email);
+      console.log(`Promo applied to: ${session.customer_email}`);
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// ==============================
+// ROTA TESTE
+// ==============================
 app.get("/", (_, res) => res.send("Stripe API running 🚀"));
 
+// ==============================
+// START SERVER
+// ==============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
+
