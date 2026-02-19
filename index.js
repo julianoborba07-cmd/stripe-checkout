@@ -245,37 +245,30 @@ app.post("/create-checkout-session", async (req, res) => {
           priceId = priceMap.laser?.[item.area]?.[item.package];
           if (!priceId) throw new Error("Invalid laser item");
           break;
-
         case "facial":
           priceId = priceMap?.[item.service]?.[item.key];
           if (!priceId) throw new Error("Invalid facial item");
           break;
-
         case "full-body":
           priceId = priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
           if (!priceId) throw new Error("Invalid full body item");
           break;
-
         case "med-spa":
           priceId = priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
           if (!priceId) throw new Error("Invalid med-spa item");
           break;
-
         case "membership":
           priceId = priceMap.membership?.[item.plan]?.[item.package];
           if (!priceId) throw new Error("Invalid membership item");
           break;
-
         case "other-service":
           priceId = otherServicesPrices[item.serviceKey];
           if (!priceId) throw new Error("Invalid other-service item");
           break;
-
         default:
           throw new Error("Invalid item type");
       }
 
-      // Pega o preço real do Stripe para calcular total facial
       const priceData = await stripe.prices.retrieve(priceId);
       if (item.type === "facial") facialTotal += (priceData.unit_amount || 0) * item.quantity;
 
@@ -283,76 +276,56 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     // =========================
-    // CALCULAR DESCONTO FACIAL IMEDIATO
+    // DESCONTOS / PROMO CODES
     // =========================
     const discounts = [];
 
+    // === Desconto progressivo facial (opcional) ===
     let discountPercent = 0;
     if (facialTotal >= 1500 * 100) discountPercent = 10;
     else if (facialTotal >= 600 * 100) discountPercent = 7;
     else if (facialTotal >= 300 * 100) discountPercent = 5;
 
     if (facialTotal > 0 && discountPercent > 0) {
-  const couponMap = {
-    5: "pvJpxT7h",
-    7: "qQVDq1Hd",
-    10: "BNKguNqk"
-  };
+      const couponMap = {
+        5: "pvJpxT7h",
+        7: "qQVDq1Hd",
+        10: "BNKguNqk",
+      };
 
-  const couponId = couponMap[discountPercent];
+      const couponId = couponMap[discountPercent];
+      if (couponId) discounts.push({ coupon: couponId });
+    }
 
-  if (couponId) {
-    discounts.push({ coupon: couponId });
-  }
-}
-
-    // =========================
-// VALIDAR SE EXISTE ITEM ELEGÍVEL PARA CUPOM
-// =========================
-
-const eligiblePriceIds = [
-  "price_1SxA01LVWAMw3iFesKpaxZvz",
-  "price_1SyuFlLVWAMw3iFeAAU7GR1e",
-  "price_1SziCULVWAMw3iFeKQ7lsdNk"
-];
-
-const hasEligibleItem = line_items.some(item =>
-  eligiblePriceIds.includes(item.price)
-);
-
-// =========================
-// INCLUIR PROMO CODE SE HOUVER E FOR ELEGÍVEL
-// =========================
-
-if (promoCode && hasEligibleItem) {
-  discounts.push({ promotion_code: promoCode });
-}
+    // === Promo code de primeira compra (garantido) ===
+    if (promoCode) {
+      // aplica o promo code direto, sem checar items
+      discounts.push({ promotion_code: promoCode });
+    }
 
     // =========================
     // CRIAR SESSÃO STRIPE
     // =========================
     const sessionData = {
-  mode: "payment",
-  customer: customer?.id,
-  line_items,
-  metadata: { categories: JSON.stringify(categories) },
-  success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-  cancel_url: "https://lltouch.com/cancel",
-};
+      mode: "payment",
+      customer: customer?.id,
+      line_items,
+      metadata: { categories: JSON.stringify(categories) },
+      success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+      cancel_url: "https://lltouch.com/cancel",
+    };
 
-if (discounts.length > 0) {
-  sessionData.discounts = discounts;
-}
+    if (discounts.length > 0) sessionData.discounts = discounts;
 
-const session = await stripe.checkout.sessions.create(sessionData);
+    const session = await stripe.checkout.sessions.create(sessionData);
 
     res.json({ url: session.url });
-
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ==============================
 // WEBHOOK
