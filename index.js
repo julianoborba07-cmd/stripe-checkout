@@ -275,9 +275,6 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const { discounts, metadata } = await resolveDiscounts(customer, items);
 
-    console.log("DISCOUNTS APLICADOS:", discounts);
-    console.log("METADATA:", metadata);
-
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer_email: email,
