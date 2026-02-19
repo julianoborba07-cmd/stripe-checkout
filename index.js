@@ -150,16 +150,28 @@ function resolvePriceId(item) {
 }
 
 // ==============================
-// RESOLVE DISCOUNTS
+// RESOLVE DISCOUNTS (FINAL CORRIGIDO)
 // ==============================
 async function resolveDiscounts(customer, items) {
+
   const hasLaser = items.some(i => i.type === "laser" || i.type === "full-body");
   const hasFacial = items.some(i => i.type === "facial");
-  const hasMicroneedling = items.some(i => i.type === "med-spa" && i.service === "microneedling" && i.package === "single");
-  const hasMembershipPlatinum = items.some(i => i.type === "membership" && i.plan === "platinum");
-  const hasOtherFullFace = items.some(i => i.type === "other-service" && i.serviceKey === "combo-full-face");
+  const hasMicroneedling = items.some(
+    i => i.type === "med-spa" &&
+         i.service === "microneedling" &&
+         i.package === "single"
+  );
+  const hasMembershipPlatinum = items.some(
+    i => i.type === "membership" && i.plan === "platinum"
+  );
+  const hasOtherFullFace = items.some(
+    i => i.type === "other-service" &&
+         i.serviceKey === "combo-full-face"
+  );
 
-  // 1️⃣ PRIMEIRA COMPRA (POPUP)
+  // ==============================
+  // 1️⃣ PRIMEIRA COMPRA
+  // ==============================
   if (customer.popup_unlocked && !customer.first_purchase_used) {
     return {
       discounts: [{ promotion_code: "promo_1T2B8qLVWAMw3iFeuDu7TgOB" }],
@@ -167,7 +179,9 @@ async function resolveDiscounts(customer, items) {
     };
   }
 
-  // 2️⃣ CASHBACK
+  // ==============================
+  // 2️⃣ CASHBACK (Laser / Full Body)
+  // ==============================
   if (hasLaser && customer.cashback_balance > 0) {
     const coupon = await stripe.coupons.create({
       amount_off: Math.round(customer.cashback_balance * 100),
@@ -175,28 +189,67 @@ async function resolveDiscounts(customer, items) {
       duration: "once",
       name: "Laser Cashback"
     });
-    return { discounts: [{ coupon: coupon.id }], metadata: { discount_type: "cashback" } };
+
+    return {
+      discounts: [{ coupon: coupon.id }],
+      metadata: { discount_type: "cashback" }
+    };
   }
 
-  // 3️⃣ FACIAL PROGRESSIVO
-  if (hasFacial && customer.facial_discount_next > 0) {
-    const map = { 10: "BNKguNqk", 7: "qQVDq1Hd", 5: "pvJpxT7h" };
-    return { discounts: [{ coupon: map[customer.facial_discount_next] }], metadata: { discount_type: "facial" } };
+  // ==============================
+  // 3️⃣ FACIAL PROGRESSIVO (IMEDIATO)
+  // ==============================
+  if (hasFacial) {
+
+    // calcula valor total de facial incluindo a compra atual
+    let projectedFacialTotal = customer.facial_total || 0;
+    items.forEach(item => {
+      if (item.type === "facial" && item.price) projectedFacialTotal += item.price;
+    });
+
+    // determina tier de desconto
+    let discountTier = 0;
+    if (projectedFacialTotal >= 1500) discountTier = 10;
+    else if (projectedFacialTotal >= 600) discountTier = 7;
+    else if (projectedFacialTotal >= 300) discountTier = 5;
+
+    if (discountTier > 0) {
+      const map = { 10: "BNKguNqk", 7: "qQVDq1Hd", 5: "pvJpxT7h" };
+      return {
+        discounts: [{ coupon: map[discountTier] }],
+        metadata: { discount_type: "facial" }
+      };
+    }
   }
 
+  // ==============================
   // 4️⃣ MICRONEEDLING
+  // ==============================
   if (hasMicroneedling && !customer.microneedling_discount_used) {
-    return { discounts: [{ promotion_code: "promo_1T2C4eLVWAMw3iFelFs4ILhS" }], metadata: { discount_type: "microneedling" } };
+    return {
+      discounts: [{ promotion_code: "promo_1T2C4eLVWAMw3iFelFs4ILhS" }],
+      metadata: { discount_type: "microneedling" }
+    };
   }
 
+  // ==============================
   // 5️⃣ MEMBERSHIP
+  // ==============================
   if (hasMembershipPlatinum) {
-    return { discounts: [{ promotion_code: "promo_1T2C35LVWAMw3iFeaHNr796B" }], metadata: { discount_type: "membership" } };
+    return {
+      discounts: [{ promotion_code: "promo_1T2C35LVWAMw3iFeaHNr796B" }],
+      metadata: { discount_type: "membership" }
+    };
   }
 
+  // ==============================
   // 6️⃣ OTHER SERVICES
+  // ==============================
   if (hasOtherFullFace) {
-    return { discounts: [{ promotion_code: "promo_1T2C1jLVWAMw3iFekFFK21u4" }], metadata: { discount_type: "other" } };
+    return {
+      discounts: [{ promotion_code: "promo_1T2C1jLVWAMw3iFekFFK21u4" }],
+      metadata: { discount_type: "other" }
+    };
   }
 
   return { discounts: [], metadata: {} };
