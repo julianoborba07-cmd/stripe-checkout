@@ -292,15 +292,19 @@ app.post("/create-checkout-session", async (req, res) => {
     else if (facialTotal >= 600 * 100) discountPercent = 7;
     else if (facialTotal >= 300 * 100) discountPercent = 5;
 
-    if (discountPercent > 0) {
-      // IDs reais dos cupons criados no Stripe
-      const couponMap = {
-        5: "pvJpxT7h",   // 5% OFF
-        7: "qQVDq1Hd",   // 7% OFF
-        10: "BNKguNqk"  // 10% OFF
-      };
-      discounts.push({ coupon: couponMap[discountPercent] });
-    }
+    if (facialTotal > 0 && discountPercent > 0) {
+  const couponMap = {
+    5: "pvJpxT7h",
+    7: "qQVDq1Hd",
+    10: "BNKguNqk"
+  };
+
+  const couponId = couponMap[discountPercent];
+
+  if (couponId) {
+    discounts.push({ coupon: couponId });
+  }
+}
 
     // =========================
     // INCLUIR PROMO CODE SE HOUVER
@@ -310,15 +314,20 @@ app.post("/create-checkout-session", async (req, res) => {
     // =========================
     // CRIAR SESSÃO STRIPE
     // =========================
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer: customer?.id,
-      line_items,
-      discounts,
-      metadata: { categories: JSON.stringify(categories) },
-      success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: "https://lltouch.com/cancel",
-    });
+    const sessionData = {
+  mode: "payment",
+  customer: customer?.id,
+  line_items,
+  metadata: { categories: JSON.stringify(categories) },
+  success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+  cancel_url: "https://lltouch.com/cancel",
+};
+
+if (discounts.length > 0) {
+  sessionData.discounts = discounts;
+}
+
+const session = await stripe.checkout.sessions.create(sessionData);
 
     res.json({ url: session.url });
 
