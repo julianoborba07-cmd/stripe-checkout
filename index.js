@@ -179,22 +179,23 @@ async function resolveDiscounts(customer, items) {
     };
   }
 
-  // ==============================
-  // 2️⃣ CASHBACK (Laser / Full Body)
-  // ==============================
-  if (hasLaser && customer.cashback_balance > 0) {
-    const coupon = await stripe.coupons.create({
-      amount_off: Math.round(customer.cashback_balance * 100),
-      currency: "usd",
-      duration: "once",
-      name: "Laser Cashback"
-    });
+// ==============================
+// 2️⃣ CASHBACK (UNIVERSAL)
+// ==============================
+if (customer.cashback_balance > 0) {
 
-    return {
-      discounts: [{ coupon: coupon.id }],
-      metadata: { discount_type: "cashback" }
-    };
-  }
+  const coupon = await stripe.coupons.create({
+    amount_off: Math.round(customer.cashback_balance * 100),
+    currency: "usd",
+    duration: "once",
+    name: "Universal Cashback"
+  });
+
+  return {
+    discounts: [{ coupon: coupon.id }],
+    metadata: { discount_type: "cashback" }
+  };
+}
 
   // ==============================
   // 3️⃣ FACIAL PROGRESSIVO (IMEDIATO)
@@ -315,16 +316,31 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
     const total = session.amount_total / 100;
 
     let laserSpent = 0;
-    let facialSpent = 0;
+let facialSpent = 0;
 
-    for (const item of session.line_items.data) {
-      const priceId = item.price.id;
-      const amount = item.amount_total / 100;
+const allLaserPriceIds = [
+  ...Object.values(priceMap.laser).flatMap(area => Object.values(area)),
+  ...Object.values(priceMap["full-body"]).flatMap(pkg => Object.values(pkg))
+];
 
-      if (Object.values(priceMap.laser).some(area => Object.values(area).includes(priceId))) laserSpent += amount;
-      if (Object.values(priceMap["full-body"]).some(pkg => Object.values(pkg).includes(priceId))) laserSpent += amount;
-      if (priceMap[item.metadata?.service]) facialSpent += amount;
-    }
+const allFacialPriceIds = [
+  ...Object.values(priceMap["ll-signature"]),
+  ...Object.values(priceMap["classic-deluxe"]),
+  ...Object.values(priceMap["ll-teen"])
+];
+
+for (const item of session.line_items.data) {
+  const priceId = item.price.id;
+  const amount = item.amount_total / 100;
+
+  if (allLaserPriceIds.includes(priceId)) {
+    laserSpent += amount;
+  }
+
+  if (allFacialPriceIds.includes(priceId)) {
+    facialSpent += amount;
+  }
+}
 
     try { await supabase.from("customers").update({ lifetime_total: (customer.lifetime_total || 0) + total }).eq("email", email); } catch(e){console.error(e)}
 
