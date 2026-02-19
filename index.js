@@ -203,9 +203,6 @@ const otherServicesPrices = {
   "combo-full-face": "price_1SziCULVWAMw3iFeKQ7lsdNk",
 };
 
-// ==============================
-// CHECKOUT
-// ==============================
 // =========================
 // CHECKOUT
 // =========================
@@ -232,10 +229,10 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     // =========================
-    // MONTAR LINE ITEMS E PEGAR PREÇOS DO STRIPE
+    // MONTAR LINE ITEMS
     // =========================
     const line_items = [];
-    let facialTotal = 0; // valor total em centavos
+    let facialTotal = 0;
 
     for (const item of items) {
       let priceId;
@@ -276,31 +273,51 @@ app.post("/create-checkout-session", async (req, res) => {
     }
 
     // =========================
-    // DESCONTOS / PROMO CODES
+    // GERAR CUPONS DINAMICAMENTE
     // =========================
     const discounts = [];
 
-    // === Desconto progressivo facial (opcional) ===
-    let discountPercent = 0;
-    if (facialTotal >= 1500 * 100) discountPercent = 10;
-    else if (facialTotal >= 600 * 100) discountPercent = 7;
-    else if (facialTotal >= 300 * 100) discountPercent = 5;
+    // Cupom de primeira compra: sempre prioridade
+    const firstPurchaseCoupon = promoCode; // aqui você passa o promoCode do frontend se for primeira compra
 
-    if (facialTotal > 0 && discountPercent > 0) {
-      const couponMap = {
-        5: "pvJpxT7h",
-        7: "qQVDq1Hd",
-        10: "BNKguNqk",
-      };
-
-      const couponId = couponMap[discountPercent];
-      if (couponId) discounts.push({ coupon: couponId });
+    // Todos os priceIds do seu index.js
+    function getAllPriceIds(obj) {
+      const ids = [];
+      function recurse(o) {
+        for (const key in o) {
+          const value = o[key];
+          if (typeof value === "string" && value.startsWith("price_")) ids.push(value);
+          else if (typeof value === "object" && value !== null) recurse(value);
+        }
+      }
+      recurse(obj);
+      return ids;
     }
+    const eligiblePriceIds = [...getAllPriceIds(priceMap), ...Object.values(otherServicesPrices)];
 
-    // === Promo code de primeira compra (garantido) ===
-    if (promoCode) {
-      // aplica o promo code direto, sem checar items
-      discounts.push({ promotion_code: promoCode });
+    const hasEligibleItem = line_items.some(item => eligiblePriceIds.includes(item.price));
+
+    // =========================
+    // APLICA PRIMEIRA COMPRA SE HOUVER ITEM ELEGÍVEL
+    // =========================
+    if (firstPurchaseCoupon && hasEligibleItem) {
+      discounts.push({ promotion_code: firstPurchaseCoupon });
+    } else {
+      // Desconto progressivo facial (se primeira compra não estiver ativo)
+      let discountPercent = 0;
+      if (facialTotal >= 1500 * 100) discountPercent = 10;
+      else if (facialTotal >= 600 * 100) discountPercent = 7;
+      else if (facialTotal >= 300 * 100) discountPercent = 5;
+
+      if (discountPercent > 0) {
+        const couponMap = {
+          5: "pvJpxT7h",
+          7: "qQVDq1Hd",
+          10: "BNKguNqk"
+        };
+        const couponId = couponMap[discountPercent];
+        if (couponId) discounts.push({ coupon: couponId });
+      }
     }
 
     // =========================
@@ -320,6 +337,7 @@ app.post("/create-checkout-session", async (req, res) => {
     const session = await stripe.checkout.sessions.create(sessionData);
 
     res.json({ url: session.url });
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
