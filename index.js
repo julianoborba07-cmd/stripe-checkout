@@ -358,42 +358,44 @@ app.post("/create-checkout-session", async (req, res) => {
 "price_1StqevLVWAMw3iFer0kW5wBq"
     ];
 
-    const hasEligibleItem = line_items.some(item => eligiblePriceIds.includes(item.price));
+    // Verifica se algum item do pedido é elegível para cupom
+const hasEligibleItem = line_items.some(item => eligiblePriceIds.includes(item.price));
 
-    if (promoCode && hasEligibleItem) {
-      // ✅ Cupom de primeira compra tem prioridade
-      discounts.push({ promotion_code: promoCode });
-    } else {
-      // Sem cupom de primeira compra, aplica desconto progressivo facial
-      let discountPercent = 0;
-      if (facialTotal >= 1500 * 100) discountPercent = 10;
-      else if (facialTotal >= 600 * 100) discountPercent = 7;
-      else if (facialTotal >= 300 * 100) discountPercent = 5;
+// ✅ Só aplica o cupom se houver item elegível
+if (promoCode && hasEligibleItem) {
+  discounts.push({ promotion_code: promoCode });
+} else {
+  // Sem cupom de primeira compra, aplica desconto progressivo facial
+  let discountPercent = 0;
+  if (facialTotal >= 1500 * 100) discountPercent = 10;
+  else if (facialTotal >= 600 * 100) discountPercent = 7;
+  else if (facialTotal >= 300 * 100) discountPercent = 5;
 
-      if (discountPercent > 0) {
-        const couponMap = { 5: "pvJpxT7h", 7: "qQVDq1Hd", 10: "BNKguNqk" };
-        discounts.push({ coupon: couponMap[discountPercent] });
-      }
-    }
+  if (discountPercent > 0) {
+    const couponMap = { 5: "pvJpxT7h", 7: "qQVDq1Hd", 10: "BNKguNqk" };
+    discounts.push({ coupon: couponMap[discountPercent] });
+  }
+}
 
-    // =========================
-    // CRIAR SESSÃO STRIPE
-    // =========================
-    const sessionData = {
-      mode: "payment",
-      customer: customer?.id,
-      line_items,
-      metadata: { categories: JSON.stringify(categories) },
-      success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: "https://lltouch.com/cancel",
-    };
+// =========================
+// CRIAR SESSÃO STRIPE
+// =========================
+const sessionData = {
+  mode: "payment",
+  customer: customer?.id,
+  line_items,
+  metadata: { categories: JSON.stringify(categories) },
+  success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+  cancel_url: "https://lltouch.com/cancel",
+};
 
-    if (discounts.length > 0) {
-      sessionData.discounts = discounts;
-    }
+// Só envia descontos se houver algum válido
+if (discounts.length > 0) {
+  sessionData.discounts = discounts;
+}
 
-    const session = await stripe.checkout.sessions.create(sessionData);
-    res.json({ url: session.url });
+const session = await stripe.checkout.sessions.create(sessionData);
+res.json({ url: session.url });
 
   } catch (err) {
     console.error(err);
