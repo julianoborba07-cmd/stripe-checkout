@@ -210,6 +210,10 @@ app.post("/create-checkout-session", async (req, res) => {
   try {
     const { line_items, promoCode, categories, facialTotal, email } = req.body;
 
+    if (!Array.isArray(line_items)) {
+      return res.status(400).json({ error: "line_items precisa ser um array válido" });
+    }
+
     // Busca ou cria cliente no Supabase
     const customer = await getOrCreateCustomer(email);
 
