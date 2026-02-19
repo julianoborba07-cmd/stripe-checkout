@@ -31,13 +31,7 @@ async function getOrCreateCustomer(email) {
     const { data } = await supabase
       .from("customers")
       .insert([
-        {
-          email,
-          lifetime_total: 0,
-          laser_total: 0,
-          cashback_balance: 0,
-          laser_tier: 0,
-        },
+        { email, lifetime_total: 0, laser_total: 0, cashback_balance: 0, laser_tier: 0 }
       ])
       .select()
       .single();
@@ -51,18 +45,16 @@ async function getOrCreateCustomer(email) {
 // ==============================
 // CORS
 // ==============================
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      const allowed = ["https://lltouch.com"];
-      if (!origin || allowed.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
-    },
-  })
-);
+app.use(cors({
+  origin: function (origin, callback) {
+    const allowed = ["https://lltouch.com"];
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  }
+}));
 
 app.use(express.json());
 
@@ -140,7 +132,7 @@ const otherServicesPrices = {
 };
 
 // ==============================
-// RESOLVER PRICE ID (PROTEGIDO)
+// RESOLVE PRICE ID
 // ==============================
 function resolvePriceId(item) {
   try {
@@ -148,12 +140,14 @@ function resolvePriceId(item) {
 
     if (type === "membership") return priceMap.membership?.[item.plan]?.[item.package];
     if (type === "laser") return priceMap.laser?.[item.area]?.[item.package];
-    if (type === "full-body") return priceMap["full-body"]?.[item.package]?.[item.option];
-    if (type === "med-spa") return priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.option];
-    if (type === "other-service") return otherServicesPrices?.[item.service];
+    if (type === "full-body") return priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
+    if (type === "med-spa") return priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon || "none"];
+    if (type === "other-service") return otherServicesPrices?.[item.serviceKey || item.service];
+    if (type === "facial") return priceMap[item.key]?.[`${item.package || "single"}-${item.addon || "none"}`];
 
     return null;
-  } catch {
+  } catch (err) {
+    console.error("Erro ao resolver priceId:", err, item);
     return null;
   }
 }
@@ -182,12 +176,11 @@ async function resolveDiscounts(customer, items) {
 }
 
 // ==============================
-// ROTA CREATE CHECKOUT SESSION
+// CREATE CHECKOUT SESSION
 // ==============================
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
-
     if (!email || !Array.isArray(items) || items.length === 0 || items.length > 20) {
       return res.status(400).json({ error: "Dados inválidos" });
     }
@@ -196,7 +189,7 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const line_items = items.map((item) => {
       const priceId = resolvePriceId(item);
-      if (!priceId) throw new Error("Produto inválido detectado.");
+      if (!priceId) throw new Error(`Produto inválido detectado: ${JSON.stringify(item)}`);
       return { price: priceId, quantity: item.quantity || 1 };
     });
 
@@ -214,7 +207,7 @@ app.post("/create-checkout-session", async (req, res) => {
 
     res.json({ url: session.url });
   } catch (err) {
-    console.error(err);
+    console.error("Erro no checkout:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
