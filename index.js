@@ -204,175 +204,74 @@ const otherServicesPrices = {
 };
 
 // =========================
-// CHECKOUT
+// CUPONS E DESCONTOS (LÓGICA FINAL CORRIGIDA)
 // =========================
-app.post("/create-checkout-session", async (req, res) => {
-  try {
-    const { items, email, promoCode } = req.body;
 
-    if (!Array.isArray(items) || items.length === 0)
-      return res.status(400).json({ error: "No items provided" });
+const discounts = [];
 
-    const categories = [...new Set(items.map(item => item.type))];
+// =========================
+// 1️⃣ CUPOM PRIMEIRA COMPRA (PRIORIDADE MÁXIMA)
+// =========================
 
-    // =========================
-    // CRIAR OU PEGAR CUSTOMER STRIPE
-    // =========================
-    let customer;
-    if (email) {
-      const existingCustomers = await stripe.customers.list({ email, limit: 1 });
-      if (existingCustomers.data.length > 0) {
-        customer = existingCustomers.data[0];
-      } else {
-        customer = await stripe.customers.create({ email });
-      }
-    }
-
-    // =========================
-    // MONTAR LINE ITEMS E PEGAR PREÇOS DO STRIPE
-    // =========================
-    const line_items = [];
-    let facialTotal = 0; // valor total em centavos
-
-    for (const item of items) {
-      let priceId;
-
-      switch (item.type) {
-        case "laser":
-          priceId = priceMap.laser?.[item.area]?.[item.package];
-          if (!priceId) throw new Error("Invalid laser item");
-          break;
-        case "facial":
-          priceId = priceMap?.[item.service]?.[item.key];
-          if (!priceId) throw new Error("Invalid facial item");
-          break;
-        case "full-body":
-          priceId = priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
-          if (!priceId) throw new Error("Invalid full body item");
-          break;
-        case "med-spa":
-          priceId = priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon];
-          if (!priceId) throw new Error("Invalid med-spa item");
-          break;
-        case "membership":
-          priceId = priceMap.membership?.[item.plan]?.[item.package];
-          if (!priceId) throw new Error("Invalid membership item");
-          break;
-        case "other-service":
-          priceId = otherServicesPrices[item.serviceKey];
-          if (!priceId) throw new Error("Invalid other-service item");
-          break;
-        default:
-          throw new Error("Invalid item type");
-      }
-
-      // Pega o preço real do Stripe para calcular total facial
-      const priceData = await stripe.prices.retrieve(priceId);
-      if (item.type === "facial") facialTotal += (priceData.unit_amount || 0) * item.quantity;
-
-      line_items.push({ price: priceId, quantity: item.quantity });
-    }
-
-    // =========================
-    // CUPONS COM PRIORIDADE
-    // =========================
-    const discounts = [];
-
-    // Itens elegíveis para cupom de primeira compra
-    const eligiblePriceIds = [
-      "price_1SziCULVWAMw3iFeKQ7lsdNk",
-"price_1SziBtLVWAMw3iFeOlogbBw5",
-"price_1SziBLLVWAMw3iFefsG4hGYu",
-"price_1SziATLVWAMw3iFeJ8O37uOa",
-"price_1Szi9tLVWAMw3iFeni0n26QU",
-"price_1Syx58LVWAMw3iFe2rmfw0VF",
-"price_1Syx4ULVWAMw3iFevqsTAPJj",
-"price_1SyuHuLVWAMw3iFetbcoodh2",
-"price_1SyuGnLVWAMw3iFe3U8Y81SF",
-"price_1SyuFlLVWAMw3iFeAAU7GR1e",
-"price_1SxAy7LVWAMw3iFeS4ctcll6",
-"price_1SxAwrLVWAMw3iFew3fsdrha",
-"price_1SxAvcLVWAMw3iFemyVhJy70",
-"price_1SxAu4LVWAMw3iFe0xzdQLj6",
-"price_1SxAWsLVWAMw3iFesU5eyyWC",
-"price_1SxAVeLVWAMw3iFeXpnKTDlr",
-"price_1SxAUjLVWAMw3iFeTVxGy05w",
-"price_1SxATvLVWAMw3iFeu78Ak5Xr",
-"price_1SxASrLVWAMw3iFeieILAe3T",
-"price_1SxAKsLVWAMw3iFeyKH4OSTl",
-"price_1SxAEuLVWAMw3iFeNSwQFrR5",
-"price_1SxABRLVWAMw3iFe7vYyqaVW",
-"price_1SxA9LLVWAMw3iFeShWxtdjh",
-"price_1SxA8eLVWAMw3iFeGKRTsEEX",
-"price_1SxA85LVWAMw3iFeG1JZ19Lu",
-"price_1SxA7FLVWAMw3iFeBJydTb8W",
-"price_1SxA6YLVWAMw3iFe3Rv6fPhS",
-"price_1SxA5mLVWAMw3iFeifsFKOFW",
-"price_1SxA4pLVWAMw3iFekvmzRRtg",
-"price_1SxA3LLVWAMw3iFeJWCBn4w9",
-"price_1SxA2lLVWAMw3iFeOfMnlep9",
-"price_1SxA1bLVWAMw3iFeENwK7Pjo",
-"price_1SxA0VLVWAMw3iFeDjB6cXS9",
-"price_1SxA01LVWAMw3iFesKpaxZvz",
-"price_1Svn2qLVWAMw3iFew7lsbArO",
-"price_1Svn24LVWAMw3iFep1e0Mpmb",
-"price_1Svn0ULVWAMw3iFebOifqGLa",
-"price_1SvmxsLVWAMw3iFe7DU1aRwk",
-"price_1SvmwjLVWAMw3iFenlsJHaWU",
-"price_1SvmuWLVWAMw3iFe6G7zVtgQ",
-"price_1Sv2PQLVWAMw3iFeYiWPlDxM",
-"price_1Sv2OwLVWAMw3iFeY7kKQSzl",
-"price_1Sv2NvLVWAMw3iFe73PwJ0u4",
-"price_1Sv2N4LVWAMw3iFePan3vdsc",
-"price_1Sv2MaLVWAMw3iFeHcHi1TLZ",
-"price_1Sv2M2LVWAMw3iFe3BavpQJO",
-"price_1Sv2KALVWAMw3iFen8mPo7yZ",
-"price_1Sv2JmLVWAMw3iFe7xLMmPow",
-"price_1Sv2IcLVWAMw3iFeoadLWZQa",
-"price_1Sv2GkLVWAMw3iFe5JQYNmyz",
-"price_1Sv2GKLVWAMw3iFeN9zMligM",
-"price_1Sv2ExLVWAMw3iFedZ6vFjav",
-"price_1SuEiLLVWAMw3iFe8YD0gUZy",
-"price_1SuEi5LVWAMw3iFewusx6G2v",
-"price_1SuEhaLVWAMw3iFew6XXmiTM",
-"price_1SuEgsLVWAMw3iFeILBNpjT1",
-"price_1SuEgGLVWAMw3iFeVHNgvu91",
-"price_1SuEfvLVWAMw3iFe3kb7eqUJ",
-"price_1SuEfLLVWAMw3iFermWmmr34",
-"price_1SuEejLVWAMw3iFedQAwSrU6",
-"price_1SuEdmLVWAMw3iFeJLmbA2Q0",
-"price_1SuEd6LVWAMw3iFebVOUfGLQ",
-"price_1SuEc1LVWAMw3iFey3J96baH",
-"price_1SuEbGLVWAMw3iFeeieTxip5",
-"price_1SuEZPLVWAMw3iFe7tYRV0oU",
-"price_1SuEYnLVWAMw3iFewE4dpv9l",
-"price_1SuEYELVWAMw3iFefiIqcGFR",
-"price_1SuEXILVWAMw3iFeEzZhwlVJ",
-"price_1StqkrLVWAMw3iFe4tjY3cFF",
-"price_1StqkXLVWAMw3iFeR7QiSc1x",
-"price_1StqioLVWAMw3iFeAm59s0Xt",
-"price_1StqiCLVWAMw3iFePkaQpH6V",
-"price_1StqhlLVWAMw3iFemTTki7vK",
-"price_1StqhLLVWAMw3iFesS17pRjR",
-"price_1StqgqLVWAMw3iFe9k2tD5rT",
-"price_1StqevLVWAMw3iFer0kW5wBq"
-    ];
-
-    // Verifica se algum item do pedido é elegível para cupom
-const hasEligibleItem = line_items.some(item => eligiblePriceIds.includes(item.price));
-
-// ✅ Só aplica o cupom se houver item elegível
-if (promoCode && hasEligibleItem) {
+if (promoCode === "promo_1T2B8qLVWAMw3iFeuDu7TgOB") {
+  // Aplica para qualquer serviço
   discounts.push({ promotion_code: promoCode });
-} else {
-  // Sem cupom de primeira compra, aplica desconto progressivo facial
+}
+
+// =========================
+// 2️⃣ CUPONS ESPECÍFICOS (SÓ SE O PRODUTO ESTIVER NO CARRINHO)
+// =========================
+else if (promoCode === "promo_1T2C4eLVWAMw3iFelFs4ILhS") {
+  // MedSpa Microneedling (price específico)
+  const hasMicroneedling = line_items.some(
+    item => item.price === "price_1SxA01LVWAMw3iFesKpaxZvz"
+  );
+
+  if (hasMicroneedling) {
+    discounts.push({ promotion_code: promoCode });
+  }
+}
+
+else if (promoCode === "promo_1T2C35LVWAMw3iFeaHNr796B") {
+  // Membership Platinum
+  const hasPlatinum = line_items.some(
+    item => item.price === "price_1SyuFlLVWAMw3iFeAAU7GR1e"
+  );
+
+  if (hasPlatinum) {
+    discounts.push({ promotion_code: promoCode });
+  }
+}
+
+else if (promoCode === "promo_1T2C1jLVWAMw3iFekFFK21u4") {
+  // Other Services - Full Face
+  const hasFullFace = line_items.some(
+    item => item.price === "price_1SziCULVWAMw3iFeKQ7lsdNk"
+  );
+
+  if (hasFullFace) {
+    discounts.push({ promotion_code: promoCode });
+  }
+}
+
+// =========================
+// 3️⃣ DESCONTO AUTOMÁTICO FACIAL (SE NÃO HOUVER CUPOM MANUAL)
+// =========================
+else {
+
   let discountPercent = 0;
+
   if (facialTotal >= 1500 * 100) discountPercent = 10;
   else if (facialTotal >= 600 * 100) discountPercent = 7;
   else if (facialTotal >= 300 * 100) discountPercent = 5;
 
   if (discountPercent > 0) {
-    const couponMap = { 5: "pvJpxT7h", 7: "qQVDq1Hd", 10: "BNKguNqk" };
+    const couponMap = {
+      5: "pvJpxT7h",
+      7: "qQVDq1Hd",
+      10: "BNKguNqk"
+    };
+
     discounts.push({ coupon: couponMap[discountPercent] });
   }
 }
