@@ -18,7 +18,7 @@ const supabase = createClient(
 );
 
 // ==============================
-// FUNÇÃO GET OR CREATE CUSTOMER
+// GET OR CREATE CUSTOMER
 // ==============================
 async function getOrCreateCustomer(email) {
   let { data: customer } = await supabase
@@ -30,9 +30,16 @@ async function getOrCreateCustomer(email) {
   if (!customer) {
     const { data } = await supabase
       .from("customers")
-      .insert([
-        { email, lifetime_total: 0, laser_total: 0, cashback_balance: 0, laser_tier: 0 }
-      ])
+      .insert([{
+        email,
+        lifetime_total: 0,
+        laser_total: 0,
+        cashback_balance: 0,
+        laser_tier: 0,
+        facial_discount_next: 0,
+        first_purchase_used: false,
+        microneedling_discount_used: false
+      }])
       .select()
       .single();
 
@@ -46,14 +53,7 @@ async function getOrCreateCustomer(email) {
 // CORS
 // ==============================
 app.use(cors({
-  origin: function (origin, callback) {
-    const allowed = ["https://lltouch.com"];
-    if (!origin || allowed.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("Not allowed by CORS"));
-    }
-  }
+  origin: ["https://lltouch.com"],
 }));
 
 app.use(express.json());
@@ -136,167 +136,228 @@ const otherServicesPrices = {
 // ==============================
 function resolvePriceId(item) {
   try {
-    const { type } = item;
-
-    if (type === "membership") {
+    if (item.type === "membership") {
       return priceMap.membership?.[item.plan]?.[item.package];
     }
 
-    if (type === "laser") {
+    if (item.type === "laser") {
       return priceMap.laser?.[item.area]?.[item.package];
     }
 
-    if (type === "full-body") {
+    if (item.type === "full-body") {
       return priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
     }
 
-    if (type === "facial") {
+    if (item.type === "facial") {
       return priceMap[item.service]?.[item.key];
     }
 
-    if (type === "med-spa") {
+    if (item.type === "med-spa") {
       return priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon || "none"];
     }
 
-    if (type === "other-service") {
+    if (item.type === "other-service") {
       return otherServicesPrices?.[item.serviceKey];
     }
 
     return null;
-
-  } catch (err) {
-    console.error("Erro ao resolver priceId:", err, item);
+  } catch {
     return null;
   }
 }
 
-
 // ==============================
-// RESOLVE DESCONTOS
+// RESOLVE DISCOUNTS (FINAL)
 // ==============================
 async function resolveDiscounts(customer, items) {
-  const discounts = [];
 
-  if (!customer.lifetime_total || customer.lifetime_total === 0) {
-    discounts.push({ promotion_code: "promo_1T2B8qLVWAMw3iFeuDu7TgOB" });
-    return discounts;
+  // 1️⃣ PRIMEIRA COMPRA (PRIORIDADE MÁXIMA)
+  if (!customer.first_purchase_used) {
+    return {
+      discounts: [{ promotion_code: "promo_1T2B8qLVWAMw3iFeuDu7TgOB" }],
+      metadata: { discount_type: "first_purchase" }
+    };
   }
 
-  const facialTypes = ["ll-signature", "classic-deluxe", "ll-teen", "med-spa"];
-  const facialItems = items.filter((i) => facialTypes.includes(i.type));
+  const hasLaser = items.some(i => i.type === "laser" || i.type === "full-body");
+  const hasFacial = items.some(i => i.type === "facial");
+  const hasMicroneedling = items.some(
+    i => i.type === "med-spa" &&
+         i.service === "microneedling" &&
+         i.package === "single"
+  );
+  const hasMembershipPlatinum = items.some(
+    i => i.type === "membership" && i.plan === "platinum"
+  );
+  const hasOtherFullFace = items.some(
+    i => i.type === "other-service" &&
+         i.serviceKey === "combo-full-face"
+  );
 
-  if (facialItems.length > 0) {
-    if (customer.facial_discount_next === 10) discounts.push({ coupon: "BNKguNqk" });
-    else if (customer.facial_discount_next === 7) discounts.push({ coupon: "qQVDq1Hd" });
-    else if (customer.facial_discount_next === 5) discounts.push({ coupon: "pvJpxT7h" });
+  // 2️⃣ CASHBACK
+  if (hasLaser && customer.cashback_balance > 0) {
+
+    const coupon = await stripe.coupons.create({
+      amount_off: Math.round(customer.cashback_balance * 100),
+      currency: "usd",
+      duration: "once",
+      name: "Laser Cashback"
+    });
+
+    return {
+      discounts: [{ coupon: coupon.id }],
+      metadata: { discount_type: "cashback" }
+    };
   }
 
-  return discounts;
+  // 3️⃣ FACIAL PROGRESSIVO
+  if (hasFacial && customer.facial_discount_next > 0) {
+
+    const map = {
+      10: "BNKguNqk",
+      7: "qQVDq1Hd",
+      5: "pvJpxT7h"
+    };
+
+    return {
+      discounts: [{ coupon: map[customer.facial_discount_next] }],
+      metadata: { discount_type: "facial" }
+    };
+  }
+
+  // 4️⃣ MICRONEEDLING
+  if (hasMicroneedling && !customer.microneedling_discount_used) {
+    return {
+      discounts: [{ promotion_code: "promo_1T2C4eLVWAMw3iFelFs4ILhS" }],
+      metadata: { discount_type: "microneedling" }
+    };
+  }
+
+  // 5️⃣ MEMBERSHIP
+  if (hasMembershipPlatinum) {
+    return {
+      discounts: [{ promotion_code: "promo_1T2C35LVWAMw3iFeaHNr796B" }],
+      metadata: { discount_type: "membership" }
+    };
+  }
+
+  // 6️⃣ OTHER SERVICES
+  if (hasOtherFullFace) {
+    return {
+      discounts: [{ promotion_code: "promo_1T2C1jLVWAMw3iFekFFK21u4" }],
+      metadata: { discount_type: "other" }
+    };
+  }
+
+  return { discounts: [], metadata: {} };
 }
 
 // ==============================
-// CREATE CHECKOUT SESSION
+// CREATE CHECKOUT
 // ==============================
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
-    if (!email || !Array.isArray(items) || items.length === 0 || items.length > 20) {
+    if (!email || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Dados inválidos" });
     }
 
     const customer = await getOrCreateCustomer(email);
 
-    const line_items = items.map((item) => {
+    const line_items = items.map(item => {
       const priceId = resolvePriceId(item);
-      if (!priceId) throw new Error(`Produto inválido detectado: ${JSON.stringify(item)}`);
+      if (!priceId) throw new Error("Produto inválido");
       return { price: priceId, quantity: item.quantity || 1 };
     });
 
-    const discounts = await resolveDiscounts(customer, items);
+    const { discounts, metadata } =
+      await resolveDiscounts(customer, items);
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer_email: email,
       line_items,
       discounts,
-      metadata: { customer_email: email },
+      metadata: {
+        customer_email: email,
+        ...metadata
+      },
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel",
     });
 
     res.json({ url: session.url });
+
   } catch (err) {
-    console.error("Erro no checkout:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ==============================
-// WEBHOOK STRIPE
+// WEBHOOK
 // ==============================
-app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  let event;
+app.post("/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
 
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
-  } catch (err) {
-    console.log("Webhook signature verification failed.", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+    const sig = req.headers["stripe-signature"];
+    let event;
 
-  if (event.type === "checkout.session.completed") {
-    const session = await stripe.checkout.sessions.retrieve(event.data.object.id, { expand: ["line_items.data.price"] });
-    const email = session.customer_details?.email;
-    if (!email) return res.json({ received: true });
-
-    const total = session.amount_total / 100;
-    const customer = await getOrCreateCustomer(email);
-
-    let laserTotal = 0;
-    let facialTotal = 0;
-
-    session.line_items.data.forEach((item) => {
-      const category = item.price.metadata?.category;
-      const amount = item.amount_total / 100;
-      if (category === "laser") laserTotal += amount;
-      if (category === "facial") facialTotal += amount;
-    });
-
-    await supabase.from("customers").update({ lifetime_total: (customer.lifetime_total || 0) + total }).eq("email", email);
-
-    if (laserTotal > 0) {
-      const newLaserTotal = (customer.laser_total || 0) + laserTotal;
-      let tier = 0;
-      if (newLaserTotal >= 3000) tier = 10;
-      else if (newLaserTotal >= 1500) tier = 7;
-      else if (newLaserTotal >= 500) tier = 5;
-
-      const cashbackEarned = (laserTotal * tier) / 100;
-
-      await supabase
-        .from("customers")
-        .update({ laser_total: newLaserTotal, laser_tier: tier, cashback_balance: (customer.cashback_balance || 0) + cashbackEarned })
-        .eq("email", email);
-
-      await supabase.from("cashback_transactions").insert([{ email, amount: cashbackEarned, type: "earned", source: "laser purchase" }]);
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    if (facialTotal > 0) {
-      let discountTier = 0;
-      if (facialTotal >= 1500) discountTier = 10;
-      else if (facialTotal >= 600) discountTier = 7;
-      else if (facialTotal >= 300) discountTier = 5;
+    if (event.type === "checkout.session.completed") {
 
-      await supabase.from("customers").update({ facial_discount_next: discountTier }).eq("email", email);
+      const session = await stripe.checkout.sessions.retrieve(
+        event.data.object.id,
+        { expand: ["line_items.data.price"] }
+      );
+
+      const email = session.customer_details?.email;
+      if (!email) return res.json({ received: true });
+
+      const customer = await getOrCreateCustomer(email);
+      const total = session.amount_total / 100;
+
+      // Atualiza lifetime
+      await supabase.from("customers").update({
+        lifetime_total: (customer.lifetime_total || 0) + total
+      }).eq("email", email);
+
+      // Primeira compra
+      if (!customer.first_purchase_used) {
+        await supabase.from("customers")
+          .update({ first_purchase_used: true })
+          .eq("email", email);
+      }
+
+      // Cashback usado
+      if (session.metadata.discount_type === "cashback") {
+        await supabase.from("customers")
+          .update({ cashback_balance: 0 })
+          .eq("email", email);
+      }
+
+      // Microneedling usado
+      if (session.metadata.discount_type === "microneedling") {
+        await supabase.from("customers")
+          .update({ microneedling_discount_used: true })
+          .eq("email", email);
+      }
+
+      console.log("Pagamento processado:", email);
     }
 
-    console.log(`Checkout processed for: ${email}`);
+    res.json({ received: true });
   }
-
-  res.json({ received: true });
-});
+);
 
 app.get("/", (_, res) => res.send("Stripe API running 🚀"));
 
