@@ -155,7 +155,7 @@ function resolvePriceId(item) {
 async function resolveDiscounts(customer, items) {
 
   // ==============================
-  // 🔒 RESOLVE PRICE IDS PRIMEIRO
+  // 🔒 RESOLVE PRICE IDS
   // ==============================
   const resolvedItems = items.map(item => {
     const priceId = resolvePriceId(item);
@@ -164,7 +164,7 @@ async function resolveDiscounts(customer, items) {
   });
 
   // ==============================
-  // 🔎 CLASSIFICAÇÃO BASEADA EM PRICE ID
+  // 🔎 MAPAS DE IDS
   // ==============================
 
   const laserIds = [
@@ -193,12 +193,10 @@ async function resolveDiscounts(customer, items) {
   let hasMembershipPlatinum = false;
   let hasOtherFullFace = false;
 
-  let projectedFacialTotal = customer.facial_total || 0;
+  // 👉 Facial só considera compra atual
+  let currentFacialPurchase = 0;
 
   for (const item of resolvedItems) {
-
-    const stripePrice = await stripe.prices.retrieve(item.priceId);
-    const itemTotal = (stripePrice.unit_amount / 100) * item.quantity;
 
     if (laserIds.includes(item.priceId)) {
       hasLaser = true;
@@ -206,7 +204,6 @@ async function resolveDiscounts(customer, items) {
 
     if (facialIds.includes(item.priceId)) {
       hasFacial = true;
-      projectedFacialTotal += itemTotal;
     }
 
     if (item.priceId === microneedlingSingleId) {
@@ -223,7 +220,7 @@ async function resolveDiscounts(customer, items) {
   }
 
   // ==============================
-  // 🥇 1. PRIMEIRA COMPRA
+  // 🥇 1. POPUP - PRIORIDADE MÁXIMA
   // ==============================
   if (customer.popup_unlocked && !customer.first_purchase_used) {
     return {
@@ -263,25 +260,35 @@ async function resolveDiscounts(customer, items) {
   }
 
   // ==============================
-  // 🎯 5. FACIAL PROGRESSIVO
+  // 🎯 5. FACIAL (APENAS COMPRA ATUAL)
   // ==============================
   if (hasFacial) {
 
+    // calcular total facial da compra atual
+    for (const item of items) {
+      const priceId = resolvePriceId(item);
+      if (facialIds.includes(priceId)) {
+        // aqui usamos metadata enviada do front
+        currentFacialPurchase += item.calculatedPrice || 0;
+      }
+    }
+
     let discountTier = 0;
 
-    if (projectedFacialTotal >= 1500) discountTier = 10;
-    else if (projectedFacialTotal >= 600) discountTier = 7;
-    else if (projectedFacialTotal >= 300) discountTier = 5;
+    if (currentFacialPurchase >= 1500) discountTier = 10;
+    else if (currentFacialPurchase >= 600) discountTier = 7;
+    else if (currentFacialPurchase >= 300) discountTier = 5;
 
     if (discountTier > 0) {
-      const map = {
+
+      const couponMap = {
         10: "BNKguNqk",
         7: "qQVDq1Hd",
         5: "pvJpxT7h"
       };
 
       return {
-        discounts: [{ coupon: map[discountTier] }],
+        discounts: [{ coupon: couponMap[discountTier] }],
         metadata: { discount_type: "facial" }
       };
     }
@@ -360,12 +367,29 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
   }
 
   if (event.type === "checkout.session.completed") {
-    const session = await stripe.checkout.sessions.retrieve(event.data.object.id, { expand: ["line_items.data.price"] });
-    const email = session.customer_details?.email;
-    if (!email) return res.json({ received: true });
 
-    const customer = await getOrCreateCustomer(email);
-    const total = session.amount_total / 100;
+  const session = await stripe.checkout.sessions.retrieve(
+    event.data.object.id,
+    { expand: ["line_items.data.price"] }
+  );
+
+  const email = session.customer_details?.email;
+  if (!email) return res.json({ received: true });
+
+  const customer = await getOrCreateCustomer(email);
+
+  // 🔐 BLOQUEIO CONTRA DUPLICAÇÃO
+  if (customer.last_checkout_session === session.id) {
+    console.log("Webhook duplicado ignorado:", session.id);
+    return res.json({ received: true });
+  }
+
+  // marca imediatamente como processado
+  await supabase.from("customers")
+    .update({ last_checkout_session: session.id })
+    .eq("email", email);
+
+  const total = session.amount_total / 100;
 
     let laserSpent = 0;
 let facialSpent = 0;
