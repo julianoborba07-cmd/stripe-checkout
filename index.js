@@ -307,9 +307,26 @@ app.post("/create-checkout-session", async (req, res) => {
 }
 
     // =========================
-    // INCLUIR PROMO CODE SE HOUVER
-    // =========================
-    if (promoCode) discounts.push({ promotion_code: promoCode });
+// VALIDAR SE EXISTE ITEM ELEGÍVEL PARA CUPOM
+// =========================
+
+const eligiblePriceIds = [
+  "price_1SxA01LVWAMw3iFesKpaxZvz",
+  "price_1SyuFlLVWAMw3iFeAAU7GR1e",
+  "price_1SziCULVWAMw3iFeKQ7lsdNk"
+];
+
+const hasEligibleItem = line_items.some(item =>
+  eligiblePriceIds.includes(item.price)
+);
+
+// =========================
+// INCLUIR PROMO CODE SE HOUVER E FOR ELEGÍVEL
+// =========================
+
+if (promoCode && hasEligibleItem) {
+  discounts.push({ promotion_code: promoCode });
+}
 
     // =========================
     // CRIAR SESSÃO STRIPE
