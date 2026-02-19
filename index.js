@@ -141,9 +141,12 @@ function resolvePriceId(item) {
     if (type === "membership") return priceMap.membership?.[item.plan]?.[item.package];
     if (type === "laser") return priceMap.laser?.[item.area]?.[item.package];
     if (type === "full-body") return priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
-    if (type === "med-spa") return priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon || "none"];
-    if (type === "other-service") return otherServicesPrices?.[item.serviceKey || item.service];
-    if (type === "facial") return priceMap[item.key]?.[`${item.package || "single"}-${item.addon || "none"}`];
+    if (type === "facial") 
+  return priceMap[item.service]?.[item.key];
+    if (type === "med-spa") 
+  return priceMap[item.service]?.[item.key];
+    if (type === "other-service") 
+  return priceMap[item.service]?.[item.key];
 
     return null;
   } catch (err) {
