@@ -40,7 +40,7 @@ async function getOrCreateCustomer(email) {
         microneedling_discount_used: false,
         facial_total: 0,
         facial_discount_next: 0,
-        popup_unlocked: false
+        popup_unlocked: true // <-- já ativa aqui
       }])
       .select()
       .single();
@@ -260,39 +260,37 @@ async function resolveDiscounts(customer, items) {
   }
 
   // ==============================
-  // 🎯 5. FACIAL (APENAS COMPRA ATUAL)
-  // ==============================
-  if (hasFacial) {
+// 🎯 5. FACIAL (APENAS COMPRA ATUAL)
+// ==============================
+if (hasFacial) {
 
-    // calcular total facial da compra atual
-    for (const item of items) {
-      const priceId = resolvePriceId(item);
-      if (facialIds.includes(priceId)) {
-        // aqui usamos metadata enviada do front
-        currentFacialPurchase += item.calculatedPrice || 0;
-      }
-    }
-
-    let discountTier = 0;
-
-    if (currentFacialPurchase >= 1500) discountTier = 10;
-    else if (currentFacialPurchase >= 600) discountTier = 7;
-    else if (currentFacialPurchase >= 300) discountTier = 5;
-
-    if (discountTier > 0) {
-
-      const couponMap = {
-        10: "BNKguNqk",
-        7: "qQVDq1Hd",
-        5: "pvJpxT7h"
-      };
-
-      return {
-        discounts: [{ coupon: couponMap[discountTier] }],
-        metadata: { discount_type: "facial" }
-      };
+  for (const item of resolvedItems) {
+    if (facialIds.includes(item.priceId)) {
+      const stripePrice = await stripe.prices.retrieve(item.priceId);
+      currentFacialPurchase += (stripePrice.unit_amount / 100) * item.quantity;
     }
   }
+
+  let discountTier = 0;
+
+  if (currentFacialPurchase >= 1500) discountTier = 10;
+  else if (currentFacialPurchase >= 600) discountTier = 7;
+  else if (currentFacialPurchase >= 300) discountTier = 5;
+
+  if (discountTier > 0) {
+
+    const couponMap = {
+      10: "BNKguNqk",
+      7: "qQVDq1Hd",
+      5: "pvJpxT7h"
+    };
+
+    return {
+      discounts: [{ coupon: couponMap[discountTier] }],
+      metadata: { discount_type: "facial" }
+    };
+  }
+}
 
   // ==============================
   // 💰 6. CASHBACK (ÚLTIMO)
