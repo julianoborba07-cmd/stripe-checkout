@@ -109,6 +109,40 @@ const priceMap = {
     "3-led20": "price_1SuEi5LVWAMw3iFewusx6G2v",
     "3-peel": "price_1SuEiLLVWAMw3iFe8YD0gUZy",
   },
+   morpheus: {
+    "morpheus": {
+      single: {
+        none: "price_1T3io1LVWAMw3iFeYCb7pmvS",
+        exosomes: "price_1T3iomLVWAMw3iFe895XqAfF",
+        salmon: "price_1T3ipvLVWAMw3iFe9Q0wKLlV"
+      },
+      2: {
+        none: "price_1T3iqyLVWAMw3iFeMTuCGFGx",
+        exosomes: "price_1T3isALVWAMw3iFeQXPeVtUv",
+        salmon: "price_1T3it4LVWAMw3iFecG7B95Q6"
+      },
+      3: {
+        none: "price_1T3iuQLVWAMw3iFeKQN7i4fR",
+        exosomes: "price_1T3iv4LVWAMw3iFe3iOdRxXs",
+        salmon: "price_1T3ivWLVWAMw3iFeEVdCK8hV"
+      }
+    },
+    "morpheus-body": {
+      single: {
+        none: "price_1T3iwtLVWAMw3iFezQNoxYyz",
+        exosomes: "price_1T3ixcLVWAMw3iFeB2S9YvZg",
+        salmon: "price_1T3iyULVWAMw3iFejpyukweq"
+      },
+      2: {
+        none: "price_1T3iz8LVWAMw3iFeiUG56lb0",
+        exosomes: "price_1T3izmLVWAMw3iFebwwOwsSA",
+        salmon: "price_1T3j0CLVWAMw3iFehOnasPI7"
+      },
+      3: {
+        none: "price_1T3j0yLVWAMw3iFeO89KT1Uw",
+        exosomes: "price_1T3j1bLVWAMw3iFef1plSmKA",
+        salmon: "price_1T3j2TLVWAMw3iFeearvfAnH"
+  },
   "med-spa": {
     microneedling: {
       single: { none: "price_1SxA01LVWAMw3iFesKpaxZvz", exosomes: "price_1SxA0VLVWAMw3iFeDjB6cXS9", neck: "price_1SxA1bLVWAMw3iFeENwK7Pjo", "exo-neck": "price_1SxAu4LVWAMw3iFe0xzdQLj6" },
@@ -137,6 +171,9 @@ const otherServicesPrices = {
 // ==============================
 function resolvePriceId(item) {
   try {
+    if (item.type === "morpheus") {
+      return priceMap.morpheus?.[item.serviceKey]?.[item.packageKey]?.[item.addon || "none"];
+    }
     if (item.type === "membership") return priceMap.membership?.[item.plan]?.[item.package];
     if (item.type === "laser") return priceMap.laser?.[item.area]?.[item.package];
     if (item.type === "full-body") return priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
