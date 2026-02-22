@@ -142,6 +142,8 @@ const priceMap = {
         none: "price_1T3j0yLVWAMw3iFeO89KT1Uw",
         exosomes: "price_1T3j1bLVWAMw3iFef1plSmKA",
         salmon: "price_1T3j2TLVWAMw3iFeearvfAnH"
+      }
+    }
   },
   "med-spa": {
     microneedling: {
