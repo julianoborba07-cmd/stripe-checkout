@@ -316,6 +316,13 @@ async function resolveDiscounts(customer, items) {
 // ==============================
 // CREATE CHECKOUT
 // ==============================
+const STRIPE_PRODUCTS = {
+  morpheus: "prod_U39sJVkTLR7trX",
+  body: "prod_U39ssoiJMPSmRG",
+  lumecca: "prod_U39tei6ivoThaN",
+  combo: "prod_U39yMaYdkhYBaS"
+};
+
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
@@ -325,28 +332,59 @@ app.post("/create-checkout-session", async (req, res) => {
     const customer = await getOrCreateCustomer(email);
 
     const line_items = items.map(item => {
-      const priceId = resolvePriceId(item);
-      if (!priceId) throw new Error("Produto inválido");
-      return { price: priceId, quantity: item.quantity || 1 };
-    });
+
+  if (item.type === "morpheus") {
+
+  let productId;
+
+  if (item.combo) {
+    productId = STRIPE_PRODUCTS.combo;
+  } else if (item.mode === "body") {
+    productId = STRIPE_PRODUCTS.body;
+  } else if (item.mode === "lumecca") {
+    productId = STRIPE_PRODUCTS.lumecca;
+  } else {
+    productId = STRIPE_PRODUCTS.morpheus;
+  }
+
+  return {
+    price_data: {
+      currency: "usd",
+      product: productId,
+      unit_amount: Math.round(item.price * 100),
+    },
+    quantity: item.qty || 1
+  };
+}
+
+  // mantém lógica antiga para outros serviços
+  const priceId = resolvePriceId(item);
+  if (!priceId) throw new Error("Produto inválido");
+  return { price: priceId, quantity: item.quantity || 1 };
+});
 
     const { discounts, metadata } = await resolveDiscounts(customer, items);
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer_email: email,
-      line_items,
-      discounts,
-      metadata: { customer_email: email, ...metadata },
-      success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: "https://lltouch.com/cancel",
-    });
+// Detecta se existe morpheus no carrinho
+const morpheusItem = items.find(i => i.type === "morpheus");
 
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error("Erro create-checkout-session:", err);
-    res.status(500).json({ error: err.message });
-  }
+const session = await stripe.checkout.sessions.create({
+  mode: "payment",
+  customer_email: email,
+  line_items,
+  discounts,
+  metadata: {
+    customer_email: email,
+    ...metadata,
+
+    ...(morpheusItem && {
+      service_type: "morpheus",
+      service_mode: morpheusItem.mode,
+      service_key: morpheusItem.serviceKey
+    })
+  },
+  success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+  cancel_url: "https://lltouch.com/cancel",
 });
 
 // ==============================
