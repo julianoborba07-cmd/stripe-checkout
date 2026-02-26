@@ -443,10 +443,10 @@ app.post("/unlock-popup", async (req, res) => {
       .eq("email", email);
 
     res.json({ success: true });
-  } catch (err) {
-    console.error("Erro unlock-popup:", err);
-    res.status(500).json({ error: "Erro interno" });
-  }
+  } catch (error) {
+  console.error("Erro checkout COMPLETO:", error);
+  res.status(500).json({ error: error.message });
+}
 });
 
 // ==============================
