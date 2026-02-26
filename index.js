@@ -196,44 +196,44 @@ async function resolveDiscounts(customer, items) {
   }
 
   // ==============================
-  // 1️⃣ POPUP FIRST PURCHASE (PRIORIDADE)
-  // ==============================
-  if (customer.popup_unlocked && !customer.first_purchase_used) {
-    return {
-      discounts: [{ promotion_code: "promo_1T2B8qLVWAMw3iFeuDu7TgOB" }],
-      metadata: { discount_type: "first_purchase" }
-    };
-  }
+// 1️⃣ POPUP FIRST PURCHASE (PRIORIDADE)
+// ==============================
+if (customer.popup_unlocked && !customer.first_purchase_used) {
+  return {
+    discounts: [{ coupon: "jmx11QWL" }],
+    metadata: { discount_type: "first_purchase" }
+  };
+}
 
-  // ==============================
-  // 2️⃣ MICRONEEDLING
-  // ==============================
-  if (hasMicroneedling && !customer.microneedling_discount_used) {
-    return {
-      discounts: [{ promotion_code: "promo_1T2C4eLVWAMw3iFelFs4ILhS" }],
-      metadata: { discount_type: "microneedling" }
-    };
-  }
+// ==============================
+// 2️⃣ MICRONEEDLING
+// ==============================
+if (hasMicroneedling && !customer.microneedling_discount_used) {
+  return {
+    discounts: [{ coupon: "U2VFw8Yj" }],
+    metadata: { discount_type: "microneedling" }
+  };
+}
 
-  // ==============================
-  // 3️⃣ MEMBERSHIP
-  // ==============================
-  if (hasMembershipPlatinum) {
-    return {
-      discounts: [{ promotion_code: "promo_1T2C35LVWAMw3iFeaHNr796B" }],
-      metadata: { discount_type: "membership" }
-    };
-  }
+// ==============================
+// 3️⃣ MEMBERSHIP
+// ==============================
+if (hasMembershipPlatinum) {
+  return {
+    discounts: [{ coupon: "thCriSEx" }],
+    metadata: { discount_type: "membership" }
+  };
+}
 
-  // ==============================
-  // 4️⃣ OTHER SERVICES
-  // ==============================
-  if (hasOtherFullFace) {
-    return {
-      discounts: [{ promotion_code: "promo_1T2C1jLVWAMw3iFekFFK21u4" }],
-      metadata: { discount_type: "other" }
-    };
-  }
+// ==============================
+// 4️⃣ OTHER SERVICES
+// ==============================
+if (hasOtherFullFace) {
+  return {
+    discounts: [{ coupon: "oLmALLlo" }],
+    metadata: { discount_type: "other" }
+  };
+}
 
   // ==============================
   // 5️⃣ FACIAL (APENAS COMPRA ATUAL)
