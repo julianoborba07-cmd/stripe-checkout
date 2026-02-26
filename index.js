@@ -327,17 +327,6 @@ app.post(
 );
 
 // ==============================
-// JSON & CORS (DEPOIS DO WEBHOOK)
-// ==============================
-app.use(express.json());
-
-app.use(
-  cors({
-    origin: ["https://lltouch.com"],
-  })
-);
-
-// ==============================
 // STRIPE PRODUCTS
 // ==============================
 const STRIPE_PRODUCTS = {
@@ -390,34 +379,32 @@ app.post("/create-checkout-session", async (req, res) => {
       };
     });
 
-    const { discounts, metadata } = await resolveDiscounts(customer, items);
+    const { discounts, metadata } = await resolveDiscounts(
+      customer,
+      items
+    );
 
-const morpheusItem = items.find((i) => i.type === "morpheus");
+    const morpheusItem = items.find((i) => i.type === "morpheus");
 
-const sessionConfig = {
-  mode: "payment",
-  customer_email: email,
-  line_items,
-  allow_promotion_codes: true,
-  metadata: {
-    customer_email: email,
-    ...metadata,
-    ...(morpheusItem && {
-      service_type: "morpheus",
-      service_mode: morpheusItem.mode,
-      service_key: morpheusItem.serviceKey,
-    }),
-  },
-  success_url:
-    "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-  cancel_url: "https://lltouch.com/cancel",
-};
-
-if (discounts.length > 0) {
-  sessionConfig.discounts = discounts;
-}
-
-const session = await stripe.checkout.sessions.create(sessionConfig);
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: email,
+      line_items,
+      discounts,
+      
+      metadata: {
+        customer_email: email,
+        ...metadata,
+        ...(morpheusItem && {
+          service_type: "morpheus",
+          service_mode: morpheusItem.mode,
+          service_key: morpheusItem.serviceKey,
+        }),
+      },
+      success_url:
+        "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+      cancel_url: "https://lltouch.com/cancel",
+    });
 
     res.json({ url: session.url });
   } catch (error) {
