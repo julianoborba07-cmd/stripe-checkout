@@ -192,12 +192,13 @@ function resolvePriceId(item) {
 // RESOLVE DISCOUNTS (FINAL)
 // ==============================
 async function resolveDiscounts(customer, items) {
-  const resolvedItems = items.map(item => {
+  const resolvedItems = items
+  .filter(item => item.type !== "morpheus")
+  .map(item => {
     const priceId = resolvePriceId(item);
     if (!priceId) throw new Error("Produto inválido");
     return { priceId, quantity: item.quantity || 1 };
   });
-
   const laserIds = [
     ...Object.values(priceMap.laser).flatMap(a => Object.values(a)),
     ...Object.values(priceMap["full-body"]).flatMap(p => Object.values(p))
@@ -405,10 +406,6 @@ app.post("/create-checkout-session", async (req, res) => {
           productId = STRIPE_PRODUCTS.lumecca;
         else productId = STRIPE_PRODUCTS.morpheus;
 
-  console.log("MORPHEUS ITEM:", item);
-  console.log("PRODUCT ID:", productId);
-  console.log("PRICE RECEIVED:", item.price);
-  
         return {
           price_data: {
             currency: "usd",
