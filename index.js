@@ -390,13 +390,6 @@ app.post("/create-checkout-session", async (req, res) => {
       };
     });
 
-    const { discounts, metadata } = await resolveDiscounts(
-      customer,
-      items
-    );
-
-    const morpheusItem = items.find((i) => i.type === "morpheus");
-
     const { discounts, metadata } = await resolveDiscounts(customer, items);
 
 const morpheusItem = items.find((i) => i.type === "morpheus");
@@ -420,7 +413,6 @@ const sessionConfig = {
   cancel_url: "https://lltouch.com/cancel",
 };
 
-// ⚠️ Só adiciona discounts se realmente existir
 if (discounts.length > 0) {
   sessionConfig.discounts = discounts;
 }
