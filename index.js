@@ -387,6 +387,7 @@ const STRIPE_PRODUCTS = {
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
+    console.log("Items recebidos:", JSON.stringify(items, null, 2));
 
     if (!email || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Dados inválidos" });
