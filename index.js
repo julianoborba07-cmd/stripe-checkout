@@ -316,6 +316,8 @@ async function resolveDiscounts(customer, items) {
 // ==============================
 // CREATE CHECKOUT
 // ==============================
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
 const STRIPE_PRODUCTS = {
   morpheus: "prod_U39sJVkTLR7trX",
   body: "prod_U39ssoiJMPSmRG",
