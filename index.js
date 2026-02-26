@@ -402,6 +402,7 @@ app.post("/create-checkout-session", async (req, res) => {
       customer_email: email,
       line_items,
       discounts,
+      allow_promotion_codes: true
       metadata: {
         customer_email: email,
         ...metadata,
