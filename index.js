@@ -397,17 +397,23 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const line_items = items.map((item) => {
       if (item.type === "morpheus") {
-  const priceId = resolvePriceId(item);
+        let productId;
 
-  if (!priceId) {
-    throw new Error("Price ID inválido para Morpheus");
-  }
+        if (item.combo) productId = STRIPE_PRODUCTS.combo;
+        else if (item.mode === "body") productId = STRIPE_PRODUCTS.body;
+        else if (item.mode === "lumecca")
+          productId = STRIPE_PRODUCTS.lumecca;
+        else productId = STRIPE_PRODUCTS.morpheus;
 
-  return {
-    price: priceId,
-    quantity: item.quantity || 1,
-  };
-}
+        return {
+          price_data: {
+            currency: "usd",
+            product: productId,
+            unit_amount: Math.round(item.price * 100),
+          },
+          quantity: item.qty || 1,
+        };
+      }
 
       const priceId = resolvePriceId(item);
       if (!priceId) throw new Error("Produto inválido");
