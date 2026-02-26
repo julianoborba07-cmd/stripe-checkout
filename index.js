@@ -314,189 +314,146 @@ async function resolveDiscounts(customer, items) {
 }
 
 // ==============================
-// CREATE CHECKOUT
+// WEBHOOK (PRECISA VIR ANTES DO express.json())
 // ==============================
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
 
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Erro webhook:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === "checkout.session.completed") {
+      const session = await stripe.checkout.sessions.retrieve(
+        event.data.object.id,
+        { expand: ["line_items.data.price"] }
+      );
+
+      const email = session.customer_details?.email;
+      if (!email) return res.json({ received: true });
+
+      const customer = await getOrCreateCustomer(email);
+
+      if (customer.last_checkout_session === session.id)
+        return res.json({ received: true });
+
+      await supabase
+        .from("customers")
+        .update({ last_checkout_session: session.id })
+        .eq("email", email);
+
+      console.log("Pagamento processado:", email);
+    }
+
+    res.json({ received: true });
+  }
+);
+
+// ==============================
+// JSON & CORS (DEPOIS DO WEBHOOK)
+// ==============================
+app.use(express.json());
+
+app.use(
+  cors({
+    origin: ["https://lltouch.com"],
+  })
+);
+
+// ==============================
+// STRIPE PRODUCTS
+// ==============================
 const STRIPE_PRODUCTS = {
   morpheus: "prod_U39sJVkTLR7trX",
   body: "prod_U39ssoiJMPSmRG",
   lumecca: "prod_U39tei6ivoThaN",
-  combo: "prod_U39yMaYdkhYBaS"
+  combo: "prod_U39yMaYdkhYBaS",
 };
 
+// ==============================
+// CREATE CHECKOUT SESSION
+// ==============================
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
-    if (!email || !Array.isArray(items) || items.length === 0)
+
+    if (!email || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Dados inválidos" });
+    }
 
     const customer = await getOrCreateCustomer(email);
 
-    const line_items = items.map(item => {
+    const line_items = items.map((item) => {
+      if (item.type === "morpheus") {
+        let productId;
 
-  if (item.type === "morpheus") {
+        if (item.combo) productId = STRIPE_PRODUCTS.combo;
+        else if (item.mode === "body") productId = STRIPE_PRODUCTS.body;
+        else if (item.mode === "lumecca")
+          productId = STRIPE_PRODUCTS.lumecca;
+        else productId = STRIPE_PRODUCTS.morpheus;
 
-  let productId;
+        return {
+          price_data: {
+            currency: "usd",
+            product: productId,
+            unit_amount: Math.round(item.price * 100),
+          },
+          quantity: item.qty || 1,
+        };
+      }
 
-  if (item.combo) {
-    productId = STRIPE_PRODUCTS.combo;
-  } else if (item.mode === "body") {
-    productId = STRIPE_PRODUCTS.body;
-  } else if (item.mode === "lumecca") {
-    productId = STRIPE_PRODUCTS.lumecca;
-  } else {
-    productId = STRIPE_PRODUCTS.morpheus;
-  }
+      const priceId = resolvePriceId(item);
+      if (!priceId) throw new Error("Produto inválido");
 
-  return {
-    price_data: {
-      currency: "usd",
-      product: productId,
-      unit_amount: Math.round(item.price * 100),
-    },
-    quantity: item.qty || 1
-  };
-}
+      return {
+        price: priceId,
+        quantity: item.quantity || 1,
+      };
+    });
 
-  // mantém lógica antiga para outros serviços
-  const priceId = resolvePriceId(item);
-  if (!priceId) throw new Error("Produto inválido");
-  return { price: priceId, quantity: item.quantity || 1 };
-});
-
-    const { discounts, metadata } = await resolveDiscounts(customer, items);
-
-// Detecta se existe morpheus no carrinho
-const morpheusItem = items.find(i => i.type === "morpheus");
-
-const session = await stripe.checkout.sessions.create({
-  mode: "payment",
-  customer_email: email,
-  line_items,
-  discounts,
-  metadata: {
-    customer_email: email,
-    ...metadata,
-
-    ...(morpheusItem && {
-      service_type: "morpheus",
-      service_mode: morpheusItem.mode,
-      service_key: morpheusItem.serviceKey
-    })
-  },
-  success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-  cancel_url: "https://lltouch.com/cancel",
-});
-
-// ==============================
-// WEBHOOK
-// ==============================
-app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error("Erro webhook:", err);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  if (event.type === "checkout.session.completed") {
-    const session = await stripe.checkout.sessions.retrieve(
-      event.data.object.id,
-      { expand: ["line_items.data.price"] }
+    const { discounts, metadata } = await resolveDiscounts(
+      customer,
+      items
     );
 
-    const email = session.customer_details?.email;
-    if (!email) return res.json({ received: true });
+    const morpheusItem = items.find((i) => i.type === "morpheus");
 
-    const customer = await getOrCreateCustomer(email);
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: email,
+      line_items,
+      discounts,
+      metadata: {
+        customer_email: email,
+        ...metadata,
+        ...(morpheusItem && {
+          service_type: "morpheus",
+          service_mode: morpheusItem.mode,
+          service_key: morpheusItem.serviceKey,
+        }),
+      },
+      success_url:
+        "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+      cancel_url: "https://lltouch.com/cancel",
+    });
 
-    // 🔐 Bloqueio contra duplicação
-    if (customer.last_checkout_session === session.id) return res.json({ received: true });
-
-    await supabase.from("customers").update({ last_checkout_session: session.id }).eq("email", email);
-
-    const total = session.amount_total / 100;
-
-    let laserSpent = 0;
-    let facialSpent = 0;
-
-    const allLaserPriceIds = [
-      ...Object.values(priceMap.laser).flatMap(area => Object.values(area)),
-      ...Object.values(priceMap["full-body"]).flatMap(pkg => Object.values(pkg))
-    ];
-    const allFacialPriceIds = [
-      ...Object.values(priceMap["ll-signature"]),
-      ...Object.values(priceMap["classic-deluxe"]),
-      ...Object.values(priceMap["ll-teen"])
-    ];
-
-    for (const item of session.line_items.data) {
-      const priceId = item.price.id;
-      const amount = item.amount_total / 100;
-      if (allLaserPriceIds.includes(priceId)) laserSpent += amount;
-      if (allFacialPriceIds.includes(priceId)) facialSpent += amount;
-    }
-
-    // Atualizações principais
-    try { await supabase.from("customers").update({ lifetime_total: (customer.lifetime_total || 0) + total }).eq("email", email); } catch(e){console.error(e)}
-
-    if (session.metadata.discount_type === "first_purchase") {
-      try { await supabase.from("customers").update({ first_purchase_used: true }).eq("email", email); } catch(e){console.error(e)}
-    }
-
-    if (session.metadata.discount_type === "cashback") {
-      try { await supabase.from("customers").update({ cashback_balance: 0 }).eq("email", email); } catch(e){console.error(e)}
-    }
-
-    if (laserSpent > 0) {
-      const newLaserTotal = (customer.laser_total || 0) + laserSpent;
-      let tier = 0;
-      if (newLaserTotal >= 3000) tier = 10;
-      else if (newLaserTotal >= 1500) tier = 7;
-      else if (newLaserTotal >= 500) tier = 5;
-      const cashbackEarned = laserSpent * (tier / 100);
-
-      try {
-        await supabase.from("customers").update({
-          laser_total: newLaserTotal,
-          laser_tier: tier,
-          cashback_balance: (customer.cashback_balance || 0) + cashbackEarned
-        }).eq("email", email);
-
-        await supabase.from("cashback_transactions").insert([{
-          email,
-          amount: cashbackEarned,
-          type: "earned",
-          category: "laser",
-          source: "checkout"
-        }]);
-      } catch (e) { console.error("Erro laser progressivo:", e) }
-    }
-
-    if (facialSpent > 0) {
-      const newFacialTotal = (customer.facial_total || 0) + facialSpent;
-      let discountTier = 0;
-      if (newFacialTotal >= 1500) discountTier = 10;
-      else if (newFacialTotal >= 600) discountTier = 7;
-      else if (newFacialTotal >= 300) discountTier = 5;
-
-      try { await supabase.from("customers").update({ facial_total: newFacialTotal, facial_discount_next: discountTier }).eq("email", email); } catch(e){console.error("Erro facial progressivo:", e)}
-    }
-
-    if (session.metadata.discount_type === "microneedling") {
-      try { await supabase.from("customers").update({ microneedling_discount_used: true }).eq("email", email); } catch(e){console.error(e)}
-    }
-
-    await supabase.from("customers").update({ updated_at: new Date() }).eq("email", email);
-
-    console.log("Pagamento processado:", email);
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error("Erro checkout:", error);
+    res.status(500).json({ error: "Erro ao criar sessão" });
   }
-
-  res.json({ received: true });
 });
 
 // ==============================
@@ -504,11 +461,19 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
 // ==============================
 app.post("/unlock-popup", async (req, res) => {
   const { email } = req.body;
-  if (!email || !email.includes("@")) return res.status(400).json({ error: "Email inválido" });
 
-  const customer = await getOrCreateCustomer(email);
+  if (!email || !email.includes("@")) {
+    return res.status(400).json({ error: "Email inválido" });
+  }
+
   try {
-    await supabase.from("customers").update({ popup_unlocked: true }).eq("email", email);
+    await getOrCreateCustomer(email);
+
+    await supabase
+      .from("customers")
+      .update({ popup_unlocked: true })
+      .eq("email", email);
+
     res.json({ success: true });
   } catch (err) {
     console.error("Erro unlock-popup:", err);
@@ -516,7 +481,14 @@ app.post("/unlock-popup", async (req, res) => {
   }
 });
 
-app.get("/", (_, res) => res.send("Stripe API running 🚀"));
+// ==============================
+// ROOT
+// ==============================
+app.get("/", (_, res) =>
+  res.send("Stripe API running 🚀")
+);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port", PORT));
+app.listen(PORT, () =>
+  console.log("Server running on port", PORT)
+);
