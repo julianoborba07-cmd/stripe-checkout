@@ -384,6 +384,9 @@ const STRIPE_PRODUCTS = {
 // ==============================
 // CREATE CHECKOUT SESSION
 // ==============================
+console.log("MORPHEUS ITEM:", item);
+console.log("PRODUCT ID:", productId);
+
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
