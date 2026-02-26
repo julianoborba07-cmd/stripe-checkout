@@ -402,7 +402,7 @@ app.post("/create-checkout-session", async (req, res) => {
       customer_email: email,
       line_items,
       discounts,
-      allow_promotion_codes: discounts.length === 0,
+      
       metadata: {
         customer_email: email,
         ...metadata,
@@ -443,10 +443,10 @@ app.post("/unlock-popup", async (req, res) => {
       .eq("email", email);
 
     res.json({ success: true });
-  } catch (error) {
-  console.error("Erro checkout COMPLETO:", error);
-  res.status(500).json({ error: error.message });
-}
+  } catch (err) {
+    console.error("Erro unlock-popup:", err);
+    res.status(500).json({ error: "Erro interno" });
+  }
 });
 
 // ==============================
