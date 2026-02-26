@@ -397,23 +397,37 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const line_items = items.map((item) => {
       if (item.type === "morpheus") {
-        let productId;
+  let productId;
 
-        if (item.combo) productId = STRIPE_PRODUCTS.combo;
-        else if (item.mode === "body") productId = STRIPE_PRODUCTS.body;
-        else if (item.mode === "lumecca")
-          productId = STRIPE_PRODUCTS.lumecca;
-        else productId = STRIPE_PRODUCTS.morpheus;
+  if (item.combo === true) {
+    productId = STRIPE_PRODUCTS.combo;
+  } else if (item.mode === "body") {
+    productId = STRIPE_PRODUCTS.body;
+  } else if (item.mode === "lumecca") {
+    productId = STRIPE_PRODUCTS.lumecca;
+  } else {
+    productId = STRIPE_PRODUCTS.morpheus;
+  }
 
-        return {
-          price_data: {
-            currency: "usd",
-            product: productId,
-            unit_amount: Math.round(item.price * 100),
-          },
-          quantity: item.qty || 1,
-        };
-      }
+  if (!productId) {
+    console.error("Produto Morpheus inválido:", item);
+    throw new Error("Produto Morpheus inválido");
+  }
+
+  if (!item.price || isNaN(item.price)) {
+    console.error("Preço inválido:", item.price);
+    throw new Error("Preço inválido");
+  }
+
+  return {
+    price_data: {
+      currency: "usd",
+      product: productId,
+      unit_amount: Math.round(Number(item.price) * 100),
+    },
+    quantity: item.quantity || 1,
+  };
+}
 
       const priceId = resolvePriceId(item);
       if (!priceId) throw new Error("Produto inválido");
