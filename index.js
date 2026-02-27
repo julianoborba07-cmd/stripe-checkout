@@ -418,8 +418,7 @@ const line_items = items.map((item, index) => {
   // 🔥 MORPHEUS DINÂMICO
   if (item.type === "morpheus") {
 
-    console.log("ITEM COMPLETO:", item);
-    console.log("AREA RECEBIDA:", item.area);
+    console.log("ITEMS RECEBIDOS DO FRONT:", JSON.stringify(items, null, 2));
 
     let areaName = morpheusAreas[item.area] || "Treatment";
     const packageName = packageLabels[item.packageKey] || "";
