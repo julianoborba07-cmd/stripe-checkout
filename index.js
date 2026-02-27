@@ -357,30 +357,30 @@ app.post("/create-checkout-session", async (req, res) => {
       // 🔥 MORPHEUS DINÂMICO
       if (item.type === "morpheus") {
 
-  
-
-  const serviceName = item.area.replace(/-/g, " ");
-  const packageName =
-    item.packageKey === "single"
-      ? "Single Session"
-      : `${item.packageKey} Sessions`;
-
-  return {
-    price_data: {
-      currency: "usd",
-      product_data: {
-        name: `${serviceName} - ${packageName}`,
-        description: `
+        return {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: `${item.title} - ${item.packageLabel}`,
+              description: `
 Mode: ${item.mode}
-Addon: ${item.addon || "None"}
-${item.combo ? "Combo: Morpheus + Lumecca" : ""}
-        `.trim()
-      },
-      unit_amount: securePrice * 100,
-    },
-    quantity: item.qty || 1,
-  };
-}
+Addon: ${item.addonLabel || "None"}
+${item.comboLabel ? `Combo: ${item.comboLabel}` : ""}
+              `.trim(),
+              metadata: {
+                service_name: item.title,
+                package: item.packageLabel,
+                addon: item.addonLabel || "none",
+                combo: item.comboLabel || "none",
+                mode: item.mode,
+                area: item.area
+              }
+            },
+            unit_amount: Math.round(item.price * 100),
+          },
+          quantity: item.qty || 1,
+        };
+      }
 
       // 🔥 OUTROS PRODUTOS (mantém Stripe priceId)
       const priceId = resolvePriceId(item);
