@@ -438,7 +438,7 @@ const fullName = parts.filter(Boolean).join(" - ");
         product_data: {
           name: fullName,
           images: [
-    "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/6990cc44dc3503adabfaf075_WhatsApp%20Image%202026-02-14%20at%2016.25.11.jpeg"
+    "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
   ],
           metadata: {
             service_name: areaName,
