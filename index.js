@@ -386,25 +386,31 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const morpheusItem = items.find((i) => i.type === "morpheus");
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer_email: email,
-      line_items,
-      discounts,
-      
-      metadata: {
-        customer_email: email,
-        ...metadata,
-        ...(morpheusItem && {
-          service_type: "morpheus",
-          service_mode: morpheusItem.mode,
-          service_key: morpheusItem.serviceKey,
-        }),
-      },
-      success_url:
-        "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: "https://lltouch.com/cancel",
-    });
+    const hasAutoDiscount = discounts && discounts.length > 0;
+
+const session = await stripe.checkout.sessions.create({
+  mode: "payment",
+  customer_email: email,
+  line_items,
+
+  // 🔥 REGRA INTELIGENTE
+  ...(hasAutoDiscount
+    ? { discounts }
+    : { allow_promotion_codes: true }),
+
+  metadata: {
+    customer_email: email,
+    ...metadata,
+    ...(morpheusItem && {
+      service_type: "morpheus",
+      service_mode: morpheusItem.mode,
+      service_key: morpheusItem.serviceKey,
+    }),
+  },
+
+  success_url:"https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+  cancel_url: "https://lltouch.com/cancel",
+});
 
     res.json({ url: session.url });
   } catch (error) {
