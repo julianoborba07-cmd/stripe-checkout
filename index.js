@@ -335,7 +335,111 @@ const STRIPE_PRODUCTS = {
   lumecca: "prod_U39tei6ivoThaN",
   combo: "prod_U39yMaYdkhYBaS",
 };
+// ==============================
+// MORPHEUS PRICE ENGINE (SECURE)
+// ==============================
 
+const PACKAGE_DISCOUNT = {
+  single: 0,
+  "2": 0.05,
+  "3": 0.10
+};
+
+const COMBO_DISCOUNT = 0.10;
+
+const BASE_PRICES = {
+  morpheus: {
+    face: 833,
+    neck: 833,
+    chest: 833,
+    "face-neck": 1000,
+    "face-neck-chest": 1050,
+    eyes: 650,
+    mouth: 650,
+    "acne-scars": 800,
+    "active-acne": 750,
+    scars: 650,
+    "spot-treatment": 350,
+    hands: 450
+  },
+  body: {
+    "back-acne": 1400,
+    "stretchmark-one-area": 900,
+    "upper-arms": 1000,
+    knees: 1000,
+    abdomen: 1500,
+    "inner-thighs": 1250,
+    "outer-thighs": 1250,
+    thighs: 1499,
+    cellulite: 1499,
+    "excess-sweating": 900
+  },
+  lumecca: {
+    face: 500,
+    neck: 350,
+    chest: 500,
+    "face-neck": 800,
+    "face-neck-chest": 950,
+    eyes: 550,
+    mouth: 550,
+    "acne-scars": 700,
+    "active-acne": 650,
+    scars: 550,
+    "spot-treatment": 250,
+    hands: 350
+  }
+};
+
+const ADDON_PRICES = {
+  none: 0,
+  led10: 30,
+  led20: 50,
+  exosomes: 100,
+  salmon: 100,
+  "led10-exosomes": 130,
+  "led20-exosomes": 150,
+  "led10-salmon": 130,
+  "led20-salmon": 150
+};
+
+function calculateMorpheusPrice(item) {
+
+  const { mode, area, packageKey, addon, combo } = item;
+
+  if (!BASE_PRICES[mode]?.[area]) {
+    throw new Error("Serviço inválido");
+  }
+
+  const sessions = packageKey === "single" ? 1 : parseInt(packageKey);
+
+  let baseServicePrice;
+
+  if (combo && (mode === "morpheus" || mode === "lumecca")) {
+
+    const morpheusPrice = BASE_PRICES.morpheus[area];
+    const lumeccaPrice = BASE_PRICES.lumecca[area];
+
+    if (!morpheusPrice || !lumeccaPrice) {
+      throw new Error("Combo inválido");
+    }
+
+    baseServicePrice =
+      (morpheusPrice + lumeccaPrice) * (1 - COMBO_DISCOUNT);
+
+  } else {
+    baseServicePrice = BASE_PRICES[mode][area];
+  }
+
+  let totalService = baseServicePrice * sessions;
+
+  const discount = PACKAGE_DISCOUNT[packageKey] || 0;
+  totalService = totalService * (1 - discount);
+
+  const addonBase = ADDON_PRICES[addon] || 0;
+  const totalAddon = addonBase * sessions;
+
+  return Math.round(totalService + totalAddon);
+}
 // ==============================
 // CREATE CHECKOUT SESSION (UPDATED)
 // ==============================
@@ -357,30 +461,30 @@ app.post("/create-checkout-session", async (req, res) => {
       // 🔥 MORPHEUS DINÂMICO
       if (item.type === "morpheus") {
 
-        return {
-          price_data: {
-            currency: "usd",
-            product_data: {
-              name: `${item.title} - ${item.packageLabel}`,
-              description: `
+  const securePrice = calculateMorpheusPrice(item);
+
+  const serviceName = item.area.replace(/-/g, " ");
+  const packageName =
+    item.packageKey === "single"
+      ? "Single Session"
+      : `${item.packageKey} Sessions`;
+
+  return {
+    price_data: {
+      currency: "usd",
+      product_data: {
+        name: `${serviceName} - ${packageName}`,
+        description: `
 Mode: ${item.mode}
-Addon: ${item.addonLabel || "None"}
-${item.comboLabel ? `Combo: ${item.comboLabel}` : ""}
-              `.trim(),
-              metadata: {
-                service_name: item.title,
-                package: item.packageLabel,
-                addon: item.addonLabel || "none",
-                combo: item.comboLabel || "none",
-                mode: item.mode,
-                area: item.area
-              }
-            },
-            unit_amount: Math.round(item.price * 100),
-          },
-          quantity: item.qty || 1,
-        };
-      }
+Addon: ${item.addon || "None"}
+${item.combo ? "Combo: Morpheus + Lumecca" : ""}
+        `.trim()
+      },
+      unit_amount: securePrice * 100,
+    },
+    quantity: item.qty || 1,
+  };
+}
 
       // 🔥 OUTROS PRODUTOS (mantém Stripe priceId)
       const priceId = resolvePriceId(item);
