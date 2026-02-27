@@ -337,12 +337,11 @@ const STRIPE_PRODUCTS = {
 };
 
 // ==============================
-// CREATE CHECKOUT SESSION
+// CREATE CHECKOUT SESSION (UPDATED)
 // ==============================
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
-    console.log("Items recebidos:", JSON.stringify(items, null, 2));
 
     if (!email || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Dados inválidos" });
@@ -350,26 +349,40 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const customer = await getOrCreateCustomer(email);
 
-    const line_items = items.map((item) => {
-      if (item.type === "morpheus") {
-        let productId;
+    // ==============================
+    // BUILD LINE ITEMS
+    // ==============================
+    const line_items = items.map((item, index) => {
 
-        if (item.combo) productId = STRIPE_PRODUCTS.combo;
-        else if (item.mode === "body") productId = STRIPE_PRODUCTS.body;
-        else if (item.mode === "lumecca")
-          productId = STRIPE_PRODUCTS.lumecca;
-        else productId = STRIPE_PRODUCTS.morpheus;
+      // 🔥 MORPHEUS DINÂMICO
+      if (item.type === "morpheus") {
 
         return {
           price_data: {
             currency: "usd",
-            product: productId,
+            product_data: {
+              name: `${item.title} - ${item.packageLabel}`,
+              description: `
+Mode: ${item.mode}
+Addon: ${item.addonLabel || "None"}
+${item.comboLabel ? `Combo: ${item.comboLabel}` : ""}
+              `.trim(),
+              metadata: {
+                service_name: item.title,
+                package: item.packageLabel,
+                addon: item.addonLabel || "none",
+                combo: item.comboLabel || "none",
+                mode: item.mode,
+                area: item.area
+              }
+            },
             unit_amount: Math.round(item.price * 100),
           },
           quantity: item.qty || 1,
         };
       }
 
+      // 🔥 OUTROS PRODUTOS (mantém Stripe priceId)
       const priceId = resolvePriceId(item);
       if (!priceId) throw new Error("Produto inválido");
 
@@ -379,40 +392,38 @@ app.post("/create-checkout-session", async (req, res) => {
       };
     });
 
-    const { discounts, metadata } = await resolveDiscounts(
-      customer,
-      items
-    );
-
-    const morpheusItem = items.find((i) => i.type === "morpheus");
+    // ==============================
+    // DISCOUNTS
+    // ==============================
+    const { discounts, metadata } = await resolveDiscounts(customer, items);
 
     const hasAutoDiscount = discounts && discounts.length > 0;
 
-const session = await stripe.checkout.sessions.create({
-  mode: "payment",
-  customer_email: email,
-  line_items,
+    // ==============================
+    // CREATE SESSION
+    // ==============================
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: email,
+      line_items,
 
-  // 🔥 REGRA INTELIGENTE
-  ...(hasAutoDiscount
-    ? { discounts }
-    : { allow_promotion_codes: true }),
+      ...(hasAutoDiscount
+        ? { discounts }
+        : { allow_promotion_codes: true }),
 
-  metadata: {
-    customer_email: email,
-    ...metadata,
-    ...(morpheusItem && {
-      service_type: "morpheus",
-      service_mode: morpheusItem.mode,
-      service_key: morpheusItem.serviceKey,
-    }),
-  },
+      metadata: {
+        customer_email: email,
+        cart_items_count: items.length,
+        ...metadata
+      },
 
-  success_url:"https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-  cancel_url: "https://lltouch.com/cancel",
-});
+      success_url:
+        "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+      cancel_url: "https://lltouch.com/cancel",
+    });
 
     res.json({ url: session.url });
+
   } catch (error) {
     console.error("Erro checkout:", error);
     res.status(500).json({ error: "Erro ao criar sessão" });
