@@ -343,8 +343,6 @@ app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
 
-    console.log("ITEMS RECEBIDOS:", items);
-    
     if (!email || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Dados inválidos" });
     }
@@ -359,30 +357,34 @@ app.post("/create-checkout-session", async (req, res) => {
       // 🔥 MORPHEUS DINÂMICO
       if (item.type === "morpheus") {
 
-        return {
-          price_data: {
-            currency: "usd",
-            product_data: {
-              name: `${item.title} - ${item.packageLabel}`,
-              description: `
+  const serviceName = item.serviceKey || "Morpheus";
+  const packageName = item.packageKey ? `${item.packageKey} Sessions` : "";
+  const addonName = item.addon && item.addon !== "none" ? ` + ${item.addon}` : "";
+  const comboName = item.combo ? " (Combo)" : "";
+
+  return {
+    price_data: {
+      currency: "usd",
+      product_data: {
+        name: `${serviceName} ${packageName}${addonName}${comboName}`.trim(),
+        description: `
 Mode: ${item.mode}
-Addon: ${item.addonLabel || "None"}
-${item.comboLabel ? `Combo: ${item.comboLabel}` : ""}
-              `.trim(),
-              metadata: {
-                service_name: item.title,
-                package: item.packageLabel,
-                addon: item.addonLabel || "none",
-                combo: item.comboLabel || "none",
-                mode: item.mode,
-                area: item.area
-              }
-            },
-            unit_amount: Math.round(item.price * 100),
-          },
-          quantity: item.qty || 1,
-        };
-      }
+Addon: ${item.addon || "None"}
+${item.combo ? "Combo Applied" : ""}
+        `.trim(),
+        metadata: {
+          service_name: serviceName,
+          package: item.packageKey,
+          addon: item.addon || "none",
+          combo: item.combo ? "yes" : "no",
+          mode: item.mode
+        }
+      },
+      unit_amount: Math.round(item.price * 100),
+    },
+    quantity: item.quantity || 1,
+  };
+}
 
       // 🔥 OUTROS PRODUTOS (mantém Stripe priceId)
       const priceId = resolvePriceId(item);
