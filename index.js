@@ -335,7 +335,68 @@ const STRIPE_PRODUCTS = {
   lumecca: "prod_U39tei6ivoThaN",
   combo: "prod_U39yMaYdkhYBaS",
 };
+// ==============================
+// SERVICE LABELS (EXATOS DO SITE)
+// ==============================
 
+const morpheusAreas = {
+  "face-neck-chest": "Face, Neck & Chest",
+  "face-neck": "Face & Neck",
+  "full-face": "Full Face",
+  "neck": "Neck",
+  "chest": "Chest",
+  "eyes": "Eyes",
+  "mouth": "Mouth",
+  "acne-scars": "Acne Scars",
+  "active-acne": "Active Acne",
+  "scars": "Scars",
+  "spot": "Spot Treatment",
+  "hands": "Hands"
+};
+
+const morpheusBodyAreas = {
+  "back-acne": "Back Acne",
+  "stretchmark": "Stretchmark (One Area)",
+  "upper-arms": "Upper Arms",
+  "knees": "Knees",
+  "abdomen": "Abdomen",
+  "inner-thighs": "Inner Thighs",
+  "outer-thighs": "Outer Thighs",
+  "thighs": "Thighs",
+  "cellulite": "Cellulite",
+  "excess-sweating": "Excess Sweating"
+};
+
+const lumeccaAreas = {
+  "face-neck-chest": "Face, Neck & Chest",
+  "face-neck": "Face & Neck",
+  "full-face": "Full Face",
+  "neck": "Neck",
+  "chest": "Chest",
+  "eyes": "Eyes",
+  "mouth": "Mouth",
+  "acne-scars": "Acne Scars",
+  "active-acne": "Active Acne",
+  "scars": "Scars",
+  "spot": "Spot Treatment",
+  "hands": "Hands"
+};
+
+const packageLabels = {
+  "1": "1 Session",
+  "3": "3 Sessions"
+};
+
+const addonLabels = {
+  "led10": "Led (10 min)",
+  "led20": "Led (20 min)",
+  "exosomes": "Exosomes",
+  "salmon": "Salmon DNA PDRN",
+  "led10-exosomes": "Led (10 min) + Exosomes",
+  "led20-exosomes": "Led (20 min) + Exosomes",
+  "led10-salmon": "Led (10 min) + Salmon DNA PDRN",
+  "led20-salmon": "Led (20 min) + Salmon DNA PDRN"
+};
 // ==============================
 // CREATE CHECKOUT SESSION (UPDATED)
 // ==============================
@@ -357,34 +418,39 @@ app.post("/create-checkout-session", async (req, res) => {
       // 🔥 MORPHEUS DINÂMICO
       if (item.type === "morpheus") {
 
-  const serviceName = item.serviceKey || "Morpheus";
-  const packageName = item.packageKey ? `${item.packageKey} Sessions` : "";
-  const addonName = item.addon && item.addon !== "none" ? ` + ${item.addon}` : "";
-  const comboName = item.combo ? " (Combo)" : "";
+  let areaName = morpheusAreas[item.area] || "Treatment";
+const packageName = packageLabels[item.packageKey] || "";
+const addonName = addonLabels[item.addon] || "";
+const comboName = item.combo ? " (Combo)" : "";
 
-  return {
-    price_data: {
-      currency: "usd",
-      product_data: {
-        name: `${serviceName} ${packageName}${addonName}${comboName}`.trim(),
-        description: `
+const fullName = `
+${areaName} ${packageName}
+${addonName ? "+ " + addonName : ""}
+${comboName}
+`.replace(/\s+/g, " ").trim();
+
+return {
+  price_data: {
+    currency: "usd",
+    product_data: {
+      name: fullName,
+      description: `
 Mode: ${item.mode}
 Addon: ${item.addon || "None"}
 ${item.combo ? "Combo Applied" : ""}
-        `.trim(),
-        metadata: {
-          service_name: serviceName,
-          package: item.packageKey,
-          addon: item.addon || "none",
-          combo: item.combo ? "yes" : "no",
-          mode: item.mode
-        }
-      },
-      unit_amount: Math.round(item.price * 100),
+      `.trim(),
+      metadata: {
+        service_name: areaName,
+        package: item.packageKey,
+        addon: item.addon || "none",
+        combo: item.combo ? "yes" : "no",
+        mode: item.mode
+      }
     },
-    quantity: item.quantity || 1,
-  };
-}
+    unit_amount: Math.round(item.price * 100),
+  },
+  quantity: item.quantity || 1,
+};
 
       // 🔥 OUTROS PRODUTOS (mantém Stripe priceId)
       const priceId = resolvePriceId(item);
