@@ -380,7 +380,7 @@ const packageLabels = {
 };
 
 const addonLabels = {
-  "none": "No Additional"
+  "none": "No Additional",
   "led10": "Led (10 min)",
   "led20": "Led (20 min)",
   "exosomes": "Exosomes",
