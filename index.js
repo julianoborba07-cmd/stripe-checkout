@@ -451,6 +451,7 @@ ${item.combo ? "Combo Applied" : ""}
   },
   quantity: item.quantity || 1,
 };
+}
 
       // 🔥 OUTROS PRODUTOS (mantém Stripe priceId)
       const priceId = resolvePriceId(item);
