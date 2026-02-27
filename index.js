@@ -467,6 +467,8 @@ ${comboName}
     const { discounts, metadata } = await resolveDiscounts(customer, items);
 
     const hasAutoDiscount = discounts && discounts.length > 0;
+    
+    const onlyMorpheus = items.every(item => item.type === "morpheus");
 
     // ==============================
     // CREATE SESSION
@@ -477,8 +479,10 @@ ${comboName}
       line_items,
 
       ...(hasAutoDiscount
-        ? { discounts }
-        : { allow_promotion_codes: true }),
+  ? { discounts }
+  : onlyMorpheus
+    ? { allow_promotion_codes: true }
+    : {}),
 
       metadata: {
         customer_email: email,
