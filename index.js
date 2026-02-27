@@ -342,7 +342,7 @@ const STRIPE_PRODUCTS = {
 const morpheusAreas = {
   "face-neck-chest": "Face, Neck & Chest",
   "face-neck": "Face & Neck",
-  "full-face": "Full Face",
+  "face": "Full Face",
   "neck": "Neck",
   "chest": "Chest",
   "eyes": "Eyes",
@@ -350,13 +350,13 @@ const morpheusAreas = {
   "acne-scars": "Acne Scars",
   "active-acne": "Active Acne",
   "scars": "Scars",
-  "spot": "Spot Treatment",
+  "spot-treatment": "Spot Treatment",
   "hands": "Hands"
 };
 
 const morpheusBodyAreas = {
   "back-acne": "Back Acne",
-  "stretchmark": "Stretchmark (One Area)",
+  "stretchmark-one-area": "Stretchmark (One Area)",
   "upper-arms": "Upper Arms",
   "knees": "Knees",
   "abdomen": "Abdomen",
@@ -370,7 +370,7 @@ const morpheusBodyAreas = {
 const lumeccaAreas = {
   "face-neck-chest": "Face, Neck & Chest",
   "face-neck": "Face & Neck",
-  "full-face": "Full Face",
+  "face": "Full Face",
   "neck": "Neck",
   "chest": "Chest",
   "eyes": "Eyes",
@@ -378,7 +378,7 @@ const lumeccaAreas = {
   "acne-scars": "Acne Scars",
   "active-acne": "Active Acne",
   "scars": "Scars",
-  "spot": "Spot Treatment",
+  "spot-treatment": "Spot Treatment",
   "hands": "Hands"
 };
 
