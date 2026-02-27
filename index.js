@@ -410,48 +410,51 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const customer = await getOrCreateCustomer(email);
 
-    // ==============================
-    // BUILD LINE ITEMS
-    // ==============================
-    const line_items = items.map((item, index) => {
+ // ==============================
+// BUILD LINE ITEMS
+// ==============================
+const line_items = items.map((item, index) => {
 
-      // 🔥 MORPHEUS DINÂMICO
-      if (item.type === "morpheus") {
+  // 🔥 MORPHEUS DINÂMICO
+  if (item.type === "morpheus") {
 
-  let areaName = morpheusAreas[item.area] || "Treatment";
-const packageName = packageLabels[item.packageKey] || "";
-const addonName = addonLabels[item.addon] || "";
-const comboName = item.combo ? " (Combo)" : "";
+    console.log("ITEM COMPLETO:", item);
+    console.log("AREA RECEBIDA:", item.area);
 
-const fullName = `
+    let areaName = morpheusAreas[item.area] || "Treatment";
+    const packageName = packageLabels[item.packageKey] || "";
+    const addonName = addonLabels[item.addon] || "";
+    const comboName = item.combo ? " (Combo)" : "";
+
+    const fullName = `
 ${areaName} ${packageName}
 ${addonName ? "+ " + addonName : ""}
 ${comboName}
 `.replace(/\s+/g, " ").trim();
 
-return {
-  price_data: {
-    currency: "usd",
-    product_data: {
-      name: fullName,
-      description: `
+    return {
+      price_data: {
+        currency: "usd",
+        product_data: {
+          name: fullName,
+          description: `
 Mode: ${item.mode}
 Addon: ${item.addon || "None"}
 ${item.combo ? "Combo Applied" : ""}
-      `.trim(),
-      metadata: {
-        service_name: areaName,
-        package: item.packageKey,
-        addon: item.addon || "none",
-        combo: item.combo ? "yes" : "no",
-        mode: item.mode
-      }
-    },
-    unit_amount: Math.round(item.price * 100),
-  },
-  quantity: item.quantity || 1,
-};
-}
+          `.trim(),
+          metadata: {
+            service_name: areaName,
+            package: item.packageKey,
+            addon: item.addon || "none",
+            combo: item.combo ? "yes" : "no",
+            mode: item.mode
+          }
+        },
+        unit_amount: Math.round(item.price * 100),
+      },
+      quantity: item.quantity || 1,
+    };
+  }
 
       // 🔥 OUTROS PRODUTOS (mantém Stripe priceId)
       const priceId = resolvePriceId(item);
