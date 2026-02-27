@@ -327,15 +327,6 @@ app.post(
 );
 
 // ==============================
-// STRIPE PRODUCTS
-// ==============================
-const STRIPE_PRODUCTS = {
-  morpheus: "prod_U39sJVkTLR7trX",
-  body: "prod_U39ssoiJMPSmRG",
-  lumecca: "prod_U3b6yxJI6QrCK4",
-  combo: "prod_U3b6PQnzPXpijO",
-};
-// ==============================
 // SERVICE LABELS (EXATOS DO SITE)
 // ==============================
 
@@ -389,6 +380,7 @@ const packageLabels = {
 };
 
 const addonLabels = {
+  "none": "No Additional"
   "led10": "Led (10 min)",
   "led20": "Led (20 min)",
   "exosomes": "Exosomes",
