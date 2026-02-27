@@ -414,15 +414,23 @@ const line_items = items.map((item, index) => {
     console.log("ITEMS RECEBIDOS DO FRONT:", JSON.stringify(items, null, 2));
 
     let areaName = morpheusAreas[item.area] || "Treatment";
-    const packageName = packageLabels[item.packageKey] || "";
-    const addonName = addonLabels[item.addon] || "";
-    const comboName = item.combo ? " (Combo)" : "";
+const packageName = packageLabels[item.packageKey] || "";
+const addonName = addonLabels[item.addon] || "";
 
-    const fullName = `
-${areaName} ${packageName}
-${addonName ? "+ " + addonName : ""}
-${comboName}
-`.replace(/\s+/g, " ").trim();
+// 🔥 Montagem profissional do título
+const parts = [areaName, packageName];
+
+if (addonName) {
+  parts.push(addonName);
+} else {
+  parts.push("No Additional");
+}
+
+if (item.combo) {
+  parts.push("Combo");
+}
+
+const fullName = parts.filter(Boolean).join(" - ");
 
     return {
       price_data: {
