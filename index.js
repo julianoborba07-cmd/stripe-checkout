@@ -383,7 +383,8 @@ const lumeccaAreas = {
 };
 
 const packageLabels = {
-  "1": "1 Session",
+  "single": "Single Session",
+  "2": "3 Sessions"
   "3": "3 Sessions"
 };
 
