@@ -389,7 +389,6 @@ const packageLabels = {
 };
 
 const addonLabels = {
-  "none": "No Additional",
   "led10": "Led (10 min)",
   "led20": "Led (20 min)",
   "exosomes": "Exosomes",
@@ -437,6 +436,7 @@ ${comboName}
       price_data: {
         currency: "usd",
         product_data: {
+          name: fullName,
           metadata: {
             service_name: areaName,
             package: item.packageKey,
