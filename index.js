@@ -343,6 +343,8 @@ app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
 
+    console.log("ITEMS RECEBIDOS:", items);
+    
     if (!email || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Dados inválidos" });
     }
