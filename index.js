@@ -303,7 +303,7 @@ app.post(
     if (event.type === "checkout.session.completed") {
       const session = await stripe.checkout.sessions.retrieve(
         event.data.object.id,
-        { expand: ["line_items.data.price"] }
+        { expand: ["line_items.data.price.product"] }
       );
 
       const email = session.customer_details?.email;
@@ -314,12 +314,62 @@ app.post(
       if (customer.last_checkout_session === session.id)
         return res.json({ received: true });
 
+      const LASER_SERVICES_CASHBACK = [
+        "Jawline","Areolas","Happy Trails","Men Bears","Feet","Sideburns","Ears","Chin","Upper Lip",
+        "Back-Neck", "Front-Neck","Shoulders","Under Arms","Bikini Line",
+        "Upper Legs","Lower Legs","Lower Back","Half Back","Upper Arms","Lower Arms","Chest","Abdomen","Buttocks","Full Face","Full Brazillian",
+        "Full Chest","Full Arms","Full Legs","Full Back"
+      ];
+
+      let totalLaser = 0;
+      let totalFacial = 0;
+      let totalLifetime = 0;
+      let microneedlingUsed = false;
+
+      let cashbackEligible = false;
+
+      for (const item of session.line_items.data) {
+        const product = item.price.product;
+        const quantity = item.quantity || 1;
+        const amount = (item.price.unit_amount / 100) * quantity;
+        totalLifetime += amount;
+
+        const { mode, service_name } = product.metadata || {};
+
+        // Determina se é elegível para cashback
+        if (mode === "laser" && LASER_SERVICES_CASHBACK.includes(service_name)) {
+          totalLaser += amount;
+          cashbackEligible = true;
+        }
+
+        if (mode === "facial") totalFacial += amount;
+        if (mode === "med-spa" && product.metadata?.addon === "none") microneedlingUsed = true;
+      }
+
+      // Aplicar cashback automático via cupom
+      if (cashbackEligible && customer.cashback_balance > 0) {
+        const coupon = await stripe.coupons.create({
+          amount_off: Math.round(customer.cashback_balance * 100),
+          currency: "usd",
+          duration: "once",
+          name: "Automatic Cashback"
+        });
+
+        // Aplica o cupom diretamente ao checkout
+        await stripe.checkout.sessions.update(session.id, {
+          discounts: [{ coupon: coupon.id }]
+        });
+
+        console.log(`Cashback aplicado para ${email}: $${customer.cashback_balance}`);
+      }
+
       await supabase
         .from("customers")
         .update({ last_checkout_session: session.id })
         .eq("email", email);
 
-      console.log("Pagamento processado:", email);
+      console.log(`Pagamento processado: ${email}`);
+      console.log(`Total Laser: ${totalLaser}, Total Facial: ${totalFacial}, Total Lifetime: ${totalLifetime}, Microneedling: ${microneedlingUsed}`);
     }
 
     res.json({ received: true });
