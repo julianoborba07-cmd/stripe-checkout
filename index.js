@@ -390,6 +390,157 @@ const addonLabels = {
   "led10-salmon": "Led (10 min) + Salmon DNA PDRN",
   "led20-salmon": "Led (20 min) + Salmon DNA PDRN"
 };
+
+// ==============================
+// MORPHEUS / BODY / LUMECCA BASE PRICES (SERVER OFFICIAL)
+// ==============================
+
+const MORPHEUS_BASE_PRICES = {
+
+  morpheus: {
+    face: 833,
+    neck: 833,
+    chest: 833,
+    "face-neck": 1000,
+    "face-neck-chest": 1050,
+    eyes: 650,
+    mouth: 650,
+    "acne-scars": 800,
+    "active-acne": 750,
+    scars: 650,
+    "spot-treatment": 350,
+    hands: 450
+  },
+
+  body: {
+    "back-acne": 1400,
+    "stretchmark-one-area": 900,
+    "upper-arms": 1000,
+    knees: 1000,
+    abdomen: 1500,
+    "inner-thighs": 1250,
+    "outer-thighs": 1250,
+    thighs: 1499,
+    cellulite: 1499,
+    "excess-sweating": 900
+  },
+
+  lumecca: {
+    face: 500,
+    neck: 350,
+    chest: 500,
+    "face-neck": 800,
+    "face-neck-chest": 950,
+    eyes: 550,
+    mouth: 550,
+    "acne-scars": 700,
+    "active-acne": 650,
+    scars: 550,
+    "spot-treatment": 250,
+    hands: 350
+  }
+
+};
+
+// ==============================
+// PACKAGE DISCOUNTS
+// ==============================
+
+const MORPHEUS_PACKAGE_DISCOUNT = {
+  single: 0,
+  "2": 0.05,
+  "3": 0.10
+};
+
+// ==============================
+// ADDONS
+// ==============================
+
+const MORPHEUS_ADDON_PRICES = {
+  none: 0,
+  led10: 30,
+  led20: 50,
+  exosomes: 100,
+  salmon: 100,
+  "led10-exosomes": 130,
+  "led20-exosomes": 150,
+  "led10-salmon": 130,
+  "led20-salmon": 150
+};
+
+const MORPHEUS_COMBO_DISCOUNT = 0.10;
+
+// ==============================
+// CALCULATE MORPHEUS PRICE (SERVER SIDE)
+// ==============================
+
+function getMorpheusPrice(item) {
+
+  const { mode, area, packageKey, addon, combo } = item;
+
+  // 1️⃣ VALIDAR MODE
+  if (!MORPHEUS_BASE_PRICES[mode]) {
+    throw new Error("Modo inválido");
+  }
+
+  // 2️⃣ VALIDAR ÁREA
+  const basePriceSingle = MORPHEUS_BASE_PRICES[mode][area];
+  if (!basePriceSingle) {
+    throw new Error("Área inválida");
+  }
+
+  // 3️⃣ VALIDAR PACKAGE
+  const sessions = packageKey === "single" ? 1 : parseInt(packageKey);
+  if (!sessions || sessions < 1) {
+    throw new Error("Pacote inválido");
+  }
+
+  let baseServicePrice;
+
+  // 4️⃣ COMBO (morpheus + lumecca)
+  if (combo) {
+
+    const morpheusPrice = MORPHEUS_BASE_PRICES.morpheus[area];
+    const lumeccaPrice = MORPHEUS_BASE_PRICES.lumecca[area];
+
+    if (!morpheusPrice || !lumeccaPrice) {
+      throw new Error("Combo inválido");
+    }
+
+    baseServicePrice =
+      (morpheusPrice + lumeccaPrice) *
+      (1 - MORPHEUS_COMBO_DISCOUNT);
+
+  } else {
+
+    baseServicePrice = basePriceSingle;
+
+  }
+
+  // 5️⃣ MULTIPLICA POR SESSÕES
+  let totalService = baseServicePrice * sessions;
+
+  // 6️⃣ APLICA DESCONTO DO PACOTE
+  const packageDiscount = MORPHEUS_PACKAGE_DISCOUNT[packageKey] || 0;
+  totalService = totalService * (1 - packageDiscount);
+
+  // 7️⃣ ADDON (multiplica por sessões, sem desconto)
+  const addonBase = MORPHEUS_ADDON_PRICES[addon || "none"];
+  if (addonBase === undefined) {
+    throw new Error("Addon inválido");
+  }
+
+  const totalAddon = addonBase * sessions;
+
+  // 8️⃣ VALOR FINAL
+  const finalPrice = Math.round(totalService + totalAddon);
+
+  if (finalPrice <= 0) {
+    throw new Error("Erro no cálculo");
+  }
+
+  return finalPrice;
+}
 // ==============================
 // CREATE CHECKOUT SESSION (UPDATED)
 // ==============================
@@ -411,48 +562,47 @@ const line_items = items.map((item, index) => {
   // 🔥 MORPHEUS DINÂMICO
   if (item.type === "morpheus") {
 
-    console.log("ITEMS RECEBIDOS DO FRONT:", JSON.stringify(items, null, 2));
+  const calculatedPrice = getMorpheusPrice(item);
 
-    let areaName = morpheusAreas[item.area] || "Treatment";
-const packageName = packageLabels[item.packageKey] || "";
-const addonName = addonLabels[item.addon] || "";
+  let areaName = morpheusAreas[item.area] || "Treatment";
+  const packageName = packageLabels[item.packageKey] || "";
+  const addonName = addonLabels[item.addon] || "";
 
-// 🔥 Montagem profissional do título
-const parts = [areaName, packageName];
+  const parts = [areaName, packageName];
 
-if (addonName) {
-  parts.push(addonName);
-} else {
-  parts.push("No Additional");
-}
-
-if (item.combo) {
-  parts.push("Combo");
-}
-
-const fullName = parts.filter(Boolean).join(" - ");
-
-    return {
-      price_data: {
-        currency: "usd",
-        product_data: {
-          name: fullName,
-          images: [
-    "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
-  ],
-          metadata: {
-            service_name: areaName,
-            package: item.packageKey,
-            addon: item.addon || "none",
-            combo: item.combo ? "yes" : "no",
-            mode: item.mode
-          }
-        },
-        unit_amount: Math.round(item.price * 100),
-      },
-      quantity: item.quantity || 1,
-    };
+  if (addonName) {
+    parts.push(addonName);
+  } else {
+    parts.push("No Additional");
   }
+
+  if (item.combo) {
+    parts.push("Combo");
+  }
+
+  const fullName = parts.filter(Boolean).join(" - ");
+
+  return {
+    price_data: {
+      currency: "usd",
+      product_data: {
+        name: fullName,
+        images: [
+          "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
+        ],
+        metadata: {
+          service_name: areaName,
+          package: item.packageKey,
+          addon: item.addon || "none",
+          combo: item.combo ? "yes" : "no",
+          mode: item.mode
+        }
+      },
+      unit_amount: calculatedPrice * 100,
+    },
+    quantity: item.quantity || 1,
+  };
+}
 
       // 🔥 OUTROS PRODUTOS (mantém Stripe priceId)
       const priceId = resolvePriceId(item);
