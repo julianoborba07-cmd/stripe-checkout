@@ -3,8 +3,30 @@ import Stripe from "stripe";
 import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import rateLimit from "express-rate-limit";
 
 dotenv.config();
+
+// ==============================
+// SECURITY CONFIG
+// ==============================
+
+const VALID_TYPES = [
+  "laser",
+  "full-body",
+  "facial",
+  "membership",
+  "med-spa",
+  "morpheus",
+  "other-service"
+];
+
+const MAX_CART_ITEMS = 20;
+const MAX_ITEM_QUANTITY = 10;
+
+function isValidEmail(email) {
+  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
 
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -58,6 +80,18 @@ app.use(cors({
   origin: ["https://lltouch.com"], // adicione localhost se necessário
 }));
 app.use(express.json());
+
+// ==============================
+// RATE LIMIT (CHECKOUT PROTECTION)
+// ==============================
+
+const checkoutLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 50, // 50 requisições por IP
+  message: { error: "Too many requests. Try again later." }
+});
+
+app.use("/create-checkout-session", checkoutLimiter);
 
 // ==============================
 // TABELA DE PREÇOS (Stripe Price IDs)
@@ -311,8 +345,10 @@ app.post(
 
       const customer = await getOrCreateCustomer(email);
 
-      if (customer.last_checkout_session === session.id)
+      // Evita processar a mesma sessão duas vezes
+      if (customer?.last_checkout_session === session.id) {
         return res.json({ received: true });
+      }
 
       const LASER_SERVICES_CASHBACK = [
         "Jawline","Areolas","Happy Trails","Men Bears","Feet","Sideburns","Ears","Chin","Upper Lip",
@@ -598,13 +634,44 @@ app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, items } = req.body;
 
-    if (!email || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: "Dados inválidos" });
+     // ==============================
+    // EMAIL VALIDATION
+    // ==============================
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email" });
     }
+
+    // ==============================
+    // VALIDATION LAYER
+    // ==============================
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email" });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Invalid cart items" });
+    }
+
+    if (items.length > MAX_CART_ITEMS) {
+      return res.status(400).json({ error: "Too many items in cart" });
+    }
+
+    for (const item of items) {
+  if (!VALID_TYPES.includes(item.type)) {
+    return res.status(400).json({ error: "Invalid product type" });
+  }
+
+  const quantity = Number(item.quantity) || 1;
+
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_ITEM_QUANTITY) {
+    return res.status(400).json({ error: "Invalid quantity" });
+  }
+}
 
     const customer = await getOrCreateCustomer(email);
 
- // ==============================
+// ==============================
 // BUILD LINE ITEMS
 // ==============================
 const line_items = items.map((item, index) => {
