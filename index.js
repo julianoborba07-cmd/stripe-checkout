@@ -77,7 +77,10 @@ async function getOrCreateCustomer(email) {
 // CORS
 // ==============================
 app.use(cors({
-  origin: ["https://lltouch.com"], // adicione localhost se necessário
+  origin: [
+  "https://lltouch.com",
+  "https://www.lltouch.com"
+]
 }));
 app.use(express.json());
 
