@@ -385,34 +385,145 @@ app.post(
         if (mode === "med-spa" && product.metadata?.addon === "none") microneedlingUsed = true;
       }
 
-      // Aplicar cashback automático via cupom
-      if (cashbackEligible && customer.cashback_balance > 0) {
-        const coupon = await stripe.coupons.create({
-          amount_off: Math.round(customer.cashback_balance * 100),
-          currency: "usd",
-          duration: "once",
-          name: "Automatic Cashback"
-        });
+      // ==============================
+// CALCULAR CASHBACK
+// ==============================
 
-        // Aplica o cupom diretamente ao checkout
-        await stripe.checkout.sessions.update(session.id, {
-          discounts: [{ coupon: coupon.id }]
-        });
+let cashbackEarned = 0;
 
-        console.log(`Cashback aplicado para ${email}: $${customer.cashback_balance}`);
-      }
+if (cashbackEligible && totalLaser > 0) {
 
-      await supabase
-        .from("customers")
-        .update({ last_checkout_session: session.id })
-        .eq("email", email);
+  let tierPercent = 0;
 
-      console.log(`Pagamento processado: ${email}`);
-      console.log(`Total Laser: ${totalLaser}, Total Facial: ${totalFacial}, Total Lifetime: ${totalLifetime}, Microneedling: ${microneedlingUsed}`);
-    }
-
-    res.json({ received: true });
+  if (totalLaser >= 1200) {
+    tierPercent = 0.10; // Gold
+  } 
+  else if (totalLaser >= 600) {
+    tierPercent = 0.07; // Silver
+  } 
+  else if (totalLaser >= 200) {
+    tierPercent = 0.05; // Bronze
   }
+
+  cashbackEarned = totalLaser * tierPercent;
+}
+
+// ==============================
+// SALVAR CASHBACK NO SUPABASE
+// ==============================
+
+if (cashbackEarned > 0) {
+
+  const newBalance =
+    Number(customer.cashback_balance || 0) + cashbackEarned;
+
+  // atualizar saldo do cliente
+  await supabase
+    .from("customers")
+    .update({
+      cashback_balance: newBalance
+    })
+    .eq("email", email);
+
+  // registrar histórico
+  await supabase
+    .from("cashback_transactions")
+    .insert({
+      email: email,
+      amount: cashbackEarned,
+      type: "earn",
+      category: "laser",
+      source: "checkout"
+    });
+
+  console.log(`Cashback gerado para ${email}: $${cashbackEarned}`);
+}
+
+// ==============================
+// REGISTRAR CASHBACK GANHO
+// ==============================
+if (cashbackEarned > 0) {
+
+  // atualiza o saldo do cliente
+  const { data: updatedCustomer, error } = await supabase
+    .from("customers")
+    .update({
+      cashback_balance: Number(customer.cashback_balance) + cashbackEarned
+    })
+    .eq("email", email)
+    .select()
+    .single();
+
+  if (error) {
+    console.error("Erro ao atualizar cashback:", error);
+  } else {
+    console.log(`Cashback ganho por ${email}: $${cashbackEarned}`);
+  }
+
+  // registra na tabela de transações
+  await supabase
+    .from("cashback_transactions")
+    .insert({
+      email: email,
+      amount: cashbackEarned,
+      type: "earn",
+      source: "laser"
+    });
+}
+
+      // ==============================
+// USAR CASHBACK
+// ==============================
+let cashbackUsed = 0;
+
+if (customer.cashback_balance > 0) {
+
+  // nunca usar mais do que o total da compra
+  cashbackUsed = Math.min(Number(customer.cashback_balance), totalLifetime);
+
+  if (cashbackUsed > 0) {
+
+    // cria cupom no Stripe para aplicar no checkout
+    const coupon = await stripe.coupons.create({
+      amount_off: Math.round(cashbackUsed * 100),
+      currency: "usd",
+      duration: "once",
+      name: "Automatic Cashback"
+    });
+
+    // Aplica o cupom diretamente ao checkout
+    await stripe.checkout.sessions.update(session.id, {
+      discounts: [{ coupon: coupon.id }]
+    });
+
+    // zera o saldo do cliente
+    await supabase
+      .from("customers")
+      .update({ cashback_balance: 0 })
+      .eq("email", email);
+
+    // registra uso na tabela de transações
+    await supabase
+      .from("cashback_transactions")
+      .insert({
+        email: email,
+        amount: cashbackUsed,
+        type: "redeem",
+        source: "checkout"
+      });
+
+    console.log(`Cashback usado por ${email}: $${cashbackUsed}`);
+  }
+}
+
+// atualiza a última sessão do cliente
+await supabase
+  .from("customers")
+  .update({ last_checkout_session: session.id })
+  .eq("email", email);
+
+console.log(`Pagamento processado: ${email}`);
+console.log(`Total Laser: ${totalLaser}, Total Facial: ${totalFacial}, Total Lifetime: ${totalLifetime}, Microneedling: ${microneedlingUsed}`);
 );
 
 // ==============================
