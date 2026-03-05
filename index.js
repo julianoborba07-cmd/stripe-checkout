@@ -524,6 +524,7 @@ await supabase
 
 console.log(`Pagamento processado: ${email}`);
 console.log(`Total Laser: ${totalLaser}, Total Facial: ${totalFacial}, Total Lifetime: ${totalLifetime}, Microneedling: ${microneedlingUsed}`);
+    }
 );
 
 // ==============================
