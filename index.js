@@ -301,17 +301,24 @@ if (hasOtherFullFace) {
   // 6️⃣ CASHBACK
   // ==============================
   if (customer.cashback_balance > 0) {
-    const coupon = await stripe.coupons.create({
-      amount_off: Math.round(customer.cashback_balance * 100),
-      currency: "usd",
-      duration: "once",
-      name: "Universal Cashback"
-    });
-    return {
-      discounts: [{ coupon: coupon.id }],
-      metadata: { discount_type: "cashback" }
-    };
-  }
+
+  const cashbackAmount = Number(customer.cashback_balance || 0);
+
+  const coupon = await stripe.coupons.create({
+    amount_off: Math.round(cashbackAmount * 100),
+    currency: "usd",
+    duration: "once",
+    name: "Universal Cashback"
+  });
+
+  return {
+    discounts: [{ coupon: coupon.id }],
+    metadata: {
+      discount_type: "cashback",
+      cashback_used: cashbackAmount
+    }
+  };
+}
 
   return { discounts: [], metadata: {} };
 }
@@ -351,10 +358,21 @@ app.post(
 
       const customer = await getOrCreateCustomer(email);
 
-      // evitar processar duas vezes
-      if (customer?.last_checkout_session === session.id) {
-        return res.json({ received: true });
-      }
+      // ==============================
+// CASHBACK USADO NO CHECKOUT
+// ==============================
+
+const cashbackUsed =
+  Number(session.metadata?.cashback_used || 0);
+
+      // ==============================
+// PROTEÇÃO DUPLICAÇÃO WEBHOOK
+// ==============================
+
+if (customer?.last_checkout_session === session.id) {
+  console.log("Webhook duplicado ignorado:", session.id);
+  return res.json({ received: true });
+}
 
       const LASER_SERVICES_CASHBACK = [
         "Jawline","Areolas","Happy Trails","Men Bears","Feet","Sideburns","Ears","Chin","Upper Lip",
@@ -409,7 +427,8 @@ app.post(
           tierPercent = 0.05;
         }
 
-        cashbackEarned = totalLaser * tierPercent;
+        cashbackEarned =
+  Math.round(totalLaser * tierPercent * 100) / 100;
       }
 
       // ==============================
@@ -440,6 +459,37 @@ app.post(
 
         console.log(`Cashback gerado para ${email}: $${cashbackEarned}`);
       }
+
+      // ==============================
+// REGISTRAR USO DE CASHBACK
+// ==============================
+
+if (cashbackUsed > 0) {
+
+  const newBalance =
+    Math.max(
+      0,
+      Number(customer.cashback_balance || 0) - cashbackUsed
+    );
+
+  await supabase
+    .from("customers")
+    .update({
+      cashback_balance: newBalance
+    })
+    .eq("email", email);
+
+  await supabase
+    .from("cashback_transactions")
+    .insert({
+      email: email,
+      amount: cashbackUsed,
+      type: "redeem",
+      source: "checkout"
+    });
+
+  console.log(`Cashback usado por ${email}: $${cashbackUsed}`);
+}
 
       // ==============================
       // ATUALIZAR TOTAIS DO CLIENTE
