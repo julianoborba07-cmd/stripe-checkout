@@ -394,17 +394,56 @@ async function resolveDiscounts(customer, items) {
     }
   }
   if (customer.cashback_balance > 0) {
-    const coupon = await stripe.coupons.create({
-      amount_off: Math.round(customer.cashback_balance * 100),
-      currency: "usd",
-      duration: "once",
-      name: "Universal Cashback"
-    });
-    return { discounts: [{ coupon: coupon.id }], metadata: { discount_type: "cashback" } };
-  }
-  return { discounts: [], metadata: {} };
-}
+    // Calcula o total do carrinho atual para aplicar a trava de 50%
+    let currentCartTotal = 0;
+    // ... (lógica para somar o unit_amount dos itens que você já tem no resolveDiscounts)
 
+    const maxAllowedDiscount = currentCartTotal * 0.5; // Limite de 50%
+    const finalCashbackAmount = Math.min(customer.cashback_balance, maxAllowedDiscount);
+
+    if (finalCashbackAmount > 0) {
+      const coupon = await stripe.coupons.create({
+        amount_off: Math.round(finalCashbackAmount * 100),
+        currency: "usd",
+        duration: "once",
+        name: `Cashback Used (Max 50%)`
+      });
+      return { discounts: [{ coupon: coupon.id }], metadata: { discount_type: "cashback_used", original_balance: customer.cashback_balance } };
+    }
+  }
+
+app.post("/cashback-preview", (req, res) => {
+  try {
+    const { cart } = req.body;
+    if (!cart || !Array.isArray(cart)) return res.json({ cashback: 0, rate: 0, tier: "Bronze" });
+
+    // Filtra apenas itens das páginas de Laser para o cálculo de acúmulo
+    const laserSubtotal = cart.reduce((acc, item) => {
+      if (item.mode === 'laser' || item.mode === 'full-body') {
+        const qty = item.quantity || 1;
+        return acc + (item.price * qty);
+      }
+      return acc;
+    }, 0);
+
+    // Define a porcentagem baseada no gasto da COMPRA ATUAL (Preview)
+    let rate = 0;
+    let tier = "Bronze";
+
+    if (laserSubtotal >= 1200) { rate = 0.10; tier = "Gold"; }
+    else if (laserSubtotal >= 600) { rate = 0.07; tier = "Silver"; }
+    else if (laserSubtotal >= 200) { rate = 0.05; tier = "Bronze"; }
+
+    res.json({ 
+      cashback: Number((laserSubtotal * rate).toFixed(2)), 
+      rate: rate,
+      tier: tier,
+      laserSubtotal: laserSubtotal
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Erro no cálculo de preview" });
+  }
+});
 // ==============================
 // ROUTES
 // ==============================
