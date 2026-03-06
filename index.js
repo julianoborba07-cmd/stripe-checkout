@@ -775,7 +775,6 @@ const line_items = items.map((item, index) => {
     res.status(500).json({ error: "Erro ao criar sessão" });
   }
 });
-
 // ==============================
 // UNLOCK POPUP
 // ==============================
