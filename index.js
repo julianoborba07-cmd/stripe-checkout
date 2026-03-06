@@ -411,6 +411,8 @@ async function resolveDiscounts(customer, items) {
       return { discounts: [{ coupon: coupon.id }], metadata: { discount_type: "cashback_used", original_balance: customer.cashback_balance } };
     }
   }
+    return { discounts: [], metadata: {} };
+}
 
 app.post("/cashback-preview", (req, res) => {
   try {
