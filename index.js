@@ -302,7 +302,7 @@ const priceMap = {
     "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
     "3-led10": "price_1StqioLVWAMw3iFeAm59s0Xt",
     "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
-    "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF",
+    "3-peel": "price_1SxrmDLVWAMw3iFeLxauW07O",
   },
   "classic-deluxe": {
     "single-none": "price_1SuEXILVWAMw3iFeEzZhwlVJ",
@@ -456,6 +456,9 @@ async function resolveDiscounts(customer, items) {
     if (item.priceId === otherFullFaceId) hasOtherFullFace = true;
   }
 
+  // =======================
+  // Descontos especiais
+  // =======================
   if (customer.popup_unlocked && !customer.first_purchase_used) {
     return { discounts: [{ coupon: "jmx11QWL" }], metadata: { discount_type: "first_purchase" } };
   }
@@ -468,6 +471,10 @@ async function resolveDiscounts(customer, items) {
   if (hasOtherFullFace) {
     return { discounts: [{ coupon: "oLmALLlo" }], metadata: { discount_type: "other" } };
   }
+
+  // =======================
+  // Descontos faciais
+  // =======================
   if (hasFacial) {
     for (const item of resolvedItems) {
       if (facialIds.includes(item.priceId)) {
@@ -485,12 +492,19 @@ async function resolveDiscounts(customer, items) {
       return { discounts: [{ coupon: couponMap[discountTier] }], metadata: { discount_type: "facial" } };
     }
   }
-  if (customer.cashback_balance > 0) {
-    // Calcula o total do carrinho atual para aplicar a trava de 50%
-    let currentCartTotal = 0;
-    // ... (lógica para somar o unit_amount dos itens que você já tem no resolveDiscounts)
 
-    const maxAllowedDiscount = currentCartTotal * 0.5; // Limite de 50%
+  // =======================
+  // Cashback
+  // =======================
+  if (customer.cashback_balance > 0) {
+    // Calcula total do carrinho atual
+    let currentCartTotal = 0;
+    for (const item of resolvedItems) {
+      const stripePrice = await stripe.prices.retrieve(item.priceId);
+      currentCartTotal += (stripePrice.unit_amount / 100) * item.quantity;
+    }
+
+    const maxAllowedDiscount = currentCartTotal * 0.5; // Limite 50%
     const finalCashbackAmount = Math.min(customer.cashback_balance, maxAllowedDiscount);
 
     if (finalCashbackAmount > 0) {
@@ -503,7 +517,8 @@ async function resolveDiscounts(customer, items) {
       return { discounts: [{ coupon: coupon.id }], metadata: { discount_type: "cashback_used", original_balance: customer.cashback_balance } };
     }
   }
-    return { discounts: [], metadata: {} };
+
+  return { discounts: [], metadata: {} };
 }
 
 app.post("/cashback-preview", (req, res) => {
