@@ -84,7 +84,6 @@ app.use(cors({
   ]
 }));
 
-// Webhook precisa do express.raw antes do express.json
 // ==============================
 // WEBHOOK CORRIGIDO
 // ==============================
@@ -176,38 +175,41 @@ console.log("Total Laser:", totalLaser.toFixed(2));
 
         let usedCashback = 0;
 
-        if (customer.cashback_balance > 0) {
+if (session.metadata?.cashback_used === "yes") {
 
-          const purchaseAmount = session.amount_total / 100;
+  const purchaseAmount = session.amount_total / 100;
 
-          const maxUse = purchaseAmount * 0.5;
+  const maxUse = purchaseAmount * 0.5;
 
-          usedCashback = Math.min(customer.cashback_balance, maxUse);
+  usedCashback = Math.min(customer.cashback_balance, maxUse);
 
-        }
+}
 
         console.log("Cashback Used:", usedCashback);
 
         // ==========================
-        // 4️⃣ ATUALIZA SUPABASE
-        // ==========================
+// 4️⃣ ATUALIZA SUPABASE
+// ==========================
 
-        const { error: updateError } = await supabase
-          .from("customers")
-          .update({
-            lifetime_total: customer.lifetime_total + totalLifetime,
-            laser_total: customer.laser_total + totalLaser,
-            cashback_balance:
-              customer.cashback_balance - usedCashback + cashbackEarned,
-            laser_tier: rate,
-            last_checkout_session: session.id,
-            updated_at: new Date()
-          })
-          .eq("email", email);
+const { error: updateError } = await supabase
+  .from("customers")
+  .upsert(
+    {
+      email: email,
+      lifetime_total: customer.lifetime_total + totalLifetime,
+      laser_total: customer.laser_total + totalLaser,
+      cashback_balance:
+        customer.cashback_balance - usedCashback + cashbackEarned,
+      laser_tier: rate,
+      last_checkout_session: session.id,
+      updated_at: new Date()
+    },
+    { onConflict: "email" }
+  );
 
-        if (updateError) {
-          console.error("Erro atualizando cliente:", updateError);
-        }
+if (updateError) {
+  console.error("Erro atualizando cliente:", updateError);
+}
 
         // ==========================
         // 5️⃣ REGISTRA TRANSAÇÕES
@@ -608,12 +610,26 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     const hasAutoDiscount = discounts && discounts.length > 0;
     const onlyMorpheus = items.every(item => item.type === "morpheus");
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer_email: email,
-      line_items,
-      ...(hasAutoDiscount ? { discounts } : onlyMorpheus ? { allow_promotion_codes: true } : {}),
-      metadata: { customer_email: email, cart_items_count: items.length, ...metadata },
+    const cashbackUsed = metadata?.discount_type === "cashback_used";
+
+const session = await stripe.checkout.sessions.create({
+  mode: "payment",
+  customer_email: email,
+  line_items,
+
+  ...(hasAutoDiscount
+    ? { discounts }
+    : onlyMorpheus
+    ? { allow_promotion_codes: true }
+    : {}),
+
+  metadata: {
+    customer_email: email,
+    cart_items_count: items.length,
+    cashback_used: cashbackUsed ? "yes" : "no",
+    ...metadata
+  },
+
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel",
     });
