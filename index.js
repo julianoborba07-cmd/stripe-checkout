@@ -555,23 +555,39 @@ app.post("/cashback-preview", (req, res) => {
     res.status(500).json({ error: "Erro no cálculo de preview" });
   }
   });
-  
-  // Rota para obter dados VIP do cliente
-app.get("/customer", async (req, res) => {
+
+  app.get("/customer", async (req, res) => {
   try {
+
     const email = req.query.email;
-    if (!isValidEmail(email)) return res.status(400).json({ error: "Email inválido" });
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Email inválido" });
+    }
 
     const { data: customer, error } = await supabase
       .from("customers")
       .select("email, cashback_balance, laser_total, lifetime_total, laser_tier")
       .eq("email", email)
-      .single();
+      .maybeSingle();
 
-    if (error) return res.status(500).json({ error: "Erro ao buscar cliente" });
-    if (!customer) return res.status(404).json({ error: "Cliente não encontrado" });
+    if (error) {
+      console.error(error);
+      return res.status(500).json({ error: "Erro ao buscar cliente" });
+    }
+
+    if (!customer) {
+      return res.json({
+        email,
+        cashback_balance: 0,
+        laser_total: 0,
+        lifetime_total: 0,
+        laser_tier: "bronze"
+      });
+    }
 
     res.json(customer);
+
   } catch (err) {
     console.error("Erro /customer:", err);
     res.status(500).json({ error: "Erro interno" });
