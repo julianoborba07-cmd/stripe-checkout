@@ -84,6 +84,9 @@ app.use(cors({
 }));
 
 // Webhook precisa do express.raw antes do express.json
+// ==============================
+// WEBHOOK CORRIGIDO
+// ==============================
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -102,6 +105,7 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    // Processa apenas pagamentos completos
     if (event.type === "checkout.session.completed") {
       const session = await stripe.checkout.sessions.retrieve(
         event.data.object.id,
@@ -113,10 +117,14 @@ app.post(
 
       const customer = await getOrCreateCustomer(email);
 
+      // Evita processar duas vezes a mesma sessão
       if (customer?.last_checkout_session === session.id) {
         return res.json({ received: true });
       }
 
+      // ==========================
+      // 1️⃣ CALCULA TOTALS
+      // ==========================
       const LASER_SERVICES_CASHBACK = [
         "Jawline","Areolas","Happy Trails","Men Bears","Feet","Sideburns","Ears","Chin","Upper Lip",
         "Back-Neck", "Front-Neck","Shoulders","Under Arms","Bikini Line",
@@ -125,10 +133,7 @@ app.post(
       ];
 
       let totalLaser = 0;
-      let totalFacial = 0;
       let totalLifetime = 0;
-      let microneedlingUsed = false;
-      let cashbackEligible = false;
 
       for (const item of session.line_items.data) {
         const product = item.price.product;
@@ -136,38 +141,83 @@ app.post(
         const amount = (item.price.unit_amount / 100) * quantity;
         totalLifetime += amount;
 
-        const { mode, service_name } = product.metadata || {};
-
-        if (mode === "laser" && LASER_SERVICES_CASHBACK.includes(service_name)) {
+        if (product.metadata?.mode === "laser" && LASER_SERVICES_CASHBACK.includes(product.metadata?.service_name)) {
           totalLaser += amount;
-          cashbackEligible = true;
         }
-
-        if (mode === "facial") totalFacial += amount;
-        if (mode === "med-spa" && product.metadata?.addon === "none") microneedlingUsed = true;
       }
 
-      if (cashbackEligible && customer.cashback_balance > 0) {
-        const coupon = await stripe.coupons.create({
-          amount_off: Math.round(customer.cashback_balance * 100),
-          currency: "usd",
-          duration: "once",
-          name: "Automatic Cashback"
-        });
+      // ==========================
+      // 2️⃣ CALCULA CASHBACK
+      // ==========================
+      let rate = 0;
+      if (totalLaser >= 1200) rate = 0.10;
+      else if (totalLaser >= 600) rate = 0.07;
+      else if (totalLaser >= 200) rate = 0.05;
 
-        await stripe.checkout.sessions.update(session.id, {
-          discounts: [{ coupon: coupon.id }]
-        });
+      const cashbackEarned = totalLaser * rate;
 
-        console.log(`Cashback aplicado para ${email}: $${customer.cashback_balance}`);
+      // ==========================
+      // 3️⃣ APLICA CASHBACK USADO (até 50%)
+      // ==========================
+      let usedCashback = 0;
+      if (customer.cashback_balance > 0) {
+        const maxUse = session.amount_total / 100 * 0.5; // 50% da compra
+        usedCashback = Math.min(customer.cashback_balance, maxUse);
+
+        if (usedCashback > 0) {
+          const coupon = await stripe.coupons.create({
+            amount_off: Math.round(usedCashback * 100),
+            currency: "usd",
+            duration: "once",
+            name: `Cashback Used (Max 50%)`
+          });
+
+          await stripe.checkout.sessions.update(session.id, {
+            discounts: [{ coupon: coupon.id }]
+          });
+        }
       }
 
-      await supabase
+      // ==========================
+      // 4️⃣ ATUALIZA SUPABASE
+      // ==========================
+      const { data, error } = await supabase
         .from("customers")
-        .update({ last_checkout_session: session.id })
+        .update({
+          lifetime_total: customer.lifetime_total + totalLifetime,
+          laser_total: customer.laser_total + totalLaser,
+          cashback_balance: customer.cashback_balance - usedCashback + cashbackEarned,
+          laser_tier: rate,
+          last_checkout_session: session.id
+        })
         .eq("email", email);
 
-      console.log(`Pagamento processado: ${email}`);
+      if (error) console.error("Erro atualizando cliente:", error);
+
+      // ==========================
+      // 5️⃣ REGISTRA TRANSACOES DE CASHBACK
+      // ==========================
+      if (cashbackEarned > 0) {
+        await supabase.from("cashback_transactions").insert({
+          email: email,
+          amount: cashbackEarned,
+          type: "earned",
+          category: "laser",
+          source: "stripe"
+        });
+      }
+
+      if (usedCashback > 0) {
+        await supabase.from("cashback_transactions").insert({
+          email: email,
+          amount: usedCashback,
+          type: "used",
+          category: "laser",
+          source: "stripe"
+        });
+      }
+
+      console.log(`Pagamento processado: ${email} | Ganhou: $${cashbackEarned.toFixed(2)} | Usou: $${usedCashback.toFixed(2)}`);
     }
 
     res.json({ received: true });
