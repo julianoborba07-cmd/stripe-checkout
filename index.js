@@ -198,24 +198,26 @@ app.post(
       // 5️⃣ REGISTRA TRANSACOES DE CASHBACK
       // ==========================
       if (cashbackEarned > 0) {
-        await supabase.from("cashback_transactions").insert({
-          email: email,
-          amount: cashbackEarned,
-          type: "earned",
-          category: "laser",
-          source: "stripe"
-        });
-      }
+  const { error } = await supabase.from("cashback_transactions").insert({
+    email: email,
+    amount: cashbackEarned,
+    type: "earned",
+    category: "laser",
+    source: "stripe"
+  });
+  if (error) console.error("Erro ao inserir cashback_earned:", error);
+}
 
-      if (usedCashback > 0) {
-        await supabase.from("cashback_transactions").insert({
-          email: email,
-          amount: usedCashback,
-          type: "used",
-          category: "laser",
-          source: "stripe"
-        });
-      }
+if (usedCashback > 0) {
+  const { error } = await supabase.from("cashback_transactions").insert({
+    email: email,
+    amount: usedCashback,
+    type: "used",
+    category: "laser",
+    source: "stripe"
+  });
+  if (error) console.error("Erro ao inserir cashback_used:", error);
+}
 
       console.log(`Pagamento processado: ${email} | Ganhou: $${cashbackEarned.toFixed(2)} | Usou: $${usedCashback.toFixed(2)}`);
     }
