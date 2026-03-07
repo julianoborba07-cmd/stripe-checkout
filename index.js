@@ -593,6 +593,32 @@ app.post("/cashback-preview", (req, res) => {
     res.status(500).json({ error: "Erro interno" });
   }
 });
+
+app.get("/checkout-session/:id", async (req, res) => {
+  try {
+
+    const session = await stripe.checkout.sessions.retrieve(
+      req.params.id,
+      { expand: ["line_items.data.price.product"] }
+    );
+
+    const items = session.line_items.data.map(item => ({
+      name: item.price.product.name,
+      amount: (item.price.unit_amount / 100) * item.quantity
+    }));
+
+    res.json({
+      id: session.id,
+      email: session.customer_details?.email,
+      total: session.amount_total / 100,
+      items
+    });
+
+  } catch (err) {
+    console.error("Erro buscando sessão:", err);
+    res.status(500).json({ error: "Erro ao buscar sessão" });
+  }
+});
 // ==============================
 // ROUTES
 // ==============================
