@@ -29,6 +29,7 @@ function isValidEmail(email) {
 }
 
 const app = express();
+app.set('trust proxy', 1); 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ==============================
@@ -107,119 +108,171 @@ app.post(
 
     // Processa apenas pagamentos completos
     if (event.type === "checkout.session.completed") {
-      const session = await stripe.checkout.sessions.retrieve(
-        event.data.object.id,
-        { expand: ["line_items.data.price.product"] }
-      );
+      try {
 
-      const email = session.customer_details?.email;
-      if (!email) return res.json({ received: true });
+        const session = await stripe.checkout.sessions.retrieve(
+          event.data.object.id,
+          { expand: ["line_items.data.price.product"] }
+        );
 
-      const customer = await getOrCreateCustomer(email);
+        const email = session.customer_details?.email;
+        if (!email) return res.json({ received: true });
 
-      // Evita processar duas vezes a mesma sessão
-      if (customer?.last_checkout_session === session.id) {
-        return res.json({ received: true });
-      }
+        const customer = await getOrCreateCustomer(email);
 
-      // ==========================
-      // 1️⃣ CALCULA TOTALS
-      // ==========================
-      const LASER_SERVICES_CASHBACK = [
-        "Jawline","Areolas","Happy Trails","Men Bears","Feet","Sideburns","Ears","Chin","Upper Lip",
-        "Back-Neck", "Front-Neck","Shoulders","Under Arms","Bikini Line",
-        "Upper Legs","Lower Legs","Lower Back","Half Back","Upper Arms","Lower Arms","Chest","Abdomen","Buttocks","Full Face","Full Brazillian",
-        "Full Chest","Full Arms","Full Legs","Full Back"
-      ];
-
-      let totalLaser = 0;
-      let totalLifetime = 0;
-
-      for (const item of session.line_items.data) {
-        const product = item.price.product;
-        const quantity = item.quantity || 1;
-        const amount = (item.price.unit_amount / 100) * quantity;
-        totalLifetime += amount;
-
-        if (product.metadata?.mode === "laser" && LASER_SERVICES_CASHBACK.includes(product.metadata?.service_name)) {
-          totalLaser += amount;
+        // Evita duplicação do webhook
+        if (customer?.last_checkout_session === session.id) {
+          console.log("Webhook duplicado ignorado:", session.id);
+          return res.json({ received: true });
         }
-      }
 
-      // ==========================
-      // 2️⃣ CALCULA CASHBACK
-      // ==========================
-      let rate = 0;
-      if (totalLaser >= 1200) rate = 0.10;
-      else if (totalLaser >= 600) rate = 0.07;
-      else if (totalLaser >= 200) rate = 0.05;
+        // ==========================
+        // 1️⃣ CALCULA TOTAIS
+        // ==========================
 
-      const cashbackEarned = totalLaser * rate;
+        const LASER_SERVICES_CASHBACK = [
+          "Jawline","Areolas","Happy Trails","Men Bears","Feet","Sideburns","Ears","Chin","Upper Lip",
+          "Back-Neck","Front-Neck","Shoulders","Under Arms","Bikini Line",
+          "Upper Legs","Lower Legs","Lower Back","Half Back","Upper Arms","Lower Arms",
+          "Chest","Abdomen","Buttocks","Full Face","Full Brazillian",
+          "Full Chest","Full Arms","Full Legs","Full Back"
+        ];
 
-      // ==========================
-      // 3️⃣ APLICA CASHBACK USADO (até 50%)
-      // ==========================
-      let usedCashback = 0;
-      if (customer.cashback_balance > 0) {
-        const maxUse = session.amount_total / 100 * 0.5; // 50% da compra
-        usedCashback = Math.min(customer.cashback_balance, maxUse);
+        let totalLaser = 0;
+        let totalLifetime = 0;
+
+        for (const item of session.line_items.data) {
+
+          const product = item.price.product;
+          const metadata = product.metadata || {};
+
+          const quantity = item.quantity || 1;
+
+          const amount = (item.amount_total || item.amount_subtotal) / 100;
+
+          totalLifetime += amount;
+
+          console.log("Produto:", product.name);
+          console.log("Metadata:", metadata);
+          console.log("Valor:", amount);
+
+          if (
+            metadata.mode === "laser" &&
+            LASER_SERVICES_CASHBACK.includes(metadata.service_name)
+          ) {
+            totalLaser += amount;
+          }
+
+        }
+
+        console.log("Total Lifetime:", totalLifetime);
+        console.log("Total Laser:", totalLaser);
+
+        // ==========================
+        // 2️⃣ CALCULA CASHBACK
+        // ==========================
+
+        let rate = 0;
+
+        if (totalLaser >= 1200) rate = 0.10;
+        else if (totalLaser >= 600) rate = 0.07;
+        else if (totalLaser >= 200) rate = 0.05;
+
+        const cashbackEarned = Number((totalLaser * rate).toFixed(2));
+
+        console.log("Cashback Rate:", rate);
+        console.log("Cashback Earned:", cashbackEarned);
+
+        // ==========================
+        // 3️⃣ CALCULA CASHBACK USADO
+        // ==========================
+
+        let usedCashback = 0;
+
+        if (customer.cashback_balance > 0) {
+
+          const purchaseAmount = session.amount_total / 100;
+
+          const maxUse = purchaseAmount * 0.5;
+
+          usedCashback = Math.min(customer.cashback_balance, maxUse);
+
+        }
+
+        console.log("Cashback Used:", usedCashback);
+
+        // ==========================
+        // 4️⃣ ATUALIZA SUPABASE
+        // ==========================
+
+        const { error: updateError } = await supabase
+          .from("customers")
+          .update({
+            lifetime_total: customer.lifetime_total + totalLifetime,
+            laser_total: customer.laser_total + totalLaser,
+            cashback_balance:
+              customer.cashback_balance - usedCashback + cashbackEarned,
+            laser_tier: rate,
+            last_checkout_session: session.id,
+            updated_at: new Date()
+          })
+          .eq("email", email);
+
+        if (updateError) {
+          console.error("Erro atualizando cliente:", updateError);
+        }
+
+        // ==========================
+        // 5️⃣ REGISTRA TRANSAÇÕES
+        // ==========================
+
+        if (cashbackEarned > 0) {
+
+          const expiresAt = new Date();
+          expiresAt.setMonth(expiresAt.getMonth() + 6);
+
+          const { error } = await supabase
+            .from("cashback_transactions")
+            .insert({
+              email: email,
+              amount: cashbackEarned,
+              type: "earned",
+              category: "laser",
+              source: "stripe",
+              expires_at: expiresAt
+            });
+
+          if (error) {
+            console.error("Erro ao inserir cashback earned:", error);
+          }
+        }
 
         if (usedCashback > 0) {
-          const coupon = await stripe.coupons.create({
-            amount_off: Math.round(usedCashback * 100),
-            currency: "usd",
-            duration: "once",
-            name: `Cashback Used (Max 50%)`
-          });
 
-          await stripe.checkout.sessions.update(session.id, {
-            discounts: [{ coupon: coupon.id }]
-          });
+          const { error } = await supabase
+            .from("cashback_transactions")
+            .insert({
+              email: email,
+              amount: usedCashback,
+              type: "used",
+              category: "laser",
+              source: "stripe"
+            });
+
+          if (error) {
+            console.error("Erro ao inserir cashback used:", error);
+          }
         }
+
+        console.log(
+          `Pagamento processado: ${email} | Ganhou: $${cashbackEarned.toFixed(
+            2
+          )} | Usou: $${usedCashback.toFixed(2)}`
+        );
+
+      } catch (err) {
+        console.error("Erro processando pagamento:", err);
       }
-
-      // ==========================
-      // 4️⃣ ATUALIZA SUPABASE
-      // ==========================
-      const { data, error } = await supabase
-        .from("customers")
-        .update({
-          lifetime_total: customer.lifetime_total + totalLifetime,
-          laser_total: customer.laser_total + totalLaser,
-          cashback_balance: customer.cashback_balance - usedCashback + cashbackEarned,
-          laser_tier: rate,
-          last_checkout_session: session.id
-        })
-        .eq("email", email);
-
-      if (error) console.error("Erro atualizando cliente:", error);
-
-      // ==========================
-      // 5️⃣ REGISTRA TRANSACOES DE CASHBACK
-      // ==========================
-      if (cashbackEarned > 0) {
-  const { error } = await supabase.from("cashback_transactions").insert({
-    email: email,
-    amount: cashbackEarned,
-    type: "earned",
-    category: "laser",
-    source: "stripe"
-  });
-  if (error) console.error("Erro ao inserir cashback_earned:", error);
-}
-
-if (usedCashback > 0) {
-  const { error } = await supabase.from("cashback_transactions").insert({
-    email: email,
-    amount: usedCashback,
-    type: "used",
-    category: "laser",
-    source: "stripe"
-  });
-  if (error) console.error("Erro ao inserir cashback_used:", error);
-}
-
-      console.log(`Pagamento processado: ${email} | Ganhou: $${cashbackEarned.toFixed(2)} | Usou: $${usedCashback.toFixed(2)}`);
     }
 
     res.json({ received: true });
