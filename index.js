@@ -126,47 +126,34 @@ app.post(
           return res.json({ received: true });
         }
 
-        // ==========================
-        // 1️⃣ CALCULA TOTAIS
-        // ==========================
+       // ==========================
+// 1️⃣ CALCULA TOTAIS
+// ==========================
 
-        const LASER_SERVICES_CASHBACK = [
-          "Jawline","Areolas","Happy Trails","Men Bears","Feet","Sideburns","Ears","Chin","Upper Lip",
-          "Back-Neck","Front-Neck","Shoulders","Under Arms","Bikini Line",
-          "Upper Legs","Lower Legs","Lower Back","Half Back","Upper Arms","Lower Arms",
-          "Chest","Abdomen","Buttocks","Full Face","Full Brazillian",
-          "Full Chest","Full Arms","Full Legs","Full Back"
-        ];
+let totalLaser = 0;
+let totalLifetime = 0;
 
-        let totalLaser = 0;
-        let totalLifetime = 0;
+for (const item of session.line_items.data) {
+  const product = item.price.product;
+  const metadata = product.metadata || {};
+  const quantity = item.quantity || 1;
 
-        for (const item of session.line_items.data) {
+  const unitAmount = item.price.unit_amount || 0;
+  const amount = (unitAmount / 100) * quantity;
 
-          const product = item.price.product;
-          const metadata = product.metadata || {};
+  totalLifetime += amount;
 
-          const quantity = item.quantity || 1;
+  console.log("Produto:", product.name);
+  console.log("Metadata:", metadata);
+  console.log("Valor:", amount.toFixed(2));
 
-          const amount = (item.amount_total || item.amount_subtotal) / 100;
+  if (metadata.mode === "laser") {
+    totalLaser += amount;
+  }
+}
 
-          totalLifetime += amount;
-
-          console.log("Produto:", product.name);
-          console.log("Metadata:", metadata);
-          console.log("Valor:", amount);
-
-          if (
-            metadata.mode === "laser" &&
-            LASER_SERVICES_CASHBACK.includes(metadata.service_name)
-          ) {
-            totalLaser += amount;
-          }
-
-        }
-
-        console.log("Total Lifetime:", totalLifetime);
-        console.log("Total Laser:", totalLaser);
+console.log("Total Lifetime:", totalLifetime.toFixed(2));
+console.log("Total Laser:", totalLaser.toFixed(2));
 
         // ==========================
         // 2️⃣ CALCULA CASHBACK
