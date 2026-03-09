@@ -125,7 +125,7 @@ app.post(
           return res.json({ received: true });
         }
 
-       // ==========================
+// ==========================
 // 1️⃣ CALCULA TOTAIS
 // ==========================
 
@@ -146,29 +146,29 @@ for (const item of session.line_items.data) {
   console.log("Valor:", amount.toFixed(2));
 
   if (metadata.mode === "laser" || metadata.mode === "full-body") {
-  totalLaser += amount;
-}
+    totalLaser += amount;
+  }
 }
 
 console.log("Total Lifetime:", totalLifetime.toFixed(2));
 console.log("Total Laser:", totalLaser.toFixed(2));
 
-        // ==========================
-        // 2️⃣ CALCULA CASHBACK
-        // ==========================
+// ==========================
+// 2️⃣ CALCULA CASHBACK
+// ==========================
 
-        let rate = 0;
+let rate = 0;
 
-        if (totalLaser >= 3000) rate = 0.10;
-        else if (totalLaser >= 1500) rate = 0.07;
-        else if (totalLaser >= 500) rate = 0.05;
+if (totalLaser >= 3000) rate = 0.10;
+else if (totalLaser >= 1500) rate = 0.07;
+else if (totalLaser >= 500) rate = 0.05;
 
-        const cashbackEarned = Number((totalLaser * rate).toFixed(2));
+const cashbackEarned = Number((totalLaser * rate).toFixed(2));
 
-        console.log("Cashback Rate:", rate);
-        console.log("Cashback Earned:", cashbackEarned);
+console.log("Cashback Rate:", rate);
+console.log("Cashback Earned:", cashbackEarned);
 
-        // ==========================
+// ==========================
 // 3️⃣ CALCULA CASHBACK USADO E GANHO
 // ==========================
 
@@ -176,33 +176,18 @@ console.log("Total Laser:", totalLaser.toFixed(2));
 const usedCashback = Number(session.metadata?.cashback_used_amount || 0);
 console.log("Cashback Usado:", usedCashback);
 
-// Total de serviços de Laser/Full-body no checkout
-let totalLaser = 0;
-for (const item of session.line_items.data) {
-  const product = item.price.product;
-  const metadata = product.metadata || {};
-  const quantity = item.quantity || 1;
-
-  let amount = item.amount_total / 100; // Valor total do item
-  if (metadata.mode === "laser" || metadata.mode === "full-body") {
-    totalLaser += amount;
-  }
-}
-
-console.log("Total Laser:", totalLaser.toFixed(2));
-
 // Valor efetivamente pago pelo cliente (após desconto de cashback)
 const effectivePayment = totalLaser - usedCashback;
 console.log("Valor efetivo pago:", effectivePayment.toFixed(2));
 
 // Determina a taxa de cashback com base no gasto efetivo
-let rate = 0;
+rate = 0;
 if (effectivePayment >= 3000) rate = 0.10;
 else if (effectivePayment >= 1500) rate = 0.07;
 else if (effectivePayment >= 500) rate = 0.05;
 
-const cashbackEarned = Number((effectivePayment * rate).toFixed(2));
-console.log("Cashback Ganho:", cashbackEarned);
+const cashbackEarnedAfterUsed = Number((effectivePayment * rate).toFixed(2));
+console.log("Cashback Ganho:", cashbackEarnedAfterUsed);
 
 // ==========================
 // 4️⃣ ATUALIZA SUPABASE
@@ -213,9 +198,9 @@ const { error: updateError } = await supabase
   .upsert(
     {
       email: email,
-      lifetime_total: customer.lifetime_total + totalLaser, // totalLifetime se preferir somar todos os serviços
+      lifetime_total: customer.lifetime_total + totalLaser, // ou totalLifetime se quiser somar todos os serviços
       laser_total: customer.laser_total + totalLaser,
-      cashback_balance: customer.cashback_balance - usedCashback + cashbackEarned,
+      cashback_balance: customer.cashback_balance - usedCashback + cashbackEarnedAfterUsed,
       laser_tier: rate,
       last_checkout_session: session.id,
       updated_at: new Date()
@@ -232,7 +217,7 @@ if (updateError) {
 // ==========================
 
 // Registro do cashback ganho
-if (cashbackEarned > 0) {
+if (cashbackEarnedAfterUsed > 0) {
   const expiresAt = new Date();
   expiresAt.setMonth(expiresAt.getMonth() + 6);
 
@@ -240,7 +225,7 @@ if (cashbackEarned > 0) {
     .from("cashback_transactions")
     .insert({
       email: email,
-      amount: cashbackEarned,
+      amount: cashbackEarnedAfterUsed,
       type: "earned",
       category: "laser",
       source: "stripe",
@@ -270,7 +255,7 @@ if (usedCashback > 0) {
 console.log(
   `Pagamento processado: ${email} | Pagou: $${effectivePayment.toFixed(
     2
-  )} | Cashback Ganho: $${cashbackEarned.toFixed(
+  )} | Cashback Ganho: $${cashbackEarnedAfterUsed.toFixed(
     2
   )} | Cashback Usado: $${usedCashback.toFixed(2)}`
 );
