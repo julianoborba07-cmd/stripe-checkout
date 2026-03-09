@@ -137,18 +137,17 @@ for (const item of session.line_items.data) {
   const metadata = product.metadata || {};
   const quantity = item.quantity || 1;
 
-  const unitAmount = item.price.unit_amount || 0;
-  const amount = (unitAmount / 100) * quantity;
-
+  const amount = item.amount_total / 100;
+  
   totalLifetime += amount;
 
   console.log("Produto:", product.name);
   console.log("Metadata:", metadata);
   console.log("Valor:", amount.toFixed(2));
 
-  if (metadata.mode === "laser") {
-    totalLaser += amount;
-  }
+  if (metadata.mode === "laser" || metadata.mode === "full-body") {
+  totalLaser += amount;
+}
 }
 
 console.log("Total Lifetime:", totalLifetime.toFixed(2));
@@ -173,17 +172,7 @@ console.log("Total Laser:", totalLaser.toFixed(2));
         // 3️⃣ CALCULA CASHBACK USADO
         // ==========================
 
-        let usedCashback = 0;
-
-if (session.metadata?.cashback_used === "yes") {
-
-  const purchaseAmount = session.amount_total / 100;
-
-  const maxUse = purchaseAmount * 0.5;
-
-  usedCashback = Math.min(customer.cashback_balance, maxUse);
-
-}
+        const usedCashback = Number(session.metadata?.cashback_used_amount || 0);
 
         console.log("Cashback Used:", usedCashback);
 
@@ -198,8 +187,10 @@ const { error: updateError } = await supabase
       email: email,
       lifetime_total: customer.lifetime_total + totalLifetime,
       laser_total: customer.laser_total + totalLaser,
-      cashback_balance:
-        customer.cashback_balance - usedCashback + cashbackEarned,
+      cashback_balance: Math.max(
+  0,
+  customer.cashback_balance - usedCashback + cashbackEarned
+),
       laser_tier: rate,
       last_checkout_session: session.id,
       updated_at: new Date()
@@ -228,6 +219,7 @@ if (updateError) {
               type: "earned",
               category: "laser",
               source: "stripe",
+              payment_intent: session.payment_intent,
               expires_at: expiresAt
             });
 
@@ -245,7 +237,8 @@ if (updateError) {
               amount: usedCashback,
               type: "used",
               category: "laser",
-              source: "stripe"
+              source: "stripe",
+              payment_intent: session.payment_intent
             });
 
           if (error) {
@@ -499,30 +492,52 @@ async function resolveDiscounts(customer, items) {
   // Cashback
   // =======================
   if (customer.cashback_balance > 0) {
-    // Calcula total do carrinho atual
-    let currentCartTotal = 0;
-    for (const item of resolvedItems) {
-      const stripePrice = await stripe.prices.retrieve(item.priceId);
-      currentCartTotal += (stripePrice.unit_amount / 100) * item.quantity;
+
+  let currentCartTotal = 0;
+
+  for (const item of items) {
+
+    if (item.type === "morpheus") {
+      const price = getMorpheusPrice(item);
+      currentCartTotal += price * (item.quantity || 1);
+      continue;
     }
 
-    const maxAllowedDiscount = currentCartTotal * 0.5; // Limite 50%
-    const finalCashbackAmount = Math.min(customer.cashback_balance, maxAllowedDiscount);
+    const priceId = resolvePriceId(item);
+    const stripePrice = await stripe.prices.retrieve(priceId);
 
-    if (finalCashbackAmount > 0) {
-      const coupon = await stripe.coupons.create({
-        amount_off: Math.round(finalCashbackAmount * 100),
-        currency: "usd",
-        duration: "once",
-        name: `Cashback Used (Max 50%)`
-      });
-      return { discounts: [{ coupon: coupon.id }], metadata: { discount_type: "cashback_used", original_balance: customer.cashback_balance } };
-    }
+    currentCartTotal += (stripePrice.unit_amount / 100) * (item.quantity || 1);
   }
 
-  return { discounts: [], metadata: {} };
-}
+  const maxAllowedDiscount = currentCartTotal * 0.5;
 
+  const finalCashbackAmount = Math.min(
+    customer.cashback_balance,
+    maxAllowedDiscount
+  );
+
+  if (finalCashbackAmount > 0) {
+
+    const coupon = await stripe.coupons.create({
+      amount_off: Math.round(finalCashbackAmount * 100),
+      currency: "usd",
+      duration: "once",
+      name: `Cashback Used (Max 50%)`
+    });
+
+    return {
+      discounts: [{ coupon: coupon.id }],
+      metadata: {
+        discount_type: "cashback_used",
+        cashback_used_amount: finalCashbackAmount
+      }
+    };
+
+  }
+}
+    return { discounts: [], metadata: {} };
+
+}
 app.post("/cashback-preview", (req, res) => {
   try {
     const { cart } = req.body;
@@ -674,7 +689,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     const hasAutoDiscount = discounts && discounts.length > 0;
     const onlyMorpheus = items.every(item => item.type === "morpheus");
 
-    const cashbackUsed = metadata?.discount_type === "cashback_used";
+    const cashbackUsedAmount = metadata?.cashback_used_amount || 0;
 
 const session = await stripe.checkout.sessions.create({
   mode: "payment",
@@ -688,11 +703,11 @@ const session = await stripe.checkout.sessions.create({
     : {}),
 
   metadata: {
-    customer_email: email,
-    cart_items_count: items.length,
-    cashback_used: cashbackUsed ? "yes" : "no",
-    ...metadata
-  },
+  customer_email: email,
+  cart_items_count: items.length,
+  cashback_used_amount: cashbackUsedAmount,
+  ...metadata
+},
 
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel",
