@@ -289,7 +289,7 @@ const priceMap = {
   laser: {
     small: { single: "price_1Sv2ExLVWAMw3iFedZ6vFjav", 6: "price_1Sv2GKLVWAMw3iFeN9zMligM", 8: "price_1Sv2GkLVWAMw3iFe5JQYNmyz" },
     medium: { single: "price_1Sv2IcLVWAMw3iFeoadLWZQa", 6: "price_1Sv2JmLVWAMw3iFe7xLMmPow", 8: "price_1Sv2KALVWAMw3iFen8mPo7yZ" },
-    large: { single: "price_1T8IO3LVWAMw3iFexlcAxzzD", 6: "price_1Sv2MaLVWAMw3iFeHcHi1TLZ", 8: "price_1Sv2N4LVWAMw3iFePan3vdsc" },
+    large: { single: "price_1Sv2M2LVWAMw3iFe3BavpQJO", 6: "price_1Sv2MaLVWAMw3iFeHcHi1TLZ", 8: "price_1Sv2N4LVWAMw3iFePan3vdsc" },
     xlarge: { single: "price_1Sv2NvLVWAMw3iFe73PwJ0u4", 6: "price_1Sv2OwLVWAMw3iFeY7kKQSzl", 8: "price_1Sv2PQLVWAMw3iFeYiWPlDxM" },
   },
   "full-body": {
@@ -305,7 +305,7 @@ const priceMap = {
     "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
     "3-led10": "price_1StqioLVWAMw3iFeAm59s0Xt",
     "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
-    "3-peel": "price_1SxrmDLVWAMw3iFeLxauW07O",
+    "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF",
   },
   "classic-deluxe": {
     "single-none": "price_1SuEXILVWAMw3iFeEzZhwlVJ",
