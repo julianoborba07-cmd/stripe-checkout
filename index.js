@@ -491,7 +491,7 @@ async function resolveDiscounts(customer, items) {
     else if (currentFacialPurchase >= 300) discountTier = 5;
 
     if (discountTier > 0) {
-      const couponMap = { 10: "BNKguNqk", 7: "qQVDq1Hd", 5: "nzcBZv4q" };
+      const couponMap = { 10: "xu5jbAdc", 7: "vwkWvHPm", 5: "nzcBZv4q" };
       return { discounts: [{ coupon: couponMap[discountTier] }], metadata: { discount_type: "facial" } };
     }
   }
