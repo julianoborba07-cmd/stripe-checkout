@@ -351,10 +351,33 @@ const otherServicesPrices = {
 };
 
 const morpheusAreas = {
-  "face-neck-chest": "Face, Neck & Chest", "face-neck": "Face & Neck", "face": "Full Face",
-  "neck": "Neck", "chest": "Chest", "eyes": "Eyes", "mouth": "Mouth",
-  "acne-scars": "Acne Scars", "active-acne": "Active Acne", "scars": "Scars",
-  "spot-treatment": "Spot Treatment", "hands": "Hands"
+
+  // FACE
+  "face-neck-chest": "Face, Neck & Chest",
+  "face-neck": "Face & Neck",
+  "face": "Full Face",
+  "neck": "Neck",
+  "chest": "Chest",
+  "eyes": "Eyes",
+  "mouth": "Mouth",
+  "acne-scars": "Acne Scars",
+  "active-acne": "Active Acne",
+  "scars": "Scars",
+  "spot-treatment": "Spot Treatment",
+  "hands": "Hands",
+
+  // BODY
+  "upper-arms": "Upper Arms",
+  "abdomen": "Abdomen",
+  "back-acne": "Back Acne",
+  "thighs": "Thighs",
+  "inner-thighs": "Inner Thighs",
+  "outer-thighs": "Outer Thighs",
+  "knees": "Knees",
+  "cellulite": "Cellulite",
+  "stretchmark-one-area": "Stretchmark (One Area)",
+  "excess-sweating": "Excess Sweating"
+
 };
 
 const packageLabels = { "single": "Single Session", "2": "3 Sessions", "3": "3 Sessions" };
@@ -667,7 +690,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     const line_items = items.map((item) => {
       if (item.type === "morpheus") {
         const calculatedPrice = getMorpheusPrice(item);
-        let areaName = morpheusAreas[item.area] || "Treatment";
+        let areaName = morpheusAreas[item.area] || item.area;
         const packageName = packageLabels[item.packageKey] || "";
         const addonName = addonLabels[item.addon] || "No Additional";
         const parts = [areaName, packageName, addonName];
