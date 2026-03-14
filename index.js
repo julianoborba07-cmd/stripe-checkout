@@ -728,7 +728,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     mode: item.mode,
     real_service_price: realPrice
   }
-}
+},
 
 
       unit_amount: consultationFee * 100,
