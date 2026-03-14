@@ -398,6 +398,8 @@ const MORPHEUS_BASE_PRICES = {
 const MORPHEUS_PACKAGE_DISCOUNT = { single: 0, "2": 0.05, "3": 0.10 };
 const MORPHEUS_ADDON_PRICES = { none: 0, led10: 30, led20: 50, exosomes: 100, salmon: 100, "led10-exosomes": 130, "led20-exosomes": 150, "led10-salmon": 130, "led20-salmon": 150 };
 const MORPHEUS_COMBO_DISCOUNT = 0.10;
+const MORPHEUS_CONSULTATION_FEE = 100;
+
 
 // ==============================
 // LOGIC CALCULATORS
@@ -689,27 +691,53 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
     const line_items = items.map((item) => {
       if (item.type === "morpheus") {
-        const calculatedPrice = getMorpheusPrice(item);
-        let areaName = morpheusAreas[item.area] || item.area;
-        const packageName = packageLabels[item.packageKey] || "";
-        const addonName = addonLabels[item.addon] || "No Additional";
-        const parts = [areaName, packageName, addonName];
-        if (item.combo) parts.push("Combo");
-        const fullName = parts.filter(Boolean).join(" - ");
 
-        return {
-          price_data: {
-            currency: "usd",
-            product_data: {
-              name: fullName,
-              images: ["https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"],
-              metadata: { service_name: areaName, package: item.packageKey, addon: item.addon || "none", combo: item.combo ? "yes" : "no", mode: item.mode }
-            },
-            unit_amount: calculatedPrice * 100,
-          },
-          quantity: item.quantity || 1,
-        };
-      }
+  const realPrice = getMorpheusPrice(item);
+
+  const consultationFee = 100;
+
+  let areaName = morpheusAreas[item.area] || item.area;
+  const packageName = packageLabels[item.packageKey] || "";
+  const addonName = addonLabels[item.addon] || "No Additional";
+
+  const parts = [areaName, packageName, addonName];
+  if (item.combo) parts.push("Combo");
+
+  const fullName = parts.filter(Boolean).join(" - ");
+
+  const displayName = `Morpheus8 Consultation – ${fullName}`;
+
+
+  return {
+    price_data: {
+      currency: "usd",
+      product_data: {
+  name: displayName,
+
+  description: "$100 Reservation Fee – Applied toward treatment",
+
+  images: [
+    "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
+  ],
+
+  metadata: {
+    service_name: areaName,
+    package: item.packageKey,
+    addon: item.addon || "none",
+    combo: item.combo ? "yes" : "no",
+    mode: item.mode,
+    real_service_price: realPrice
+  }
+}
+
+
+      unit_amount: consultationFee * 100,
+    },
+
+    quantity: 1
+  };
+}
+
 
       const priceId = resolvePriceId(item);
       if (!priceId) throw new Error("Produto inválido");
