@@ -694,11 +694,21 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
   const consultationFee = 100;
 
-  const areas = Array.isArray(item.selectedAreas) ? item.selectedAreas : [];
+  const services = item.services || {};
 
-  const areasText = areas.length
-  ? `Selected Areas: ${areas.join(", ")}. `
-  : "";
+  let servicesText = "";
+
+  if (services.morpheus && services.morpheus.length) {
+    servicesText += `Morpheus8: ${services.morpheus.join(", ")}. `;
+  }
+
+  if (services.body && services.body.length) {
+    servicesText += `Morpheus8 Body: ${services.body.join(", ")}. `;
+  }
+
+  if (services.lumecca && services.lumecca.length) {
+    servicesText += `Lumecca (IPL): ${services.lumecca.join(", ")}. `;
+  }
 
   const displayName = "Morpheus8 Consultation";
 
@@ -710,14 +720,16 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
         name: displayName,
 
-        description: `${areasText}$100 Reservation Fee – Applied toward treatment`,
+        description: `${servicesText}$100 Reservation Fee – Applied toward treatment`,
 
         images: [
           "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
         ],
 
         metadata: {
-          areas: areas.join(", ")
+          morpheus: services.morpheus?.join(", ") || "",
+          body: services.body?.join(", ") || "",
+          lumecca: services.lumecca?.join(", ") || ""
         }
 
       },
