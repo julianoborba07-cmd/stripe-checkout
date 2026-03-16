@@ -697,8 +697,8 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
   const areas = Array.isArray(item.selectedAreas) ? item.selectedAreas : [];
 
   const areasText = areas.length
-    ? `Selected Areas:\n${areas.join("\n")}\n\n`
-    : "";
+  ? `Selected Areas: ${areas.join(", ")}. `
+  : "";
 
   const displayName = "Morpheus8 Consultation";
 
