@@ -681,7 +681,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
     for (const item of items) {
       if (!VALID_TYPES.includes(item.type)) return res.status(400).json({ error: "Invalid product type" });
-      const quantity = Number(item.quantity) || 1;
+      const quantity = Number(item.quantity || item.qty) || 1;
       if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_ITEM_QUANTITY) {
         return res.status(400).json({ error: "Invalid quantity" });
       }
@@ -694,9 +694,11 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
   const consultationFee = 100;
 
-  const areas = item.selectedAreas || [];
+  const areas = Array.isArray(item.selectedAreas) ? item.selectedAreas : [];
 
-  const areasText = areas.join("\n");
+  const areasText = areas.length
+    ? `Selected Areas:\n${areas.join("\n")}\n\n`
+    : "";
 
   const displayName = "Morpheus8 Consultation";
 
@@ -708,9 +710,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
         name: displayName,
 
-        description: `${areasText}
-
-$100 Reservation Fee – Applied toward treatment`,
+        description: `${areasText}$100 Reservation Fee – Applied toward treatment`,
 
         images: [
           "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
