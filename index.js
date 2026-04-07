@@ -343,7 +343,7 @@ const priceMap = {
 };
 
 const otherServicesPrices = {
-  nanoblading: "price_1Szi9tLVWAMw3iFeni0n26QU",
+  nanoblading: "price_1TJhwXLVWAMw3iFeL89oDbj5",
   "powder-brows": "price_1SziATLVWAMw3iFeJ8O37uOa",
   "top-eyeliner": "price_1SziBLLVWAMw3iFefsG4hGYu",
   "lip-blush": "price_1SziBtLVWAMw3iFeOlogbBw5",
