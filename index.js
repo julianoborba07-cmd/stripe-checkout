@@ -692,7 +692,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     const line_items = items.map((item) => {
       if (item.type === "morpheus") {
 
-  const consultationFee = 50;
+  const consultationFee = MORPHEUS_CONSULTATION_FEE;
 
   const services = item.services || {};
 
@@ -777,6 +777,90 @@ const session = await stripe.checkout.sessions.create({
     res.json({ url: session.url });
   } catch (error) {
     console.error("Erro checkout:", error);
+    res.status(500).json({ error: "Erro ao criar sessão" });
+  }
+});
+
+
+function cleanLeadField(value, max = 300) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) => {
+  try {
+    const email = cleanLeadField(req.body.email, 120).toLowerCase();
+    const fullName = cleanLeadField(req.body.fullName, 120);
+    const phoneNumber = cleanLeadField(req.body.phoneNumber, 60);
+    const preferredContact = cleanLeadField(req.body.preferredContact, 40);
+    const goals = cleanLeadField(req.body.goals, 400);
+    const sourcePage = cleanLeadField(req.body.sourcePage, 180);
+
+    const areasOfConcern = Array.isArray(req.body.areasOfConcern)
+      ? req.body.areasOfConcern.map((item) => cleanLeadField(item, 60)).filter(Boolean).join(", ")
+      : cleanLeadField(req.body.areasOfConcern, 300);
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email" });
+    }
+
+    if (!fullName || !phoneNumber || !preferredContact) {
+      return res.status(400).json({ error: "Missing required form fields" });
+    }
+
+    const descriptionParts = [
+      "$50 Reservation Fee – Applied toward treatment",
+      fullName ? `Name: ${fullName}` : "",
+      phoneNumber ? `Phone: ${phoneNumber}` : "",
+      preferredContact ? `Preferred Contact: ${preferredContact}` : "",
+      areasOfConcern ? `Areas of Concern: ${areasOfConcern}` : "",
+      goals ? `Goals: ${goals}` : ""
+    ].filter(Boolean);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: email,
+      allow_promotion_codes: true,
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: "Morpheus8 Consultation",
+              description: descriptionParts.join(" | ").slice(0, 500),
+              images: [
+                "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
+              ],
+              metadata: {
+                source: "morpheus-landing-form",
+                full_name: fullName,
+                phone_number: phoneNumber,
+                preferred_contact: preferredContact,
+                areas_of_concern: areasOfConcern,
+                goals: goals
+              }
+            },
+            unit_amount: MORPHEUS_CONSULTATION_FEE * 100
+          },
+          quantity: 1
+        }
+      ],
+      metadata: {
+        source: "morpheus-landing-form",
+        source_page: sourcePage,
+        customer_email: email,
+        full_name: fullName,
+        phone_number: phoneNumber,
+        preferred_contact: preferredContact,
+        areas_of_concern: areasOfConcern,
+        goals: goals
+      },
+      success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+      cancel_url: "https://lltouch.com/cancel"
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error("Erro direct morpheus checkout:", error);
     res.status(500).json({ error: "Erro ao criar sessão" });
   }
 });
