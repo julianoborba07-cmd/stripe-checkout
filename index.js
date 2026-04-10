@@ -398,7 +398,7 @@ const MORPHEUS_BASE_PRICES = {
 const MORPHEUS_PACKAGE_DISCOUNT = { single: 0, "2": 0.05, "3": 0.10 };
 const MORPHEUS_ADDON_PRICES = { none: 0, led10: 30, led20: 50, exosomes: 100, salmon: 100, "led10-exosomes": 130, "led20-exosomes": 150, "led10-salmon": 130, "led20-salmon": 150 };
 const MORPHEUS_COMBO_DISCOUNT = 0.10;
-const MORPHEUS_CONSULTATION_FEE = 100;
+const MORPHEUS_CONSULTATION_FEE = 50;
 
 
 // ==============================
@@ -692,7 +692,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     const line_items = items.map((item) => {
       if (item.type === "morpheus") {
 
-  const consultationFee = 100;
+  const consultationFee = 50;
 
   const services = item.services || {};
 
@@ -720,7 +720,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
         name: displayName,
 
-        description: `${servicesText}$100 Reservation Fee – Applied toward treatment`,
+        description: `${servicesText}$50 Reservation Fee – Applied toward treatment`,
 
         images: [
           "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
