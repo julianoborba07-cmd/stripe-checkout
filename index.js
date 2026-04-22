@@ -398,7 +398,7 @@ const MORPHEUS_BASE_PRICES = {
 const MORPHEUS_PACKAGE_DISCOUNT = { single: 0, "2": 0.05, "3": 0.10 };
 const MORPHEUS_ADDON_PRICES = { none: 0, led10: 30, led20: 50, exosomes: 100, salmon: 100, "led10-exosomes": 130, "led20-exosomes": 150, "led10-salmon": 130, "led20-salmon": 150 };
 const MORPHEUS_COMBO_DISCOUNT = 0.10;
-const MORPHEUS_CONSULTATION_FEE = 5;
+const MORPHEUS_CONSULTATION_FEE = 50;
 
 
 // ==============================
