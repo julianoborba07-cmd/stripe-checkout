@@ -28,13 +28,44 @@ function isValidEmail(email) {
   return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
+function cleanLeadField(value, max = 300) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function safeJsonParse(value, fallback = null) {
+  try {
+    if (!value) return fallback;
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/&/g, "and")
+    .replace(/\+/g, "plus")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function formatDateOnly(value) {
+  const str = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
+  return str;
+}
+
 const app = express();
-app.set('trust proxy', 1); 
+app.set("trust proxy", 1);
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ==============================
 // SUPABASE
 // ==============================
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
@@ -43,6 +74,7 @@ const supabase = createClient(
 // ==============================
 // CUSTOMER HELPERS
 // ==============================
+
 async function getOrCreateCustomer(email) {
   let { data: customer } = await supabase
     .from("customers")
@@ -77,16 +109,21 @@ async function getOrCreateCustomer(email) {
 // ==============================
 // MIDDLEWARES
 // ==============================
+
 app.use(cors({
   origin: [
     "https://lltouch.com",
-    "https://www.lltouch.com"
+    "https://www.lltouch.com",
+    "https://llbrows.com",
+    "https://www.llbrows.com"
   ]
 }));
 
 // ==============================
-// WEBHOOK CORRIGIDO
+// STRIPE WEBHOOK
+// Keep this route before express.json()
 // ==============================
+
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -105,10 +142,8 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // Processa apenas pagamentos completos
     if (event.type === "checkout.session.completed") {
       try {
-
         const session = await stripe.checkout.sessions.retrieve(
           event.data.object.id,
           { expand: ["line_items.data.price.product"] }
@@ -119,147 +154,110 @@ app.post(
 
         const customer = await getOrCreateCustomer(email);
 
-        // Evita duplicação do webhook
         if (customer?.last_checkout_session === session.id) {
           console.log("Webhook duplicado ignorado:", session.id);
           return res.json({ received: true });
         }
 
-// ==========================
-// 1️⃣ CALCULA TOTAIS
-// ==========================
+        let totalLaser = 0;
+        let totalLifetime = 0;
 
-let totalLaser = 0;
-let totalLifetime = 0;
+        for (const item of session.line_items.data) {
+          const product = item.price.product;
+          const metadata = product.metadata || {};
+          const amount = item.amount_total / 100;
 
-for (const item of session.line_items.data) {
-  const product = item.price.product;
-  const metadata = product.metadata || {};
-  const quantity = item.quantity || 1;
+          totalLifetime += amount;
 
-  const amount = item.amount_total / 100;
-  
-  totalLifetime += amount;
+          console.log("Produto:", product.name);
+          console.log("Metadata:", metadata);
+          console.log("Valor:", amount.toFixed(2));
 
-  console.log("Produto:", product.name);
-  console.log("Metadata:", metadata);
-  console.log("Valor:", amount.toFixed(2));
+          if (metadata.mode === "laser" || metadata.mode === "full-body") {
+            totalLaser += amount;
+          }
+        }
 
-  if (metadata.mode === "laser" || metadata.mode === "full-body") {
-    totalLaser += amount;
-  }
-}
+        console.log("Total Lifetime:", totalLifetime.toFixed(2));
+        console.log("Total Laser:", totalLaser.toFixed(2));
 
-console.log("Total Lifetime:", totalLifetime.toFixed(2));
-console.log("Total Laser:", totalLaser.toFixed(2));
+        const usedCashback = Number(session.metadata?.cashback_used_amount || 0);
+        console.log("Cashback Usado:", usedCashback);
 
-// ==========================
-// 2️⃣ CALCULA CASHBACK
-// ==========================
+        const effectivePayment = totalLaser - usedCashback;
+        console.log("Valor efetivo pago:", effectivePayment.toFixed(2));
 
-let rate = 0;
+        let rate = 0;
+        if (effectivePayment >= 3000) rate = 0.10;
+        else if (effectivePayment >= 1500) rate = 0.07;
+        else if (effectivePayment >= 500) rate = 0.05;
 
-if (totalLaser >= 3000) rate = 0.10;
-else if (totalLaser >= 1500) rate = 0.07;
-else if (totalLaser >= 500) rate = 0.05;
+        const cashbackEarnedAfterUsed = Number((effectivePayment * rate).toFixed(2));
+        console.log("Cashback Ganho:", cashbackEarnedAfterUsed);
 
-const cashbackEarned = Number((totalLaser * rate).toFixed(2));
+        const { error: updateError } = await supabase
+          .from("customers")
+          .upsert(
+            {
+              email,
+              lifetime_total: Number(customer.lifetime_total || 0) + totalLaser,
+              laser_total: Number(customer.laser_total || 0) + totalLaser,
+              cashback_balance:
+                Number(customer.cashback_balance || 0) -
+                usedCashback +
+                cashbackEarnedAfterUsed,
+              laser_tier: rate,
+              last_checkout_session: session.id,
+              updated_at: new Date()
+            },
+            { onConflict: "email" }
+          );
 
-console.log("Cashback Rate:", rate);
-console.log("Cashback Earned:", cashbackEarned);
+        if (updateError) {
+          console.error("Erro atualizando cliente:", updateError);
+        }
 
-// ==========================
-// 3️⃣ CALCULA CASHBACK USADO E GANHO
-// ==========================
+        if (cashbackEarnedAfterUsed > 0) {
+          const expiresAt = new Date();
+          expiresAt.setMonth(expiresAt.getMonth() + 6);
 
-// Valor de cashback usado nesta compra (se houver)
-const usedCashback = Number(session.metadata?.cashback_used_amount || 0);
-console.log("Cashback Usado:", usedCashback);
+          const { error } = await supabase
+            .from("cashback_transactions")
+            .insert({
+              email,
+              amount: cashbackEarnedAfterUsed,
+              type: "earned",
+              category: "laser",
+              source: "stripe",
+              payment_intent: session.payment_intent,
+              expires_at: expiresAt
+            });
 
-// Valor efetivamente pago pelo cliente (após desconto de cashback)
-const effectivePayment = totalLaser - usedCashback;
-console.log("Valor efetivo pago:", effectivePayment.toFixed(2));
+          if (error) console.error("Erro inserindo cashback ganho:", error);
+        }
 
-// Determina a taxa de cashback com base no gasto efetivo
-rate = 0;
-if (effectivePayment >= 3000) rate = 0.10;
-else if (effectivePayment >= 1500) rate = 0.07;
-else if (effectivePayment >= 500) rate = 0.05;
+        if (usedCashback > 0) {
+          const { error } = await supabase
+            .from("cashback_transactions")
+            .insert({
+              email,
+              amount: usedCashback,
+              type: "used",
+              category: "laser",
+              source: "stripe",
+              payment_intent: session.payment_intent
+            });
 
-const cashbackEarnedAfterUsed = Number((effectivePayment * rate).toFixed(2));
-console.log("Cashback Ganho:", cashbackEarnedAfterUsed);
+          if (error) console.error("Erro inserindo cashback usado:", error);
+        }
 
-// ==========================
-// 4️⃣ ATUALIZA SUPABASE
-// ==========================
-
-const { error: updateError } = await supabase
-  .from("customers")
-  .upsert(
-    {
-      email: email,
-      lifetime_total: customer.lifetime_total + totalLaser, // ou totalLifetime se quiser somar todos os serviços
-      laser_total: customer.laser_total + totalLaser,
-      cashback_balance: customer.cashback_balance - usedCashback + cashbackEarnedAfterUsed,
-      laser_tier: rate,
-      last_checkout_session: session.id,
-      updated_at: new Date()
-    },
-    { onConflict: "email" }
-  );
-
-if (updateError) {
-  console.error("Erro atualizando cliente:", updateError);
-}
-
-// ==========================
-// 5️⃣ REGISTRA TRANSAÇÕES DE CASHBACK
-// ==========================
-
-// Registro do cashback ganho
-if (cashbackEarnedAfterUsed > 0) {
-  const expiresAt = new Date();
-  expiresAt.setMonth(expiresAt.getMonth() + 6);
-
-  const { error } = await supabase
-    .from("cashback_transactions")
-    .insert({
-      email: email,
-      amount: cashbackEarnedAfterUsed,
-      type: "earned",
-      category: "laser",
-      source: "stripe",
-      payment_intent: session.payment_intent,
-      expires_at: expiresAt
-    });
-
-  if (error) console.error("Erro inserindo cashback ganho:", error);
-}
-
-// Registro do cashback usado
-if (usedCashback > 0) {
-  const { error } = await supabase
-    .from("cashback_transactions")
-    .insert({
-      email: email,
-      amount: usedCashback,
-      type: "used",
-      category: "laser",
-      source: "stripe",
-      payment_intent: session.payment_intent
-    });
-
-  if (error) console.error("Erro inserindo cashback usado:", error);
-}
-
-console.log(
-  `Pagamento processado: ${email} | Pagou: $${effectivePayment.toFixed(
-    2
-  )} | Cashback Ganho: $${cashbackEarnedAfterUsed.toFixed(
-    2
-  )} | Cashback Usado: $${usedCashback.toFixed(2)}`
-);
-
+        console.log(
+          `Pagamento processado: ${email} | Pagou: $${effectivePayment.toFixed(
+            2
+          )} | Cashback Ganho: $${cashbackEarnedAfterUsed.toFixed(
+            2
+          )} | Cashback Usado: $${usedCashback.toFixed(2)}`
+        );
       } catch (err) {
         console.error("Erro processando pagamento:", err);
       }
@@ -269,7 +267,7 @@ console.log(
   }
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 const checkoutLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -280,23 +278,52 @@ const checkoutLimiter = rateLimit({
 // ==============================
 // PRICE TABLES & LABELS
 // ==============================
+
 const priceMap = {
   membership: {
     platinum: { "6": "price_1SyuFlLVWAMw3iFeAAU7GR1e" },
     gold: { "6": "price_1SyuGnLVWAMw3iFe3U8Y81SF" },
-    teen: { "6": "price_1SyuHuLVWAMw3iFetbcoodh2" },
+    teen: { "6": "price_1SyuHuLVWAMw3iFetbcoodh2" }
   },
+
   laser: {
-    small: { single: "price_1Sv2ExLVWAMw3iFedZ6vFjav", 6: "price_1Sv2GKLVWAMw3iFeN9zMligM", 8: "price_1Sv2GkLVWAMw3iFe5JQYNmyz" },
-    medium: { single: "price_1Sv2IcLVWAMw3iFeoadLWZQa", 6: "price_1Sv2JmLVWAMw3iFe7xLMmPow", 8: "price_1Sv2KALVWAMw3iFen8mPo7yZ" },
-    large: { single: "price_1Sv2M2LVWAMw3iFe3BavpQJO", 6: "price_1Sv2MaLVWAMw3iFeHcHi1TLZ", 8: "price_1Sv2N4LVWAMw3iFePan3vdsc" },
-    xlarge: { single: "price_1Sv2NvLVWAMw3iFe73PwJ0u4", 6: "price_1Sv2OwLVWAMw3iFeY7kKQSzl", 8: "price_1Sv2PQLVWAMw3iFeYiWPlDxM" },
+    small: {
+      single: "price_1Sv2ExLVWAMw3iFedZ6vFjav",
+      6: "price_1Sv2GKLVWAMw3iFeN9zMligM",
+      8: "price_1Sv2GkLVWAMw3iFe5JQYNmyz"
+    },
+    medium: {
+      single: "price_1Sv2IcLVWAMw3iFeoadLWZQa",
+      6: "price_1Sv2JmLVWAMw3iFe7xLMmPow",
+      8: "price_1Sv2KALVWAMw3iFen8mPo7yZ"
+    },
+    large: {
+      single: "price_1Sv2M2LVWAMw3iFe3BavpQJO",
+      6: "price_1Sv2MaLVWAMw3iFeHcHi1TLZ",
+      8: "price_1Sv2N4LVWAMw3iFePan3vdsc"
+    },
+    xlarge: {
+      single: "price_1Sv2NvLVWAMw3iFe73PwJ0u4",
+      6: "price_1Sv2OwLVWAMw3iFeY7kKQSzl",
+      8: "price_1Sv2PQLVWAMw3iFeYiWPlDxM"
+    }
   },
+
   "full-body": {
-    single: { none: "price_1SvmuWLVWAMw3iFe6G7zVtgQ", fullface: "price_1SvmwjLVWAMw3iFenlsJHaWU" },
-    6: { none: "price_1SvmxsLVWAMw3iFe7DU1aRwk", fullface: "price_1Svn0ULVWAMw3iFebOifqGLa" },
-    8: { none: "price_1Svn24LVWAMw3iFep1e0Mpmb", fullface: "price_1Svn2qLVWAMw3iFew7lsbArO" },
+    single: {
+      none: "price_1SvmuWLVWAMw3iFe6G7zVtgQ",
+      fullface: "price_1SvmwjLVWAMw3iFenlsJHaWU"
+    },
+    6: {
+      none: "price_1SvmxsLVWAMw3iFe7DU1aRwk",
+      fullface: "price_1Svn0ULVWAMw3iFebOifqGLa"
+    },
+    8: {
+      none: "price_1Svn24LVWAMw3iFep1e0Mpmb",
+      fullface: "price_1Svn2qLVWAMw3iFew7lsbArO"
+    }
   },
+
   "ll-signature": {
     "single-none": "price_1StqevLVWAMw3iFer0kW5wBq",
     "single-led10": "price_1StqgqLVWAMw3iFe9k2tD5rT",
@@ -305,8 +332,9 @@ const priceMap = {
     "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
     "3-led10": "price_1StqioLVWAMw3iFeAm59s0Xt",
     "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
-    "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF",
+    "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF"
   },
+
   "classic-deluxe": {
     "single-none": "price_1SuEXILVWAMw3iFeEzZhwlVJ",
     "single-led10": "price_1SuEYELVWAMw3iFefiIqcGFR",
@@ -315,8 +343,9 @@ const priceMap = {
     "3-none": "price_1SuEbGLVWAMw3iFeeieTxip5",
     "3-led10": "price_1SuEc1LVWAMw3iFey3J96baH",
     "3-led20": "price_1SuEd6LVWAMw3iFebVOUfGLQ",
-    "3-peel": "price_1SuEdmLVWAMw3iFeJLmbA2Q0",
+    "3-peel": "price_1SuEdmLVWAMw3iFeJLmbA2Q0"
   },
+
   "ll-teen": {
     "single-none": "price_1SuEejLVWAMw3iFedQAwSrU6",
     "single-led10": "price_1SuEfLLVWAMw3iFermWmmr34",
@@ -325,21 +354,63 @@ const priceMap = {
     "3-none": "price_1SuEgsLVWAMw3iFeILBNpjT1",
     "3-led10": "price_1SuEhaLVWAMw3iFew6XXmiTM",
     "3-led20": "price_1SuEi5LVWAMw3iFewusx6G2v",
-    "3-peel": "price_1SuEiLLVWAMw3iFe8YD0gUZy",
+    "3-peel": "price_1SuEiLLVWAMw3iFe8YD0gUZy"
   },
+
   "med-spa": {
     microneedling: {
-      single: { none: "price_1SxA01LVWAMw3iFesKpaxZvz", exosomes: "price_1SxA0VLVWAMw3iFeDjB6cXS9", neck: "price_1SxA1bLVWAMw3iFeENwK7Pjo", "exo-neck": "price_1SxAu4LVWAMw3iFe0xzdQLj6" },
-      3: { none: "price_1SxA2lLVWAMw3iFeOfMnlep9", exosomes: "price_1SxA3LLVWAMw3iFeJWCBn4w9", neck: "price_1SxA4pLVWAMw3iFekvmzRRtg", "exo-neck": "price_1SxAvcLVWAMw3iFemyVhJy70" },
+      single: {
+        none: "price_1SxA01LVWAMw3iFesKpaxZvz",
+        exosomes: "price_1SxA0VLVWAMw3iFeDjB6cXS9",
+        neck: "price_1SxA1bLVWAMw3iFeENwK7Pjo",
+        "exo-neck": "price_1SxAu4LVWAMw3iFe0xzdQLj6"
+      },
+      3: {
+        none: "price_1SxA2lLVWAMw3iFeOfMnlep9",
+        exosomes: "price_1SxA3LLVWAMw3iFeJWCBn4w9",
+        neck: "price_1SxA4pLVWAMw3iFekvmzRRtg",
+        "exo-neck": "price_1SxAvcLVWAMw3iFemyVhJy70"
+      }
     },
+
     llumigold: {
-      single: { none: "price_1SxA5mLVWAMw3iFeifsFKOFW", exosomes: "price_1SxA6YLVWAMw3iFe3Rv6fPhS", neck: "price_1SxA7FLVWAMw3iFeBJydTb8W", "exo-neck": "price_1SxAwrLVWAMw3iFew3fsdrha" },
-      3: { none: "price_1SxA85LVWAMw3iFeG1JZ19Lu", exosomes: "price_1SxA8eLVWAMw3iFeGKRTsEEX", neck: "price_1SxA9LLVWAMw3iFeShWxtdjh", "exo-neck": "price_1SxAy7LVWAMw3iFeS4ctcll6" },
+      single: {
+        none: "price_1SxA5mLVWAMw3iFeifsFKOFW",
+        exosomes: "price_1SxA6YLVWAMw3iFe3Rv6fPhS",
+        neck: "price_1SxA7FLVWAMw3iFeBJydTb8W",
+        "exo-neck": "price_1SxAwrLVWAMw3iFew3fsdrha"
+      },
+      3: {
+        none: "price_1SxA85LVWAMw3iFeG1JZ19Lu",
+        exosomes: "price_1SxA8eLVWAMw3iFeGKRTsEEX",
+        neck: "price_1SxA9LLVWAMw3iFeShWxtdjh",
+        "exo-neck": "price_1SxAy7LVWAMw3iFeS4ctcll6"
+      }
     },
-    "laser-facial": { single: { none: "price_1SxABRLVWAMw3iFe7vYyqaVW" }, 3: { none: "price_1SxAEuLVWAMw3iFeNSwQFrR5" } },
-    "glow-up-laser-facial": { single: { none: "price_1SxAKsLVWAMw3iFeyKH4OSTl", decollete: "price_1SxASrLVWAMw3iFeieILAe3T", neck: "price_1SxATvLVWAMw3iFeu78Ak5Xr" }, 3: { none: "price_1SxAUjLVWAMw3iFeTVxGy05w", decollete: "price_1SxAVeLVWAMw3iFeXpnKTDlr", neck: "price_1SxAWsLVWAMw3iFesU5eyyWC" } },
-    peel: { single: { none: "price_1Syx4ULVWAMw3iFevqsTAPJj" }, 3: { none: "price_1Syx58LVWAMw3iFe2rmfw0VF" } },
-  },
+
+    "laser-facial": {
+      single: { none: "price_1SxABRLVWAMw3iFe7vYyqaVW" },
+      3: { none: "price_1SxAEuLVWAMw3iFeNSwQFrR5" }
+    },
+
+    "glow-up-laser-facial": {
+      single: {
+        none: "price_1SxAKsLVWAMw3iFeyKH4OSTl",
+        decollete: "price_1SxASrLVWAMw3iFeieILAe3T",
+        neck: "price_1SxATvLVWAMw3iFeu78Ak5Xr"
+      },
+      3: {
+        none: "price_1SxAUjLVWAMw3iFeTVxGy05w",
+        decollete: "price_1SxAVeLVWAMw3iFeXpnKTDlr",
+        neck: "price_1SxAWsLVWAMw3iFesU5eyyWC"
+      }
+    },
+
+    peel: {
+      single: { none: "price_1Syx4ULVWAMw3iFevqsTAPJj" },
+      3: { none: "price_1Syx58LVWAMw3iFe2rmfw0VF" }
+    }
+  }
 };
 
 const otherServicesPrices = {
@@ -347,90 +418,829 @@ const otherServicesPrices = {
   "powder-brows": "price_1SziATLVWAMw3iFeJ8O37uOa",
   "top-eyeliner": "price_1SziBLLVWAMw3iFefsG4hGYu",
   "lip-blush": "price_1SziBtLVWAMw3iFeOlogbBw5",
-  "combo-full-face": "price_1SziCULVWAMw3iFeKQ7lsdNk",
+  "combo-full-face": "price_1SziCULVWAMw3iFeKQ7lsdNk"
 };
 
-const morpheusAreas = {
-
-  // FACE
-  "face-neck-chest": "Face, Neck & Chest",
-  "face-neck": "Face & Neck",
-  "face": "Full Face",
-  "neck": "Neck",
-  "chest": "Chest",
-  "eyes": "Eyes",
-  "mouth": "Mouth",
-  "acne-scars": "Acne Scars",
-  "active-acne": "Active Acne",
-  "scars": "Scars",
-  "spot-treatment": "Spot Treatment",
-  "hands": "Hands",
-
-  // BODY
-  "upper-arms": "Upper Arms",
-  "abdomen": "Abdomen",
-  "back-acne": "Back Acne",
-  "thighs": "Thighs",
-  "inner-thighs": "Inner Thighs",
-  "outer-thighs": "Outer Thighs",
-  "knees": "Knees",
-  "cellulite": "Cellulite",
-  "stretchmark-one-area": "Stretchmark (One Area)",
-  "excess-sweating": "Excess Sweating"
-
+const packageLabels = {
+  single: "Single Session",
+  2: "3 Sessions",
+  3: "3 Sessions",
+  6: "6 Sessions",
+  8: "8 Sessions"
 };
-
-const packageLabels = { "single": "Single Session", "2": "3 Sessions", "3": "3 Sessions" };
 
 const addonLabels = {
-  "none": "No Additional", "led10": "Led (10 min)", "led20": "Led (20 min)",
-  "exosomes": "Exosomes", "salmon": "Salmon DNA PDRN",
-  "led10-exosomes": "Led (10 min) + Exosomes", "led20-exosomes": "Led (20 min) + Exosomes",
-  "led10-salmon": "Led (10 min) + Salmon DNA PDRN", "led20-salmon": "Led (20 min) + Salmon DNA PDRN"
+  none: "No Additional",
+  led10: "Led (10 min)",
+  led20: "Led (20 min)",
+  exosomes: "Exosomes",
+  salmon: "Salmon DNA PDRN",
+  "led10-exosomes": "Led (10 min) + Exosomes",
+  "led20-exosomes": "Led (20 min) + Exosomes",
+  "led10-salmon": "Led (10 min) + Salmon DNA PDRN",
+  "led20-salmon": "Led (20 min) + Salmon DNA PDRN"
 };
 
 const MORPHEUS_BASE_PRICES = {
-  morpheus: { face: 833, neck: 833, chest: 833, "face-neck": 1000, "face-neck-chest": 1050, eyes: 650, mouth: 650, "acne-scars": 800, "active-acne": 750, scars: 650, "spot-treatment": 350, hands: 450 },
-  body: { "back-acne": 1400, "stretchmark-one-area": 900, "upper-arms": 1000, knees: 1000, abdomen: 1500, "inner-thighs": 1250, "outer-thighs": 1250, thighs: 1499, cellulite: 1499, "excess-sweating": 900 },
-  lumecca: { face: 500, neck: 350, chest: 500, "face-neck": 800, "face-neck-chest": 950, eyes: 550, mouth: 550, "acne-scars": 700, "active-acne": 650, scars: 550, "spot-treatment": 250, hands: 350 }
+  morpheus: {
+    face: 833,
+    neck: 833,
+    chest: 833,
+    "face-neck": 1000,
+    "face-neck-chest": 1050,
+    eyes: 650,
+    mouth: 650,
+    "acne-scars": 800,
+    "active-acne": 750,
+    scars: 650,
+    "spot-treatment": 350,
+    hands: 450
+  },
+  body: {
+    "back-acne": 1400,
+    "stretchmark-one-area": 900,
+    "upper-arms": 1000,
+    knees: 1000,
+    abdomen: 1500,
+    "inner-thighs": 1250,
+    "outer-thighs": 1250,
+    thighs: 1499,
+    cellulite: 1499,
+    "excess-sweating": 900
+  },
+  lumecca: {
+    face: 500,
+    neck: 350,
+    chest: 500,
+    "face-neck": 800,
+    "face-neck-chest": 950,
+    eyes: 550,
+    mouth: 550,
+    "acne-scars": 700,
+    "active-acne": 650,
+    scars: 550,
+    "spot-treatment": 250,
+    hands: 350
+  }
 };
 
-const MORPHEUS_PACKAGE_DISCOUNT = { single: 0, "2": 0.05, "3": 0.10 };
-const MORPHEUS_ADDON_PRICES = { none: 0, led10: 30, led20: 50, exosomes: 100, salmon: 100, "led10-exosomes": 130, "led20-exosomes": 150, "led10-salmon": 130, "led20-salmon": 150 };
+const MORPHEUS_PACKAGE_DISCOUNT = {
+  single: 0,
+  2: 0.05,
+  3: 0.10
+};
+
+const MORPHEUS_ADDON_PRICES = {
+  none: 0,
+  led10: 30,
+  led20: 50,
+  exosomes: 100,
+  salmon: 100,
+  "led10-exosomes": 130,
+  "led20-exosomes": 150,
+  "led10-salmon": 130,
+  "led20-salmon": 150
+};
+
 const MORPHEUS_COMBO_DISCOUNT = 0.10;
 const MORPHEUS_CONSULTATION_FEE = 50;
 
+// ==============================
+// VAGARO CONFIG - FASE 1
+// ==============================
+
+const VAGARO_REGION = process.env.VAGARO_REGION || "us03";
+const VAGARO_SCOPE = process.env.VAGARO_SCOPE || "read_access";
+const VAGARO_BUSINESS_ID =
+  process.env.VAGARO_BUSINESS_ID || "u70rCIZg8Li86bNB7KxwcA==";
+const VAGARO_LUDIMILLA_PROVIDER_ID =
+  process.env.VAGARO_LUDIMILLA_PROVIDER_ID || "b777Fo236wdourBe-n4dMw==";
+const VAGARO_LISTING_URL =
+  process.env.VAGARO_LISTING_URL || "https://www.vagaro.com/llbrows/book-now";
+
+const VAGARO_BASE_URL = `https://api.vagaro.com/${VAGARO_REGION}`;
+
+let vagaroTokenCache = {
+  accessToken: null,
+  expiresAt: 0
+};
+
+function isVagaroConfigured() {
+  return Boolean(process.env.VAGARO_CLIENT_ID && process.env.VAGARO_CLIENT_SECRET);
+}
+
+async function getVagaroAccessToken() {
+  if (!isVagaroConfigured()) {
+    throw new Error("Vagaro credentials are missing in Render environment variables.");
+  }
+
+  const now = Date.now();
+
+  if (
+    vagaroTokenCache.accessToken &&
+    vagaroTokenCache.expiresAt &&
+    now < vagaroTokenCache.expiresAt - 60 * 1000
+  ) {
+    return vagaroTokenCache.accessToken;
+  }
+
+  const response = await fetch(
+    `${VAGARO_BASE_URL}/api/v2/merchants/generate-access-token`,
+    {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        clientId: process.env.VAGARO_CLIENT_ID,
+        clientSecretKey: process.env.VAGARO_CLIENT_SECRET,
+        scope: VAGARO_SCOPE
+      })
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || data?.status !== 200 || !data?.data?.access_token) {
+    console.error("Erro gerando token Vagaro:", data);
+    throw new Error(data?.message || "Could not generate Vagaro access token");
+  }
+
+  const expiresIn = Number(data.data.expires_in || 3600);
+
+  vagaroTokenCache = {
+    accessToken: data.data.access_token,
+    expiresAt: Date.now() + expiresIn * 1000
+  };
+
+  return vagaroTokenCache.accessToken;
+}
+
+async function vagaroRequest(path, options = {}) {
+  const accessToken = await getVagaroAccessToken();
+
+  const response = await fetch(`${VAGARO_BASE_URL}${path}`, {
+    method: options.method || "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      accessToken
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || data?.status >= 400) {
+    console.error("Erro Vagaro API:", {
+      path,
+      status: response.status,
+      data
+    });
+
+    const message =
+      data?.errors?.exception ||
+      data?.message ||
+      "Vagaro API request failed";
+
+    throw new Error(message);
+  }
+
+  return data;
+}
 
 // ==============================
-// LOGIC CALCULATORS
+// VAGARO SERVICE MAP
+// Only LLTouch.com services + Ludimilla
+// ==============================
+
+const VAGARO_ADD_ON_IDS = {
+  led10: "kNd7Ae-L39CQL-pKNNWudA==",
+  led20: "xjzjMUH2rz~9P8X7z6AZCA==",
+  exosomes: "aqCIVAQTOBHy~JUD~dJUnA==",
+  neck: "l6lQaQqf112TOf217gvVPg==",
+  decollete: "8NpulR54BaxrMhXSwGnmTg==",
+  "face-neck": "rQN1Iw400eiBYengNo9ovQ=="
+};
+
+const VAGARO_SERVICE_MAP = {
+  morpheus: {
+    serviceId: "86tRZDlMVXUbSNbbhqH9oA==",
+    title: "Morpheus 8 consultation",
+    category: "Morpheus8",
+    durationMinutes: 15
+  },
+
+  facial: {
+    "ll-signature": {
+      serviceId: "YfqHkdJ4xlbojEnNytwnDA==",
+      title: "LL Signature",
+      category: "Facial Treatments",
+      durationMinutes: 75
+    },
+    "classic-deluxe": {
+      serviceId: "RaQGIo6sI~kcqab7fPeozg==",
+      title: "LL Deluxe",
+      category: "Facial Treatments",
+      durationMinutes: 60
+    },
+    "ll-teen": {
+      serviceId: "jY3XyGXcn3uMoqZ1Yc~s8Q==",
+      title: "LL Teen Signature",
+      category: "Facial Treatments",
+      durationMinutes: 45
+    }
+  },
+
+  "med-spa": {
+    microneedling: {
+      serviceId: "7qDQIfdCmFEk~7nIlCDP5A==",
+      title: "Microneedling",
+      category: "Med Spa Treatments",
+      durationMinutes: 75
+    },
+    llumigold: {
+      serviceId: "glQz6wa2UA1twxLJuhudOA==",
+      title: "LLumiGold",
+      category: "Med Spa Treatments",
+      durationMinutes: 105
+    },
+    "laser-facial": {
+      serviceId: "6mrUniAXL6KN~JRD5zFTLQ==",
+      title: "Laser Facial",
+      category: "Med Spa Treatments",
+      durationMinutes: 15
+    },
+    "glow-up-laser-facial": {
+      serviceId: "cnfidEsQRZ5Sl3KX9yNlCg==",
+      title: "GlowUp Laser Facial (1 area)",
+      category: "Med Spa Treatments",
+      durationMinutes: 30
+    },
+    peel: {
+      serviceId: "qb6EszkAXfgBgP441~vl2g==",
+      title: "Brightening Glycolic Peel",
+      category: "Peel",
+      durationMinutes: 15
+    }
+  },
+
+  "other-service": {
+    nanoblading: {
+      serviceId: "DE4PS7phfzAsDoTmNFbcNA==",
+      title: "Realism Nanoblading",
+      category: "Permanent MakeUp",
+      durationMinutes: 150
+    },
+    "powder-brows": {
+      serviceId: "aUA~~QwAC0fjL5DruLTBhA==",
+      title: "Powder Brows",
+      category: "Permanent MakeUp",
+      durationMinutes: 150
+    },
+    "top-eyeliner": {
+      serviceId: "Tx5uO64oVVgm8OKC3S1BwQ==",
+      title: "Top Eyeliner",
+      category: "Permanent MakeUp",
+      durationMinutes: 75
+    },
+    "lip-blush": {
+      serviceId: "VgTvo53xawgNjmAK4fLssQ==",
+      title: "Lip Blush",
+      category: "Permanent MakeUp",
+      durationMinutes: 150
+    },
+    "combo-full-face": null
+  },
+
+  laser: {
+    defaultByArea: {
+      small: {
+        serviceId: "J-HUz0ryZvEYUA~nzCopmA==",
+        title: "Chin",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      medium: {
+        serviceId: "aeHet9LRV-14nm5GaUWsdg==",
+        title: "Under Arms",
+        category: "LHR-Medium Area",
+        durationMinutes: 15
+      },
+      large: {
+        serviceId: "38t6KJORzDvPC-c1Ph75ug==",
+        title: "Full Brazilian",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      xlarge: {
+        serviceId: "jVv9Y2entpIc6r9pP8MuTQ==",
+        title: "Full Back",
+        category: "LHR-XLarge Area",
+        durationMinutes: 25
+      }
+    },
+
+    byServiceName: {
+      chin: {
+        serviceId: "J-HUz0ryZvEYUA~nzCopmA==",
+        title: "Chin",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      ears: {
+        serviceId: "m6Kw27c~L1aV-SmB8sGnQA==",
+        title: "Ears",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      sideburns: {
+        serviceId: "m78JQB3Q~iE7T56xoMiIKw==",
+        title: "Sideburns",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      feet: {
+        serviceId: "yj8PygSeR-aOZ8k1UMz0Ig==",
+        title: "Feet",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      "men-bears": {
+        serviceId: "uGdseQrv64wCPJQLcVpHgQ==",
+        title: "Men Bears",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      "happy-trails": {
+        serviceId: "OFdtiDZLOAFc10yCcYMKhQ==",
+        title: "Happy Trails",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      areolas: {
+        serviceId: "W-1lIaIrXM6ppQ3OAbF2PQ==",
+        title: "Areolas",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      jawline: {
+        serviceId: "3x-7NdSEwDw68zH~rUXAhA==",
+        title: "Jawline",
+        category: "LHR-Small Area",
+        durationMinutes: 15
+      },
+      "bikini-line": {
+        serviceId: "Q1~u1T0FnFiYTlla~~8m7Q==",
+        title: "Bikini Line",
+        category: "LHR-Medium Area",
+        durationMinutes: 15
+      },
+      "under-arms": {
+        serviceId: "aeHet9LRV-14nm5GaUWsdg==",
+        title: "Under Arms",
+        category: "LHR-Medium Area",
+        durationMinutes: 15
+      },
+      shoulders: {
+        serviceId: "fzFWc-OKl5tWCNL7KAoniw==",
+        title: "Shoulders",
+        category: "LHR-Medium Area",
+        durationMinutes: 15
+      },
+      "neck-front": {
+        serviceId: "DuQHi0wt8Sicym0zTuI4wQ==",
+        title: "Neck-Front",
+        category: "LHR-Medium Area",
+        durationMinutes: 15
+      },
+      "neck-back": {
+        serviceId: "XhI3QEk8QU4rK8D6deuByg==",
+        title: "Neck-Back",
+        category: "LHR-Medium Area",
+        durationMinutes: 15
+      },
+      "arms-lower": {
+        serviceId: "gj2ZDmTIasi~eIDmnJcQtw==",
+        title: "Arms-Lower",
+        category: "LHR-Medium Area",
+        durationMinutes: 15
+      },
+      "arms-upper": {
+        serviceId: "oUtk5u4rGlP3~4DYDcpQgg==",
+        title: "Arms-Upper",
+        category: "LHR-Medium Area",
+        durationMinutes: 15
+      },
+      "full-brazilian": {
+        serviceId: "38t6KJORzDvPC-c1Ph75ug==",
+        title: "Full Brazilian",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      "full-face": {
+        serviceId: "10bcP6KOfgrIFq3b6DjwIQ==",
+        title: "Full Face",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      buttocks: {
+        serviceId: "s6HaxBtKSDBtFf7cKZfThg==",
+        title: "Buttocks",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      abdomen: {
+        serviceId: "uubgg1LFS4y11g5IzMqNjA==",
+        title: "Abdomen",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      chest: {
+        serviceId: "Sphi7d7TbguA9TM5hHjPaQ==",
+        title: "Chest",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      "back-half": {
+        serviceId: "di2NWM70ja9E8RBsS79AFw==",
+        title: "Back-Half",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      "back-lower": {
+        serviceId: "5VVQ0cDxI4RaZfJnc1u3mg==",
+        title: "Back-Lower",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      "legs-lower": {
+        serviceId: "mkq2R6sLFGZLt4mmkibvBg==",
+        title: "Legs-Lower",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      "legs-upper": {
+        serviceId: "W8kD7lwRwUwJ65DbU~mSzg==",
+        title: "Legs-Upper",
+        category: "LHR-Large Area",
+        durationMinutes: 15
+      },
+      "full-back": {
+        serviceId: "jVv9Y2entpIc6r9pP8MuTQ==",
+        title: "Full Back",
+        category: "LHR-XLarge Area",
+        durationMinutes: 25
+      },
+      "full-legs": {
+        serviceId: "JxUxYDhjxwO~7wWXhkt6zg==",
+        title: "Full Legs",
+        category: "LHR-XLarge Area",
+        durationMinutes: 25
+      },
+      "full-arms": {
+        serviceId: "ecn~58vkCBMIAoqG-pVDww==",
+        title: "Full Arms",
+        category: "LHR-XLarge Area",
+        durationMinutes: 25
+      },
+      "full-chest": {
+        serviceId: "KyG7G6EvsZnty08awgBUPg==",
+        title: "Full Chest",
+        category: "LHR-XLarge Area",
+        durationMinutes: 25
+      }
+    }
+  },
+
+  "full-body": {
+    serviceId: "81NqSI53~w4sKenWUsflzg==",
+    title: "Full Body - 6 areas",
+    category: "Payments",
+    durationMinutes: 15
+  }
+};
+
+function resolveVagaroAddOns(siteItem = {}) {
+  const addon = normalizeKey(siteItem.addon || siteItem.addonKey || "");
+
+  if (!addon || addon === "none") return [];
+
+  const addOns = [];
+
+  if (addon.includes("led10")) addOns.push(VAGARO_ADD_ON_IDS.led10);
+  if (addon.includes("led20")) addOns.push(VAGARO_ADD_ON_IDS.led20);
+  if (addon.includes("exosomes") || addon.includes("exo")) {
+    addOns.push(VAGARO_ADD_ON_IDS.exosomes);
+  }
+  if (addon === "neck") addOns.push(VAGARO_ADD_ON_IDS.neck);
+  if (addon === "decollete") addOns.push(VAGARO_ADD_ON_IDS.decollete);
+
+  return [...new Set(addOns.filter(Boolean))];
+}
+
+function resolveVagaroServiceFromSiteItem(siteItem = {}) {
+  const type = siteItem.type;
+
+  if (type === "morpheus") {
+    return {
+      ...VAGARO_SERVICE_MAP.morpheus,
+      addOnIds: []
+    };
+  }
+
+  if (type === "facial") {
+    const serviceKey = siteItem.service || siteItem.serviceKey;
+    const service = VAGARO_SERVICE_MAP.facial[serviceKey];
+
+    if (!service) return null;
+
+    return {
+      ...service,
+      addOnIds: resolveVagaroAddOns(siteItem)
+    };
+  }
+
+  if (type === "med-spa") {
+    const serviceKey = siteItem.service || siteItem.serviceKey;
+    const service = VAGARO_SERVICE_MAP["med-spa"][serviceKey];
+
+    if (!service) return null;
+
+    return {
+      ...service,
+      addOnIds: resolveVagaroAddOns(siteItem)
+    };
+  }
+
+  if (type === "other-service") {
+    const serviceKey = siteItem.serviceKey || siteItem.service;
+    const service = VAGARO_SERVICE_MAP["other-service"][serviceKey];
+
+    if (!service) return null;
+
+    return {
+      ...service,
+      addOnIds: []
+    };
+  }
+
+  if (type === "laser") {
+    const exactName =
+      siteItem.service ||
+      siteItem.serviceTitle ||
+      siteItem.title ||
+      siteItem.areaName ||
+      "";
+
+    const exactKey = normalizeKey(exactName);
+    const exact = VAGARO_SERVICE_MAP.laser.byServiceName[exactKey];
+
+    if (exact) {
+      return {
+        ...exact,
+        addOnIds: []
+      };
+    }
+
+    const area = normalizeKey(siteItem.area || siteItem.areaSize);
+    const fallback = VAGARO_SERVICE_MAP.laser.defaultByArea[area];
+
+    if (!fallback) return null;
+
+    return {
+      ...fallback,
+      addOnIds: []
+    };
+  }
+
+  if (type === "full-body") {
+    return {
+      ...VAGARO_SERVICE_MAP["full-body"],
+      addOnIds: []
+    };
+  }
+
+  return null;
+}
+
+// ==============================
+// PRICE ID → SITE ITEM MAP
+// ==============================
+
+const PRICE_ID_TO_SITE_ITEM = new Map();
+
+function addPriceMapping(priceId, siteItem) {
+  if (priceId) {
+    PRICE_ID_TO_SITE_ITEM.set(priceId, siteItem);
+  }
+}
+
+for (const [area, packages] of Object.entries(priceMap.laser)) {
+  for (const [pkg, priceId] of Object.entries(packages)) {
+    addPriceMapping(priceId, {
+      type: "laser",
+      area,
+      package: pkg
+    });
+  }
+}
+
+for (const [pkg, addons] of Object.entries(priceMap["full-body"])) {
+  for (const [addon, priceId] of Object.entries(addons)) {
+    addPriceMapping(priceId, {
+      type: "full-body",
+      package: pkg,
+      addon
+    });
+  }
+}
+
+for (const serviceKey of ["ll-signature", "classic-deluxe", "ll-teen"]) {
+  for (const [backendKey, priceId] of Object.entries(priceMap[serviceKey])) {
+    const parts = backendKey.split("-");
+    const packageKey = parts[0];
+    const addon = parts.slice(1).join("-") || "none";
+
+    addPriceMapping(priceId, {
+      type: "facial",
+      service: serviceKey,
+      key: backendKey,
+      package: packageKey,
+      addon
+    });
+  }
+}
+
+for (const [serviceKey, packages] of Object.entries(priceMap["med-spa"])) {
+  for (const [pkg, addons] of Object.entries(packages)) {
+    for (const [addon, priceId] of Object.entries(addons)) {
+      addPriceMapping(priceId, {
+        type: "med-spa",
+        service: serviceKey,
+        package: pkg,
+        addon
+      });
+    }
+  }
+}
+
+for (const [serviceKey, priceId] of Object.entries(otherServicesPrices)) {
+  addPriceMapping(priceId, {
+    type: "other-service",
+    serviceKey
+  });
+}
+
+for (const [plan, packages] of Object.entries(priceMap.membership)) {
+  for (const [pkg, priceId] of Object.entries(packages)) {
+    addPriceMapping(priceId, {
+      type: "membership",
+      plan,
+      package: pkg
+    });
+  }
+}
+
+function buildPrimarySiteItemMetadata(items = []) {
+  const first = items.find((item) => {
+    const vagaro = resolveVagaroServiceFromSiteItem(item);
+    return Boolean(vagaro);
+  });
+
+  if (!first) return "";
+
+  const compact = {
+    type: first.type,
+    service: first.service,
+    serviceKey: first.serviceKey,
+    area: first.area,
+    areaSize: first.areaSize,
+    package: first.package,
+    key: first.key,
+    addon: first.addon,
+    title: first.title
+  };
+
+  return JSON.stringify(compact).slice(0, 490);
+}
+
+function siteItemFromLineItem(lineItem) {
+  const priceId = lineItem.price?.id;
+  const mapped = PRICE_ID_TO_SITE_ITEM.get(priceId);
+
+  if (mapped) {
+    return { ...mapped };
+  }
+
+  const product = lineItem.price?.product || {};
+  const productName = String(product.name || "");
+
+  if (
+    normalizeKey(productName).includes("morpheus8-consultation") ||
+    normalizeKey(productName).includes("morpheus-8-consultation") ||
+    product.metadata?.source === "morpheus-landing-form"
+  ) {
+    return {
+      type: "morpheus"
+    };
+  }
+
+  return null;
+}
+
+function buildBookingOptionsFromSession(session) {
+  const options = [];
+  const seen = new Set();
+
+  const primaryFromMetadata = safeJsonParse(session.metadata?.primary_site_item, null);
+
+  if (primaryFromMetadata) {
+    const service = resolveVagaroServiceFromSiteItem(primaryFromMetadata);
+
+    if (service && !seen.has(service.serviceId)) {
+      seen.add(service.serviceId);
+      options.push({
+        index: options.length,
+        source: "session_metadata",
+        siteItem: primaryFromMetadata,
+        vagaroService: service,
+        professional: {
+          name: "Ludimilla Leite",
+          serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+        }
+      });
+    }
+  }
+
+  const lineItems = session.line_items?.data || [];
+
+  for (const lineItem of lineItems) {
+    const siteItem = siteItemFromLineItem(lineItem);
+    if (!siteItem) continue;
+
+    const service = resolveVagaroServiceFromSiteItem(siteItem);
+    if (!service || seen.has(service.serviceId)) continue;
+
+    seen.add(service.serviceId);
+
+    options.push({
+      index: options.length,
+      source: "line_item",
+      stripePriceId: lineItem.price?.id || null,
+      stripeProductName: lineItem.price?.product?.name || null,
+      siteItem,
+      vagaroService: service,
+      professional: {
+        name: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+      }
+    });
+  }
+
+  return options;
+}
+
+// ==============================
+// PRICE / CHECKOUT LOGIC
 // ==============================
 
 function resolvePriceId(item) {
   try {
-    if (item.type === "morpheus") return null; // Morpheus é calculado dinamicamente
+    if (item.type === "morpheus") return null;
     if (item.type === "membership") return priceMap.membership?.[item.plan]?.[item.package];
     if (item.type === "laser") return priceMap.laser?.[item.area]?.[item.package];
     if (item.type === "full-body") return priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
     if (item.type === "facial") return priceMap[item.service]?.[item.key];
     if (item.type === "med-spa") return priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon || "none"];
     if (item.type === "other-service") return otherServicesPrices?.[item.serviceKey];
+
     return null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 function getMorpheusPrice(item) {
   const { mode, area, packageKey, addon, combo } = item;
+
   if (!MORPHEUS_BASE_PRICES[mode]) throw new Error("Modo inválido");
+
   const basePriceSingle = MORPHEUS_BASE_PRICES[mode][area];
   if (!basePriceSingle) throw new Error("Área inválida");
+
   const sessions = packageKey === "single" ? 1 : parseInt(packageKey);
   if (!sessions || sessions < 1) throw new Error("Pacote inválido");
 
   let baseServicePrice;
+
   if (combo) {
     const morpheusPrice = MORPHEUS_BASE_PRICES.morpheus[area];
     const lumeccaPrice = MORPHEUS_BASE_PRICES.lumecca[area];
+
     if (!morpheusPrice || !lumeccaPrice) throw new Error("Combo inválido");
+
     baseServicePrice = (morpheusPrice + lumeccaPrice) * (1 - MORPHEUS_COMBO_DISCOUNT);
   } else {
     baseServicePrice = basePriceSingle;
@@ -442,25 +1252,27 @@ function getMorpheusPrice(item) {
 
   const addonBase = MORPHEUS_ADDON_PRICES[addon || "none"];
   if (addonBase === undefined) throw new Error("Addon inválido");
-  const totalAddon = addonBase * sessions;
 
+  const totalAddon = addonBase * sessions;
   const finalPrice = Math.round(totalService + totalAddon);
+
   if (finalPrice <= 0) throw new Error("Erro no cálculo");
+
   return finalPrice;
 }
 
 async function resolveDiscounts(customer, items) {
   const resolvedItems = items
-    .filter(item => item.type !== "morpheus")
-    .map(item => {
+    .filter((item) => item.type !== "morpheus")
+    .map((item) => {
       const priceId = resolvePriceId(item);
       if (!priceId) throw new Error("Produto inválido");
       return { priceId, quantity: item.quantity || 1 };
     });
 
   const laserIds = [
-    ...Object.values(priceMap.laser).flatMap(a => Object.values(a)),
-    ...Object.values(priceMap["full-body"]).flatMap(p => Object.values(p))
+    ...Object.values(priceMap.laser).flatMap((area) => Object.values(area)),
+    ...Object.values(priceMap["full-body"]).flatMap((pkg) => Object.values(pkg))
   ];
 
   const facialIds = [
@@ -473,36 +1285,51 @@ async function resolveDiscounts(customer, items) {
   const membershipPlatinumId = priceMap.membership.platinum["6"];
   const otherFullFaceId = otherServicesPrices["combo-full-face"];
 
-  let hasLaser = false, hasFacial = false, hasMicroneedling = false, hasMembershipPlatinum = false, hasOtherFullFace = false;
+  let hasFacial = false;
+  let hasMicroneedling = false;
+  let hasMembershipPlatinum = false;
+  let hasOtherFullFace = false;
   let currentFacialPurchase = 0;
 
   for (const item of resolvedItems) {
-    if (laserIds.includes(item.priceId)) hasLaser = true;
+    if (laserIds.includes(item.priceId)) {
+      // laser products are handled by cashback, not Stripe coupon here
+    }
+
     if (facialIds.includes(item.priceId)) hasFacial = true;
     if (item.priceId === microneedlingSingleId) hasMicroneedling = true;
     if (item.priceId === membershipPlatinumId) hasMembershipPlatinum = true;
     if (item.priceId === otherFullFaceId) hasOtherFullFace = true;
   }
 
-  // =======================
-  // Descontos especiais
-  // =======================
   if (customer.popup_unlocked && !customer.first_purchase_used) {
-    return { discounts: [{ coupon: "jmx11QWL" }], metadata: { discount_type: "first_purchase" } };
-  }
-  if (hasMicroneedling && !customer.microneedling_discount_used) {
-    return { discounts: [{ coupon: "U2VFw8Yj" }], metadata: { discount_type: "microneedling" } };
-  }
-  if (hasMembershipPlatinum) {
-    return { discounts: [{ coupon: "thCriSEx" }], metadata: { discount_type: "membership" } };
-  }
-  if (hasOtherFullFace) {
-    return { discounts: [{ coupon: "oLmALLlo" }], metadata: { discount_type: "other" } };
+    return {
+      discounts: [{ coupon: "jmx11QWL" }],
+      metadata: { discount_type: "first_purchase" }
+    };
   }
 
-  // =======================
-  // Descontos faciais
-  // =======================
+  if (hasMicroneedling && !customer.microneedling_discount_used) {
+    return {
+      discounts: [{ coupon: "U2VFw8Yj" }],
+      metadata: { discount_type: "microneedling" }
+    };
+  }
+
+  if (hasMembershipPlatinum) {
+    return {
+      discounts: [{ coupon: "thCriSEx" }],
+      metadata: { discount_type: "membership" }
+    };
+  }
+
+  if (hasOtherFullFace) {
+    return {
+      discounts: [{ coupon: "oLmALLlo" }],
+      metadata: { discount_type: "other" }
+    };
+  }
+
   if (hasFacial) {
     for (const item of resolvedItems) {
       if (facialIds.includes(item.priceId)) {
@@ -510,103 +1337,168 @@ async function resolveDiscounts(customer, items) {
         currentFacialPurchase += (stripePrice.unit_amount / 100) * item.quantity;
       }
     }
+
     let discountTier = 0;
+
     if (currentFacialPurchase >= 1500) discountTier = 10;
     else if (currentFacialPurchase >= 600) discountTier = 7;
     else if (currentFacialPurchase >= 300) discountTier = 5;
 
     if (discountTier > 0) {
-      const couponMap = { 10: "xu5jbAdc", 7: "vwkWvHPm", 5: "nzcBZv4q" };
-      return { discounts: [{ coupon: couponMap[discountTier] }], metadata: { discount_type: "facial" } };
+      const couponMap = {
+        10: "xu5jbAdc",
+        7: "vwkWvHPm",
+        5: "nzcBZv4q"
+      };
+
+      return {
+        discounts: [{ coupon: couponMap[discountTier] }],
+        metadata: { discount_type: "facial" }
+      };
     }
   }
 
-  // =======================
-  // Cashback
-  // =======================
   if (customer.cashback_balance > 0) {
+    let currentCartTotal = 0;
 
-  let currentCartTotal = 0;
+    for (const item of items) {
+      if (item.type === "morpheus") {
+        currentCartTotal += MORPHEUS_CONSULTATION_FEE * (item.quantity || 1);
+        continue;
+      }
 
-  for (const item of items) {
+      const priceId = resolvePriceId(item);
+      const stripePrice = await stripe.prices.retrieve(priceId);
 
-    if (item.type === "morpheus") {
-      const price = getMorpheusPrice(item);
-      currentCartTotal += price * (item.quantity || 1);
-      continue;
+      currentCartTotal += (stripePrice.unit_amount / 100) * (item.quantity || 1);
     }
 
-    const priceId = resolvePriceId(item);
-    const stripePrice = await stripe.prices.retrieve(priceId);
+    const maxAllowedDiscount = currentCartTotal * 0.5;
 
-    currentCartTotal += (stripePrice.unit_amount / 100) * (item.quantity || 1);
+    const finalCashbackAmount = Math.min(
+      Number(customer.cashback_balance || 0),
+      maxAllowedDiscount
+    );
+
+    if (finalCashbackAmount > 0) {
+      const coupon = await stripe.coupons.create({
+        amount_off: Math.round(finalCashbackAmount * 100),
+        currency: "usd",
+        duration: "once",
+        name: "Cashback Used (Max 50%)"
+      });
+
+      return {
+        discounts: [{ coupon: coupon.id }],
+        metadata: {
+          discount_type: "cashback_used",
+          cashback_used_amount: finalCashbackAmount
+        }
+      };
+    }
   }
 
-  const maxAllowedDiscount = currentCartTotal * 0.5;
+  return { discounts: [], metadata: {} };
+}
 
-  const finalCashbackAmount = Math.min(
-    customer.cashback_balance,
-    maxAllowedDiscount
-  );
+// ==============================
+// VAGARO HELPERS
+// ==============================
 
-  if (finalCashbackAmount > 0) {
+async function getStripeSessionExpanded(sessionId) {
+  return stripe.checkout.sessions.retrieve(sessionId, {
+    expand: ["line_items.data.price.product"]
+  });
+}
 
-    const coupon = await stripe.coupons.create({
-      amount_off: Math.round(finalCashbackAmount * 100),
-      currency: "usd",
-      duration: "once",
-      name: `Cashback Used (Max 50%)`
-    });
-
-    return {
-      discounts: [{ coupon: coupon.id }],
-      metadata: {
-        discount_type: "cashback_used",
-        cashback_used_amount: finalCashbackAmount
+async function searchVagaroAvailability({ date, serviceId, addOnIds = [] }) {
+  const body = {
+    businessId: VAGARO_BUSINESS_ID,
+    appointmentDate: date,
+    bookingItems: [
+      {
+        serviceId,
+        addOnIds: Array.isArray(addOnIds) ? addOnIds : [],
+        serviceProviderIds: [VAGARO_LUDIMILLA_PROVIDER_ID]
       }
-    };
+    ]
+  };
 
-  }
-}
-    return { discounts: [], metadata: {} };
+  const data = await vagaroRequest("/api/v2/appointments/availability", {
+    method: "POST",
+    body
+  });
 
+  const availability = Array.isArray(data?.data) ? data.data : [];
+
+  const normalized = availability.map((day) => ({
+    vagaroUrl: day.vagaroUrl || "llbrows",
+    appointmentDate: day.appointmentDate,
+    items: day.items || [],
+    timeSlot: Array.isArray(day.timeSlot) ? day.timeSlot : []
+  }));
+
+  return {
+    status: data.status,
+    responseCode: data.responseCode,
+    message: data.message,
+    data: normalized
+  };
 }
+
+// ==============================
+// ROUTES - CUSTOMER / CASHBACK / SESSION
+// ==============================
+
 app.post("/cashback-preview", (req, res) => {
   try {
     const { cart } = req.body;
-    if (!cart || !Array.isArray(cart)) return res.json({ cashback: 0, rate: 0, tier: "Bronze" });
 
-    // Filtra apenas itens das páginas de Laser para o cálculo de acúmulo
+    if (!cart || !Array.isArray(cart)) {
+      return res.json({
+        cashback: 0,
+        rate: 0,
+        tier: "Bronze"
+      });
+    }
+
     const laserSubtotal = cart.reduce((acc, item) => {
-      if (item.mode === 'laser' || item.mode === 'full-body') {
+      if (item.mode === "laser" || item.mode === "full-body") {
         const qty = item.quantity || 1;
-        return acc + (item.price * qty);
+        return acc + item.price * qty;
       }
+
       return acc;
     }, 0);
 
-    // Define a porcentagem baseada no gasto da COMPRA ATUAL (Preview)
     let rate = 0;
     let tier = "Bronze";
 
-    if (laserSubtotal >= 3000) { rate = 0.10; tier = "Gold"; }
-    else if (laserSubtotal >= 1500) { rate = 0.07; tier = "Silver"; }
-    else if (laserSubtotal >= 500) { rate = 0.05; tier = "Bronze"; }
+    if (laserSubtotal >= 3000) {
+      rate = 0.10;
+      tier = "Gold";
+    } else if (laserSubtotal >= 1500) {
+      rate = 0.07;
+      tier = "Silver";
+    } else if (laserSubtotal >= 500) {
+      rate = 0.05;
+      tier = "Bronze";
+    }
 
-    res.json({ 
-      cashback: Number((laserSubtotal * rate).toFixed(2)), 
-      rate: rate,
-      tier: tier,
-      laserSubtotal: laserSubtotal
+    res.json({
+      cashback: Number((laserSubtotal * rate).toFixed(2)),
+      rate,
+      tier,
+      laserSubtotal
     });
   } catch (err) {
+    console.error("Erro /cashback-preview:", err);
     res.status(500).json({ error: "Erro no cálculo de preview" });
   }
-  });
+});
 
-  app.get("/customer", async (req, res) => {
+app.get("/customer", async (req, res) => {
   try {
-
     const email = req.query.email;
 
     if (!isValidEmail(email)) {
@@ -635,7 +1527,6 @@ app.post("/cashback-preview", (req, res) => {
     }
 
     res.json(customer);
-
   } catch (err) {
     console.error("Erro /customer:", err);
     res.status(500).json({ error: "Erro interno" });
@@ -644,44 +1535,93 @@ app.post("/cashback-preview", (req, res) => {
 
 app.get("/checkout-session/:id", async (req, res) => {
   try {
+    const session = await getStripeSessionExpanded(req.params.id);
 
-    const session = await stripe.checkout.sessions.retrieve(
-      req.params.id,
-      { expand: ["line_items.data.price.product"] }
-    );
+    const items = session.line_items.data.map((item, index) => {
+      const product = item.price.product;
+      const siteItem = siteItemFromLineItem(item);
+      const vagaroService = siteItem ? resolveVagaroServiceFromSiteItem(siteItem) : null;
 
-    const items = session.line_items.data.map(item => ({
-      name: item.price.product.name,
-      amount: (item.price.unit_amount / 100) * item.quantity
+      return {
+        index,
+        name: product.name,
+        description: product.description || "",
+        amount: item.amount_total / 100,
+        unit_amount: item.price.unit_amount ? item.price.unit_amount / 100 : null,
+        quantity: item.quantity || 1,
+        currency: item.currency,
+        price_id: item.price.id || null,
+        product_id: product.id || null,
+        product_metadata: product.metadata || {},
+        site_item: siteItem,
+        vagaro_service: vagaroService
+          ? {
+              serviceId: vagaroService.serviceId,
+              title: vagaroService.title,
+              category: vagaroService.category,
+              durationMinutes: vagaroService.durationMinutes
+            }
+          : null
+      };
+    });
+
+    const bookingOptions = buildBookingOptionsFromSession(session).map((option) => ({
+      index: option.index,
+      source: option.source,
+      siteItem: option.siteItem,
+      serviceId: option.vagaroService.serviceId,
+      serviceTitle: option.vagaroService.title,
+      category: option.vagaroService.category,
+      durationMinutes: option.vagaroService.durationMinutes,
+      professional: option.professional,
+      fallbackUrl: VAGARO_LISTING_URL
     }));
 
     res.json({
       id: session.id,
       email: session.customer_details?.email,
+      payment_status: session.payment_status,
       total: session.amount_total / 100,
-      items
+      subtotal: session.amount_subtotal ? session.amount_subtotal / 100 : null,
+      currency: session.currency,
+      metadata: session.metadata || {},
+      items,
+      booking_options: bookingOptions,
+      fallback_booking_url: VAGARO_LISTING_URL
     });
-
   } catch (err) {
     console.error("Erro buscando sessão:", err);
     res.status(500).json({ error: "Erro ao buscar sessão" });
   }
 });
+
 // ==============================
-// ROUTES
+// ROUTES - CHECKOUT
 // ==============================
 
 app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
   try {
     const { email, items } = req.body;
 
-    if (!isValidEmail(email)) return res.status(400).json({ error: "Invalid email" });
-    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "Invalid cart items" });
-    if (items.length > MAX_CART_ITEMS) return res.status(400).json({ error: "Too many items in cart" });
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email" });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Invalid cart items" });
+    }
+
+    if (items.length > MAX_CART_ITEMS) {
+      return res.status(400).json({ error: "Too many items in cart" });
+    }
 
     for (const item of items) {
-      if (!VALID_TYPES.includes(item.type)) return res.status(400).json({ error: "Invalid product type" });
+      if (!VALID_TYPES.includes(item.type)) {
+        return res.status(400).json({ error: "Invalid product type" });
+      }
+
       const quantity = Number(item.quantity || item.qty) || 1;
+
       if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_ITEM_QUANTITY) {
         return res.status(400).json({ error: "Invalid quantity" });
       }
@@ -691,87 +1631,86 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
     const line_items = items.map((item) => {
       if (item.type === "morpheus") {
+        const consultationFee = MORPHEUS_CONSULTATION_FEE;
+        const services = item.services || {};
 
-  const consultationFee = MORPHEUS_CONSULTATION_FEE;
+        let servicesText = "";
 
-  const services = item.services || {};
-
-  let servicesText = "";
-
-  if (services.morpheus && services.morpheus.length) {
-    servicesText += `Morpheus8: ${services.morpheus.join(", ")}. `;
-  }
-
-  if (services.body && services.body.length) {
-    servicesText += `Morpheus8 Body: ${services.body.join(", ")}. `;
-  }
-
-  if (services.lumecca && services.lumecca.length) {
-    servicesText += `Lumecca (IPL): ${services.lumecca.join(", ")}. `;
-  }
-
-  const displayName = "Morpheus8 Consultation";
-
-  return {
-    price_data: {
-      currency: "usd",
-
-      product_data: {
-
-        name: displayName,
-
-        description: `${servicesText}$50 Reservation Fee – Applied toward treatment`,
-
-        images: [
-          "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
-        ],
-
-        metadata: {
-          morpheus: services.morpheus?.join(", ") || "",
-          body: services.body?.join(", ") || "",
-          lumecca: services.lumecca?.join(", ") || ""
+        if (services.morpheus && services.morpheus.length) {
+          servicesText += `Morpheus8: ${services.morpheus.join(", ")}. `;
         }
 
-      },
+        if (services.body && services.body.length) {
+          servicesText += `Morpheus8 Body: ${services.body.join(", ")}. `;
+        }
 
-      unit_amount: consultationFee * 100
-    },
+        if (services.lumecca && services.lumecca.length) {
+          servicesText += `Lumecca (IPL): ${services.lumecca.join(", ")}. `;
+        }
 
-    quantity: 1
-  };
-}
+        return {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: "Morpheus8 Consultation",
+              description: `${servicesText}$50 Reservation Fee – Applied toward treatment`,
+              images: [
+                "https://cdn.prod.website-files.com/65de549be003197a7c137f6b/699f468b700aaf1a46a3263e_WhatsApp%20Image%202026-02-25%20at%2015.58.50.jpeg"
+              ],
+              metadata: {
+                source: "lltouch-site",
+                mode: "morpheus",
+                morpheus: services.morpheus?.join(", ") || "",
+                body: services.body?.join(", ") || "",
+                lumecca: services.lumecca?.join(", ") || ""
+              }
+            },
+            unit_amount: consultationFee * 100
+          },
+          quantity: 1
+        };
+      }
 
       const priceId = resolvePriceId(item);
-      if (!priceId) throw new Error("Produto inválido");
-      return { price: priceId, quantity: item.quantity || 1 };
+
+      if (!priceId) {
+        throw new Error("Produto inválido");
+      }
+
+      return {
+        price: priceId,
+        quantity: item.quantity || 1
+      };
     });
 
     const { discounts, metadata } = await resolveDiscounts(customer, items);
     const hasAutoDiscount = discounts && discounts.length > 0;
-    const onlyMorpheus = items.every(item => item.type === "morpheus");
-
+    const onlyMorpheus = items.every((item) => item.type === "morpheus");
     const cashbackUsedAmount = metadata?.cashback_used_amount || 0;
 
-const session = await stripe.checkout.sessions.create({
-  mode: "payment",
-  customer_email: email,
-  line_items,
+    const primarySiteItem = buildPrimarySiteItemMetadata(items);
 
-  ...(hasAutoDiscount
-    ? { discounts }
-    : onlyMorpheus
-    ? { allow_promotion_codes: true }
-    : {}),
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: email,
+      line_items,
 
-  metadata: {
-  customer_email: email,
-  cart_items_count: items.length,
-  cashback_used_amount: cashbackUsedAmount,
-  ...metadata
-},
+      ...(hasAutoDiscount
+        ? { discounts }
+        : onlyMorpheus
+        ? { allow_promotion_codes: true }
+        : {}),
+
+      metadata: {
+        customer_email: email,
+        cart_items_count: String(items.length),
+        cashback_used_amount: String(cashbackUsedAmount),
+        primary_site_item: primarySiteItem,
+        ...metadata
+      },
 
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: "https://lltouch.com/cancel",
+      cancel_url: "https://lltouch.com/cancel"
     });
 
     res.json({ url: session.url });
@@ -780,11 +1719,6 @@ const session = await stripe.checkout.sessions.create({
     res.status(500).json({ error: "Erro ao criar sessão" });
   }
 });
-
-
-function cleanLeadField(value, max = 300) {
-  return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
-}
 
 app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) => {
   try {
@@ -796,7 +1730,10 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
     const sourcePage = cleanLeadField(req.body.sourcePage, 180);
 
     const areasOfConcern = Array.isArray(req.body.areasOfConcern)
-      ? req.body.areasOfConcern.map((item) => cleanLeadField(item, 60)).filter(Boolean).join(", ")
+      ? req.body.areasOfConcern
+          .map((item) => cleanLeadField(item, 60))
+          .filter(Boolean)
+          .join(", ")
       : cleanLeadField(req.body.areasOfConcern, 300);
 
     if (!isValidEmail(email)) {
@@ -832,11 +1769,12 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
               ],
               metadata: {
                 source: "morpheus-landing-form",
+                mode: "morpheus",
                 full_name: fullName,
                 phone_number: phoneNumber,
                 preferred_contact: preferredContact,
                 areas_of_concern: areasOfConcern,
-                goals: goals
+                goals
               }
             },
             unit_amount: MORPHEUS_CONSULTATION_FEE * 100
@@ -852,7 +1790,8 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
         phone_number: phoneNumber,
         preferred_contact: preferredContact,
         areas_of_concern: areasOfConcern,
-        goals: goals
+        goals,
+        primary_site_item: JSON.stringify({ type: "morpheus" })
       },
       success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel"
@@ -865,12 +1804,174 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
   }
 });
 
+// ==============================
+// ROUTES - VAGARO FASE 1
+// ==============================
+
+app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
+  try {
+    const sessionId = cleanLeadField(req.body.session_id, 120);
+    const date = formatDateOnly(req.body.date);
+    const selectedIndex = Number.isInteger(Number(req.body.item_index))
+      ? Number(req.body.item_index)
+      : 0;
+
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing session_id" });
+    }
+
+    if (!date) {
+      return res.status(400).json({
+        error: "Invalid date. Use YYYY-MM-DD."
+      });
+    }
+
+    const session = await getStripeSessionExpanded(sessionId);
+
+    if (session.payment_status !== "paid") {
+      return res.status(403).json({
+        error: "Payment is not confirmed yet."
+      });
+    }
+
+    const bookingOptions = buildBookingOptionsFromSession(session);
+
+    if (!bookingOptions.length) {
+      return res.status(400).json({
+        error: "No supported LLTouch booking service found for this order.",
+        fallbackUrl: VAGARO_LISTING_URL
+      });
+    }
+
+    const selected = bookingOptions[selectedIndex] || bookingOptions[0];
+
+    const availability = await searchVagaroAvailability({
+      date,
+      serviceId: selected.vagaroService.serviceId,
+      addOnIds: selected.vagaroService.addOnIds || []
+    });
+
+    const slots = availability.data.flatMap((day) =>
+      (day.timeSlot || []).map((time) => ({
+        date: day.appointmentDate,
+        time,
+        professional: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
+        serviceId: selected.vagaroService.serviceId,
+        serviceTitle: selected.vagaroService.title
+      }))
+    );
+
+    res.json({
+      status: 200,
+      message: "Success",
+      session_id: session.id,
+      date,
+      service: {
+        serviceId: selected.vagaroService.serviceId,
+        title: selected.vagaroService.title,
+        category: selected.vagaroService.category,
+        durationMinutes: selected.vagaroService.durationMinutes,
+        addOnIds: selected.vagaroService.addOnIds || []
+      },
+      professional: {
+        name: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+      },
+      slots,
+      rawAvailability: availability.data,
+      fallbackUrl: VAGARO_LISTING_URL,
+      note:
+        "Vagaro API returned availability. Final appointment confirmation must happen through Vagaro because Create Appointment is not available in this API access level."
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/availability:", err);
+
+    res.status(500).json({
+      error: "Could not load Vagaro availability",
+      details: err.message,
+      fallbackUrl: VAGARO_LISTING_URL
+    });
+  }
+});
+
+app.get("/vagaro/booking-options/:sessionId", async (req, res) => {
+  try {
+    const session = await getStripeSessionExpanded(req.params.sessionId);
+
+    const bookingOptions = buildBookingOptionsFromSession(session).map((option) => ({
+      index: option.index,
+      source: option.source,
+      siteItem: option.siteItem,
+      serviceId: option.vagaroService.serviceId,
+      serviceTitle: option.vagaroService.title,
+      category: option.vagaroService.category,
+      durationMinutes: option.vagaroService.durationMinutes,
+      professional: option.professional,
+      fallbackUrl: VAGARO_LISTING_URL
+    }));
+
+    res.json({
+      status: 200,
+      session_id: session.id,
+      payment_status: session.payment_status,
+      booking_options: bookingOptions,
+      fallbackUrl: VAGARO_LISTING_URL
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/booking-options:", err);
+    res.status(500).json({
+      error: "Could not load booking options",
+      details: err.message
+    });
+  }
+});
+
+app.post("/vagaro/webhook", async (req, res) => {
+  try {
+    const configuredToken = process.env.VAGARO_WEBHOOK_TOKEN;
+
+    if (configuredToken) {
+      const receivedToken =
+        req.headers["x-vagaro-token"] ||
+        req.headers["x-vagaro-webhook-token"] ||
+        req.headers["verification-token"] ||
+        String(req.headers.authorization || "").replace(/^Bearer\s+/i, "") ||
+        req.query.token;
+
+      if (receivedToken !== configuredToken) {
+        return res.status(401).json({ error: "Invalid Vagaro webhook token" });
+      }
+    }
+
+    console.log("Vagaro webhook recebido:", JSON.stringify(req.body).slice(0, 2000));
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error("Erro /vagaro/webhook:", err);
+    res.status(500).json({ error: "Webhook error" });
+  }
+});
+
+// ==============================
+// ROUTES - POPUP
+// ==============================
+
 app.post("/unlock-popup", async (req, res) => {
   const { email } = req.body;
-  if (!email || !email.includes("@")) return res.status(400).json({ error: "Email inválido" });
+
+  if (!email || !email.includes("@")) {
+    return res.status(400).json({ error: "Email inválido" });
+  }
+
   try {
     await getOrCreateCustomer(email);
-    await supabase.from("customers").update({ popup_unlocked: true }).eq("email", email);
+
+    await supabase
+      .from("customers")
+      .update({ popup_unlocked: true })
+      .eq("email", email);
+
     res.json({ success: true });
   } catch (err) {
     console.error("Erro unlock-popup:", err);
@@ -878,10 +1979,35 @@ app.post("/unlock-popup", async (req, res) => {
   }
 });
 
-app.get("/", (_, res) => res.send("Stripe API running 🚀"));
+// ==============================
+// HEALTH ROUTES
+// ==============================
+
+app.get("/", (_, res) => {
+  res.send("Stripe + Vagaro API running 🚀");
+});
+
+app.get("/health", (_, res) => {
+  res.json({
+    ok: true,
+    stripe: Boolean(process.env.STRIPE_SECRET_KEY),
+    supabase: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY),
+    vagaro: {
+      configured: isVagaroConfigured(),
+      region: VAGARO_REGION,
+      scope: VAGARO_SCOPE,
+      businessId: VAGARO_BUSINESS_ID,
+      professional: "Ludimilla Leite"
+    }
+  });
+});
 
 // ==============================
 // SERVER START
 // ==============================
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port", PORT));
+
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
