@@ -115,7 +115,8 @@ app.use(cors({
     "https://lltouch.com",
     "https://www.lltouch.com",
     "https://llbrows.com",
-    "https://www.llbrows.com"
+    "https://www.llbrows.com",
+    "https://ludimillas.webflow.io"
   ]
 }));
 
@@ -148,6 +149,17 @@ app.post(
           event.data.object.id,
           { expand: ["line_items.data.price.product"] }
         );
+
+        const checkoutBrand = String(session.metadata?.brand || "").toLowerCase();
+
+        // LL Brows payments share the same Stripe account/webhook, but they must
+        // not enter LL Touch cashback, laser totals or first-purchase logic.
+        if (checkoutBrand === "ll_brows") {
+          console.log(
+            `LL Brows payment confirmed: ${session.id} | ${session.customer_details?.email || "no email"}`
+          );
+          return res.json({ received: true });
+        }
 
         const email = session.customer_details?.email;
         if (!email) return res.json({ received: true });
@@ -420,6 +432,98 @@ const otherServicesPrices = {
   "lip-blush": "price_1SziBtLVWAMw3iFeOlogbBw5",
   "combo-full-face": "price_1SziCULVWAMw3iFeKQ7lsdNk"
 };
+
+// ==============================
+// LL BROWS CHECKOUT CATALOG
+// Prices are defined only on the backend. The Webflow page sends serviceKey,
+// never a trusted monetary amount.
+//
+// Optional: set the listed environment variable to a permanent Stripe Price ID.
+// When it is absent, Checkout uses the secure unitAmount below via price_data.
+// ==============================
+
+const LLB_SERVICES = Object.freeze({
+  llb_nanoblading_powder_brows: {
+    name: "Nanoblading / Powder Brows",
+    description: "Signature permanent brow service",
+    unitAmount: 80000,
+    priceEnv: "STRIPE_PRICE_LLB_NANOBLADING_POWDER_BROWS"
+  },
+  llb_lip_blushing: {
+    name: "Lip Blushing",
+    description: "Customized soft lip color and definition",
+    unitAmount: 85000,
+    priceEnv: "STRIPE_PRICE_LLB_LIP_BLUSHING"
+  },
+  llb_top_eyeliner: {
+    name: "Top Eyeliner",
+    description: "Refined upper-lash definition",
+    unitAmount: 45000,
+    priceEnv: "STRIPE_PRICE_LLB_TOP_EYELINER"
+  },
+  llb_brow_waxing: {
+    name: "Brow Waxing",
+    description: "Precision brow shaping",
+    unitAmount: 3000,
+    priceEnv: "STRIPE_PRICE_LLB_BROW_WAXING"
+  },
+  llb_brow_waxing_tinting: {
+    name: "Brow Waxing & Tinting",
+    description: "Brow shaping with customized tint",
+    unitAmount: 6000,
+    priceEnv: "STRIPE_PRICE_LLB_BROW_WAXING_TINTING"
+  },
+  llb_perfecting_touch_up: {
+    name: "Perfecting Touch-Up",
+    description: "Qualifying touch-up scheduled 3–6 months after the original service",
+    unitAmount: 30000,
+    priceEnv: "STRIPE_PRICE_LLB_PERFECTING_TOUCH_UP"
+  },
+  llb_annual_touch_up: {
+    name: "Annual Touch-Up",
+    description: "Annual maintenance for qualifying returning clients",
+    unitAmount: 40000,
+    priceEnv: "STRIPE_PRICE_LLB_ANNUAL_TOUCH_UP"
+  }
+});
+
+function getLLBrowsCheckoutUrl(envName) {
+  const value = String(process.env[envName] || "").trim();
+
+  if (!value || !value.startsWith("https://")) {
+    throw new Error(`${envName} must be configured with an HTTPS URL.`);
+  }
+
+  return value;
+}
+
+function createLLBrowsLineItem(serviceKey, service, quantity) {
+  const configuredPriceId = String(process.env[service.priceEnv] || "").trim();
+
+  if (configuredPriceId) {
+    return {
+      price: configuredPriceId,
+      quantity
+    };
+  }
+
+  return {
+    quantity,
+    price_data: {
+      currency: "usd",
+      unit_amount: service.unitAmount,
+      product_data: {
+        name: service.name,
+        description: service.description,
+        metadata: {
+          brand: "ll_brows",
+          source: "ll_brows_webflow",
+          service_key: serviceKey
+        }
+      }
+    }
+  };
+}
 
 const packageLabels = {
   single: "Single Session",
@@ -1599,6 +1703,94 @@ app.get("/checkout-session/:id", async (req, res) => {
 // ROUTES - CHECKOUT
 // ==============================
 
+app.post("/llb/create-checkout-session", checkoutLimiter, async (req, res) => {
+  try {
+    const email = cleanLeadField(req.body?.email, 254).toLowerCase();
+    const items = req.body?.items;
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Enter a valid checkout email." });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Your service bag is empty." });
+    }
+
+    if (items.length > 10) {
+      return res.status(400).json({ error: "Too many services in the bag." });
+    }
+
+    const seen = new Set();
+    const normalizedItems = [];
+
+    for (const item of items) {
+      const serviceKey = cleanLeadField(item?.serviceKey, 100);
+      const service = LLB_SERVICES[serviceKey];
+      const quantity = Number(item?.quantity || item?.qty || 1);
+
+      if (!service) {
+        return res.status(400).json({
+          error: `This LL Brows service cannot be purchased online: ${serviceKey || "unknown"}.`
+        });
+      }
+
+      if (seen.has(serviceKey)) {
+        return res.status(400).json({
+          error: `The service ${service.name} appears more than once.`
+        });
+      }
+
+      // Appointment services should be purchased once per checkout.
+      if (!Number.isInteger(quantity) || quantity !== 1) {
+        return res.status(400).json({
+          error: `Invalid quantity for ${service.name}.`
+        });
+      }
+
+      seen.add(serviceKey);
+      normalizedItems.push({ serviceKey, service, quantity });
+    }
+
+    const successUrl = getLLBrowsCheckoutUrl("LLB_CHECKOUT_SUCCESS_URL");
+    const cancelUrl = getLLBrowsCheckoutUrl("LLB_CHECKOUT_CANCEL_URL");
+    const serviceKeys = normalizedItems.map((item) => item.serviceKey).join(",");
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: email,
+      line_items: normalizedItems.map(({ serviceKey, service, quantity }) =>
+        createLLBrowsLineItem(serviceKey, service, quantity)
+      ),
+      billing_address_collection: "auto",
+      phone_number_collection: { enabled: true },
+      metadata: {
+        brand: "ll_brows",
+        source: "ll_brows_webflow",
+        service_keys: serviceKeys.slice(0, 500)
+      },
+      payment_intent_data: {
+        metadata: {
+          brand: "ll_brows",
+          source: "ll_brows_webflow",
+          service_keys: serviceKeys.slice(0, 500)
+        }
+      },
+      success_url: successUrl,
+      cancel_url: cancelUrl
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error("Erro LL Brows checkout:", error);
+
+    const publicMessage = String(error?.message || "").includes("must be configured")
+      ? "LL Brows checkout URLs are not configured on the server."
+      : "Unable to create the LL Brows checkout session.";
+
+    res.status(500).json({ error: publicMessage });
+  }
+});
+
 app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
   try {
     const { email, items } = req.body;
@@ -1984,13 +2176,18 @@ app.post("/unlock-popup", async (req, res) => {
 // ==============================
 
 app.get("/", (_, res) => {
-  res.send("Stripe + Vagaro API running 🚀");
+  res.send("LL Touch + LL Brows Stripe/Vagaro API running 🚀");
 });
 
 app.get("/health", (_, res) => {
   res.json({
     ok: true,
     stripe: Boolean(process.env.STRIPE_SECRET_KEY),
+    llBrows: {
+      checkoutRoute: "/llb/create-checkout-session",
+      successUrlConfigured: Boolean(process.env.LLB_CHECKOUT_SUCCESS_URL),
+      cancelUrlConfigured: Boolean(process.env.LLB_CHECKOUT_CANCEL_URL)
+    },
     supabase: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY),
     vagaro: {
       configured: isVagaroConfigured(),
