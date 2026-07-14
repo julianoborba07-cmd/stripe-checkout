@@ -427,7 +427,7 @@ const priceMap = {
 
 const otherServicesPrices = {
   nanoblading: "price_1TJhwXLVWAMw3iFeL89oDbj5",
-  "powder-brows": "price_1SziATLVWAMw3iFeJ8O37uOa",
+  microshading: "price_1SziATLVWAMw3iFeJ8O37uOa",
   "top-eyeliner": "price_1SziBLLVWAMw3iFefsG4hGYu",
   "lip-blush": "price_1SziBtLVWAMw3iFeOlogbBw5",
   "combo-full-face": "price_1SziCULVWAMw3iFeKQ7lsdNk"
@@ -443,17 +443,23 @@ const otherServicesPrices = {
 // ==============================
 
 const LLB_SERVICES = Object.freeze({
-  llb_nanoblading_powder_brows: {
-    name: "Nanoblading / Powder Brows",
-    description: "Signature permanent brow service",
-    unitAmount: 80000,
-    priceEnv: "STRIPE_PRICE_LLB_NANOBLADING_POWDER_BROWS"
+  llb_nanoblading: {
+    name: "Nanoblading",
+    description: "Realistic hair-stroke permanent brow service",
+    unitAmount: 70000,
+    priceEnv: "STRIPE_PRICE_LLB_NANOBLADING_700"
+  },
+  llb_microshading: {
+    name: "Microshading",
+    description: "Soft shaded permanent brow service",
+    unitAmount: 70000,
+    priceEnv: "STRIPE_PRICE_LLB_MICROSHADING_700"
   },
   llb_lip_blushing: {
     name: "Lip Blushing",
     description: "Customized soft lip color and definition",
-    unitAmount: 85000,
-    priceEnv: "STRIPE_PRICE_LLB_LIP_BLUSHING"
+    unitAmount: 65000,
+    priceEnv: "STRIPE_PRICE_LLB_LIP_BLUSHING_650"
   },
   llb_top_eyeliner: {
     name: "Top Eyeliner",
@@ -797,9 +803,11 @@ const VAGARO_SERVICE_MAP = {
       category: "Permanent MakeUp",
       durationMinutes: 150
     },
-    "powder-brows": {
-      serviceId: "aUA~~QwAC0fjL5DruLTBhA==",
-      title: "Powder Brows",
+    microshading: {
+      serviceId:
+        process.env.VAGARO_MICROSHADING_SERVICE_ID ||
+        "aUA~~QwAC0fjL5DruLTBhA==",
+      title: "Microshading",
       category: "Permanent MakeUp",
       durationMinutes: 150
     },
