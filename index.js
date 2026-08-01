@@ -17,8 +17,7 @@ const VALID_TYPES = [
   "facial",
   "membership",
   "med-spa",
-  "morpheus",
-  "other-service"
+  "morpheus"
 ];
 
 const MAX_CART_ITEMS = 20;
@@ -292,12 +291,6 @@ const checkoutLimiter = rateLimit({
 // ==============================
 
 const priceMap = {
-  membership: {
-    platinum: { "6": "price_1SyuFlLVWAMw3iFeAAU7GR1e" },
-    gold: { "6": "price_1SyuGnLVWAMw3iFe3U8Y81SF" },
-    teen: { "6": "price_1SyuHuLVWAMw3iFetbcoodh2" }
-  },
-
   laser: {
     small: {
       single: "price_1Sv2ExLVWAMw3iFedZ6vFjav",
@@ -336,102 +329,174 @@ const priceMap = {
     }
   },
 
-  "ll-signature": {
-    "single-none": "price_1StqevLVWAMw3iFer0kW5wBq",
-    "single-led10": "price_1StqgqLVWAMw3iFe9k2tD5rT",
-    "single-led20": "price_1StqhLLVWAMw3iFesS17pRjR",
-    "single-peel": "price_1StqhlLVWAMw3iFemTTki7vK",
-    "3-none": "price_1StqiCLVWAMw3iFePkaQpH6V",
-    "3-led10": "price_1StqioLVWAMw3iFeAm59s0Xt",
-    "3-led20": "price_1StqkXLVWAMw3iFeR7QiSc1x",
-    "3-peel": "price_1StqkrLVWAMw3iFe4tjY3cFF"
-  },
+};
 
-  "classic-deluxe": {
-    "single-none": "price_1SuEXILVWAMw3iFeEzZhwlVJ",
-    "single-led10": "price_1SuEYELVWAMw3iFefiIqcGFR",
-    "single-led20": "price_1SuEYnLVWAMw3iFewE4dpv9l",
-    "single-peel": "price_1SuEZPLVWAMw3iFe7tYRV0oU",
-    "3-none": "price_1SuEbGLVWAMw3iFeeieTxip5",
-    "3-led10": "price_1SuEc1LVWAMw3iFey3J96baH",
-    "3-led20": "price_1SuEd6LVWAMw3iFebVOUfGLQ",
-    "3-peel": "price_1SuEdmLVWAMw3iFeJLmbA2Q0"
-  },
+// ==============================
+// LASER / FULL-BODY — local dollar mirror
+// Prices did not change with the new printed price list. The real Stripe
+// Price IDs above are still used for the actual checkout line item; this
+// table only lets discount/cashback math run locally instead of round
+// -tripping to Stripe for every item.
+// ==============================
+const LASER_DOLLAR_PRICES = {
+  small: { single: 85, 6: 450, 8: 600 },
+  medium: { single: 120, 6: 630, 8: 840 },
+  large: { single: 200, 6: 900, 8: 1200 },
+  xlarge: { single: 285, 6: 1200, 8: 2000 }
+};
 
-  "ll-teen": {
-    "single-none": "price_1SuEejLVWAMw3iFedQAwSrU6",
-    "single-led10": "price_1SuEfLLVWAMw3iFermWmmr34",
-    "single-led20": "price_1SuEfvLVWAMw3iFe3kb7eqUJ",
-    "single-peel": "price_1SuEgGLVWAMw3iFeVHNgvu91",
-    "3-none": "price_1SuEgsLVWAMw3iFeILBNpjT1",
-    "3-led10": "price_1SuEhaLVWAMw3iFew6XXmiTM",
-    "3-led20": "price_1SuEi5LVWAMw3iFewusx6G2v",
-    "3-peel": "price_1SuEiLLVWAMw3iFe8YD0gUZy"
-  },
+const FULL_BODY_DOLLAR_PRICES = {
+  single: { none: 575, fullface: 625 },
+  6: { none: 3150, fullface: 3450 },
+  8: { none: 4200, fullface: 4600 }
+};
 
-  "med-spa": {
-    microneedling: {
-      single: {
-        none: "price_1SxA01LVWAMw3iFesKpaxZvz",
-        exosomes: "price_1SxA0VLVWAMw3iFeDjB6cXS9",
-        neck: "price_1SxA1bLVWAMw3iFeENwK7Pjo",
-        "exo-neck": "price_1SxAu4LVWAMw3iFe0xzdQLj6"
-      },
-      3: {
-        none: "price_1SxA2lLVWAMw3iFeOfMnlep9",
-        exosomes: "price_1SxA3LLVWAMw3iFeJWCBn4w9",
-        neck: "price_1SxA4pLVWAMw3iFekvmzRRtg",
-        "exo-neck": "price_1SxAvcLVWAMw3iFemyVhJy70"
-      }
-    },
+// ==============================
+// FACIAL TREATMENTS
+// Prices computed dynamically (price_data) instead of pre-created Stripe
+// Price IDs, so they can be edited here without any Stripe Dashboard work.
+// Matches the printed price list. "ll-teen" was removed (no longer offered).
+// ==============================
+const FACIAL_BASE_PRICES = {
+  "ll-signature": { label: "LL Signature Facial", durationMinutes: 75, single: 165, 3: 465 },
+  "classic-deluxe": { label: "Classic Deluxe Facial", durationMinutes: 60, single: 150, 3: 420 },
+  "diamond-glow": { label: "Diamond Glow", durationMinutes: 60, single: 165, 3: 450 },
+  dermaplaning: { label: "Dermaplaning", durationMinutes: 30, single: 150, 3: 350 }
+};
 
-    llumigold: {
-      single: {
-        none: "price_1SxA5mLVWAMw3iFeifsFKOFW",
-        exosomes: "price_1SxA6YLVWAMw3iFe3Rv6fPhS",
-        neck: "price_1SxA7FLVWAMw3iFeBJydTb8W",
-        "exo-neck": "price_1SxAwrLVWAMw3iFew3fsdrha"
-      },
-      3: {
-        none: "price_1SxA85LVWAMw3iFeG1JZ19Lu",
-        exosomes: "price_1SxA8eLVWAMw3iFeGKRTsEEX",
-        neck: "price_1SxA9LLVWAMw3iFeShWxtdjh",
-        "exo-neck": "price_1SxAy7LVWAMw3iFeS4ctcll6"
-      }
-    },
+// Single-session add-on prices come straight from the printed list. 3-session
+// deltas match the bundle pricing already used by LL Signature/Classic Deluxe
+// (+69 / +99 / +160), which is uniform across facial types in the existing
+// data. "dermaplaning" (during facial) has no printed 3-session bundle price;
+// it's assumed to follow the same delta tier as led10 since it shares the
+// same single-session price ($30) — flagged as an assumption, not a printed
+// figure.
+const FACIAL_ADDON_PRICES = {
+  none: { single: 0, 3: 0 },
+  led10: { single: 30, 3: 69 },
+  led20: { single: 50, 3: 99 },
+  peel: { single: 65, 3: 160 },
+  dermaplaning: { single: 30, 3: 69 }
+};
 
-    "laser-facial": {
-      single: { none: "price_1SxABRLVWAMw3iFe7vYyqaVW" },
-      3: { none: "price_1SxAEuLVWAMw3iFeNSwQFrR5" }
-    },
+function getFacialPackageKey(item) {
+  return item.package === "3" || item.package === 3 ? "3" : "single";
+}
 
-    "glow-up-laser-facial": {
-      single: {
-        none: "price_1SxAKsLVWAMw3iFeyKH4OSTl",
-        decollete: "price_1SxASrLVWAMw3iFeieILAe3T",
-        neck: "price_1SxATvLVWAMw3iFeu78Ak5Xr"
-      },
-      3: {
-        none: "price_1SxAUjLVWAMw3iFeTVxGy05w",
-        decollete: "price_1SxAVeLVWAMw3iFeXpnKTDlr",
-        neck: "price_1SxAWsLVWAMw3iFesU5eyyWC"
-      }
-    },
+function getFacialPrice(item) {
+  const service = FACIAL_BASE_PRICES[item.service];
+  if (!service) throw new Error("Invalid facial service");
 
-    peel: {
-      single: { none: "price_1Syx4ULVWAMw3iFevqsTAPJj" },
-      3: { none: "price_1Syx58LVWAMw3iFe2rmfw0VF" }
-    }
+  const pkg = getFacialPackageKey(item);
+  const basePrice = service[pkg];
+  if (basePrice === undefined) throw new Error("Invalid facial package");
+
+  const addonKey = item.addon || "none";
+  const addon = FACIAL_ADDON_PRICES[addonKey];
+  if (!addon) throw new Error("Invalid facial add-on");
+
+  return {
+    amount: basePrice + addon[pkg],
+    name: service.label,
+    package: pkg,
+    packageLabel: pkg === "3" ? "3 Sessions" : "Single Session",
+    addon: addonKey,
+    addonLabel: addonLabels[addonKey] || addonKey
+  };
+}
+
+// ==============================
+// MED SPA TREATMENTS
+// Same dynamic-pricing approach as Facial. "laser-facial" was renamed to
+// "oxi-laser-facial" to match the printed list; "hydrafacial" is new.
+// ==============================
+const MEDSPA_BASE_PRICES = {
+  microneedling: { label: "Microneedling", durationMinutes: 75, single: 200, 3: 450 },
+  llumigold: { label: "LLumiGold", durationMinutes: 105, single: 250, 3: 600 },
+  "oxi-laser-facial": { label: "Oxi Laser Facial", durationMinutes: 15, single: 180, 3: 450 },
+  "glow-up-laser-facial": { label: "Glow Up Laser Facial", durationMinutes: 30, single: 250, 3: 600 },
+  hydrafacial: { label: "Hydrafacial", durationMinutes: 60, single: 150, 3: 350 },
+  peel: { label: "Peel", durationMinutes: 15, single: 150, 3: 360 }
+};
+
+// Add-on prices are per service, single-select (kept consistent with the
+// existing combo-key convention rather than introducing independent
+// checkboxes). "glow-up-laser-facial" neck/decollete both represent the
+// printed "2 areas" option, same price.
+const MEDSPA_ADDON_PRICES = {
+  microneedling: { none: 0, led10: 10, neck: 50, "led10-neck": 60 },
+  llumigold: { none: 0, exosomes: 100, neck: 50, "exosomes-neck": 150 },
+  "oxi-laser-facial": { none: 0 },
+  "glow-up-laser-facial": { none: 0, neck: 50, decollete: 50 },
+  hydrafacial: { none: 0 },
+  peel: { none: 0 }
+};
+
+// The printed list offers 5 named peel formulas at the same flat price — this
+// is a cosmetic "type" selector, not a price variant.
+const PEEL_TYPES = {
+  glow: "Glow – Brightening",
+  renew: "Renew – Surface Renew",
+  "firm-lift": "Firm & Lift – Anti-Aging",
+  "calm-bright": "Calm & Bright – Sensitive Skin",
+  "advanced-corrective": "Advanced / Corrective – Targeted Concerns"
+};
+
+function getMedSpaPackageKey(item) {
+  return item.package === "3" || item.package === 3 ? "3" : "single";
+}
+
+function getMedSpaPrice(item) {
+  const service = MEDSPA_BASE_PRICES[item.service];
+  if (!service) throw new Error("Invalid med spa service");
+
+  const pkg = getMedSpaPackageKey(item);
+  const basePrice = service[pkg];
+  if (basePrice === undefined) throw new Error("Invalid med spa package");
+
+  const addonKey = item.addon || "none";
+  const addonTable = MEDSPA_ADDON_PRICES[item.service] || {};
+  const addonPrice = addonTable[addonKey];
+  if (addonPrice === undefined) throw new Error("Invalid med spa add-on");
+
+  let name = service.label;
+  if (item.service === "peel" && item.peelType && PEEL_TYPES[item.peelType]) {
+    name = `Peel – ${PEEL_TYPES[item.peelType]}`;
   }
+
+  return {
+    amount: basePrice + addonPrice,
+    name,
+    package: pkg,
+    packageLabel: pkg === "3" ? "3 Sessions" : "Single Session",
+    addon: addonKey,
+    addonLabel: addonLabels[addonKey] || addonKey
+  };
+}
+
+// ==============================
+// MEMBERSHIP
+// One-time payment covering the full 6-month commitment (monthlyPrice ×
+// months), same behavior as the previous Platinum/Gold/Teen plans.
+// Replaces Platinum/Gold/Teen entirely with the two plans from the printed
+// price list.
+// ==============================
+const MEMBERSHIP_PLANS = {
+  "reset-care": { label: "Reset Care Membership", monthlyPrice: 150, months: 6 },
+  "glass-skin": { label: "Glass Skin Membership", monthlyPrice: 250, months: 6 }
 };
 
-const otherServicesPrices = {
-  nanoblading: "price_1TJhwXLVWAMw3iFeL89oDbj5",
-  microshading: "price_1SziATLVWAMw3iFeJ8O37uOa",
-  "top-eyeliner": "price_1SziBLLVWAMw3iFefsG4hGYu",
-  "lip-blush": "price_1SziBtLVWAMw3iFeOlogbBw5",
-  "combo-full-face": "price_1SziCULVWAMw3iFeKQ7lsdNk"
-};
+function getMembershipPrice(item) {
+  const plan = MEMBERSHIP_PLANS[item.plan];
+  if (!plan) throw new Error("Invalid membership plan");
+
+  return {
+    amount: plan.monthlyPrice * plan.months,
+    name: plan.label,
+    monthlyPrice: plan.monthlyPrice,
+    months: plan.months
+  };
+}
 
 // ==============================
 // LL BROWS CHECKOUT CATALOG
@@ -543,7 +608,13 @@ const addonLabels = {
   none: "No Additional",
   led10: "Led (10 min)",
   led20: "Led (20 min)",
+  peel: "Peel",
+  dermaplaning: "Dermaplaning (During Facial)",
   exosomes: "Exosomes",
+  neck: "Neck",
+  decollete: "Décolleté",
+  "exosomes-neck": "Exosomes + Neck",
+  "led10-neck": "Led (10 min) + Neck",
   salmon: "Salmon DNA PDRN",
   "led10-exosomes": "Led (10 min) + Exosomes",
   "led20-exosomes": "Led (20 min) + Exosomes",
@@ -754,13 +825,11 @@ const VAGARO_SERVICE_MAP = {
       title: "LL Deluxe",
       category: "Facial Treatments",
       durationMinutes: 60
-    },
-    "ll-teen": {
-      serviceId: "jY3XyGXcn3uMoqZ1Yc~s8Q==",
-      title: "LL Teen Signature",
-      category: "Facial Treatments",
-      durationMinutes: 45
     }
+    // "diamond-glow" and "dermaplaning" are new services with no Vagaro
+    // serviceId yet. resolveVagaroServiceFromSiteItem() returns null for them
+    // (safe no-op) until real Vagaro serviceIds are provided; the booking
+    // flow falls back to VAGARO_LISTING_URL for those two.
   },
 
   "med-spa": {
@@ -776,9 +845,9 @@ const VAGARO_SERVICE_MAP = {
       category: "Med Spa Treatments",
       durationMinutes: 105
     },
-    "laser-facial": {
+    "oxi-laser-facial": {
       serviceId: "6mrUniAXL6KN~JRD5zFTLQ==",
-      title: "Laser Facial",
+      title: "Oxi Laser Facial",
       category: "Med Spa Treatments",
       durationMinutes: 15
     },
@@ -794,36 +863,8 @@ const VAGARO_SERVICE_MAP = {
       category: "Peel",
       durationMinutes: 15
     }
-  },
-
-  "other-service": {
-    nanoblading: {
-      serviceId: "DE4PS7phfzAsDoTmNFbcNA==",
-      title: "Realism Nanoblading",
-      category: "Permanent MakeUp",
-      durationMinutes: 150
-    },
-    microshading: {
-      serviceId:
-        process.env.VAGARO_MICROSHADING_SERVICE_ID ||
-        "aUA~~QwAC0fjL5DruLTBhA==",
-      title: "Microshading",
-      category: "Permanent MakeUp",
-      durationMinutes: 150
-    },
-    "top-eyeliner": {
-      serviceId: "Tx5uO64oVVgm8OKC3S1BwQ==",
-      title: "Top Eyeliner",
-      category: "Permanent MakeUp",
-      durationMinutes: 75
-    },
-    "lip-blush": {
-      serviceId: "VgTvo53xawgNjmAK4fLssQ==",
-      title: "Lip Blush",
-      category: "Permanent MakeUp",
-      durationMinutes: 150
-    },
-    "combo-full-face": null
+    // "hydrafacial" is new, no Vagaro serviceId yet — same fallback behavior
+    // as diamond-glow/dermaplaning above.
   },
 
   laser: {
@@ -1046,8 +1087,8 @@ function resolveVagaroAddOns(siteItem = {}) {
   if (addon.includes("exosomes") || addon.includes("exo")) {
     addOns.push(VAGARO_ADD_ON_IDS.exosomes);
   }
-  if (addon === "neck") addOns.push(VAGARO_ADD_ON_IDS.neck);
-  if (addon === "decollete") addOns.push(VAGARO_ADD_ON_IDS.decollete);
+  if (addon.includes("neck")) addOns.push(VAGARO_ADD_ON_IDS.neck);
+  if (addon.includes("decollete")) addOns.push(VAGARO_ADD_ON_IDS.decollete);
 
   return [...new Set(addOns.filter(Boolean))];
 }
@@ -1083,18 +1124,6 @@ function resolveVagaroServiceFromSiteItem(siteItem = {}) {
     return {
       ...service,
       addOnIds: resolveVagaroAddOns(siteItem)
-    };
-  }
-
-  if (type === "other-service") {
-    const serviceKey = siteItem.serviceKey || siteItem.service;
-    const service = VAGARO_SERVICE_MAP["other-service"][serviceKey];
-
-    if (!service) return null;
-
-    return {
-      ...service,
-      addOnIds: []
     };
   }
 
@@ -1169,51 +1198,10 @@ for (const [pkg, addons] of Object.entries(priceMap["full-body"])) {
   }
 }
 
-for (const serviceKey of ["ll-signature", "classic-deluxe", "ll-teen"]) {
-  for (const [backendKey, priceId] of Object.entries(priceMap[serviceKey])) {
-    const parts = backendKey.split("-");
-    const packageKey = parts[0];
-    const addon = parts.slice(1).join("-") || "none";
-
-    addPriceMapping(priceId, {
-      type: "facial",
-      service: serviceKey,
-      key: backendKey,
-      package: packageKey,
-      addon
-    });
-  }
-}
-
-for (const [serviceKey, packages] of Object.entries(priceMap["med-spa"])) {
-  for (const [pkg, addons] of Object.entries(packages)) {
-    for (const [addon, priceId] of Object.entries(addons)) {
-      addPriceMapping(priceId, {
-        type: "med-spa",
-        service: serviceKey,
-        package: pkg,
-        addon
-      });
-    }
-  }
-}
-
-for (const [serviceKey, priceId] of Object.entries(otherServicesPrices)) {
-  addPriceMapping(priceId, {
-    type: "other-service",
-    serviceKey
-  });
-}
-
-for (const [plan, packages] of Object.entries(priceMap.membership)) {
-  for (const [pkg, priceId] of Object.entries(packages)) {
-    addPriceMapping(priceId, {
-      type: "membership",
-      plan,
-      package: pkg
-    });
-  }
-}
+// Facial, med-spa and membership no longer use pre-created Stripe Price IDs
+// (see FACIAL_BASE_PRICES / MEDSPA_BASE_PRICES / MEMBERSHIP_PLANS above) — a
+// completed session's line item is reconstructed via product metadata
+// instead. See siteItemFromLineItem().
 
 function buildPrimarySiteItemMetadata(items = []) {
   const first = items.find((item) => {
@@ -1247,6 +1235,43 @@ function siteItemFromLineItem(lineItem) {
   }
 
   const product = lineItem.price?.product || {};
+  const metadata = product.metadata || {};
+
+  // Facial / med-spa / membership / morpheus are all dynamic price_data line
+  // items (no fixed Price ID to look up above) — reconstruct the site item
+  // from the product metadata we set when the session was created.
+  if (metadata.source === "lltouch-site") {
+    if (metadata.mode === "morpheus") {
+      return { type: "morpheus" };
+    }
+
+    if (metadata.mode === "facial") {
+      return {
+        type: "facial",
+        service: metadata.service,
+        package: metadata.package,
+        addon: metadata.addon
+      };
+    }
+
+    if (metadata.mode === "med-spa") {
+      return {
+        type: "med-spa",
+        service: metadata.service,
+        package: metadata.package,
+        addon: metadata.addon
+      };
+    }
+
+    if (metadata.mode === "membership") {
+      return {
+        type: "membership",
+        plan: metadata.plan,
+        package: metadata.package
+      };
+    }
+  }
+
   const productName = String(product.name || "");
 
   if (
@@ -1318,15 +1343,14 @@ function buildBookingOptionsFromSession(session) {
 // PRICE / CHECKOUT LOGIC
 // ==============================
 
+// Only laser / full-body still reference pre-created Stripe Price IDs.
+// Facial / med-spa / membership / morpheus are priced dynamically — see
+// getFacialPrice() / getMedSpaPrice() / getMembershipPrice() / consultation
+// fee handling inline in /create-checkout-session.
 function resolvePriceId(item) {
   try {
-    if (item.type === "morpheus") return null;
-    if (item.type === "membership") return priceMap.membership?.[item.plan]?.[item.package];
     if (item.type === "laser") return priceMap.laser?.[item.area]?.[item.package];
     if (item.type === "full-body") return priceMap["full-body"]?.[item.package]?.[item.addon || "none"];
-    if (item.type === "facial") return priceMap[item.service]?.[item.key];
-    if (item.type === "med-spa") return priceMap["med-spa"]?.[item.service]?.[item.package]?.[item.addon || "none"];
-    if (item.type === "other-service") return otherServicesPrices?.[item.serviceKey];
 
     return null;
   } catch {
@@ -1373,46 +1397,49 @@ function getMorpheusPrice(item) {
   return finalPrice;
 }
 
+// Computes an item's dollar amount without ever hitting Stripe — laser/
+// full-body use the local dollar mirror (real prices unchanged), everything
+// else uses its own dynamic-pricing helper.
+function computeLocalItemAmount(item) {
+  const quantity = item.quantity || 1;
+
+  if (item.type === "morpheus") return MORPHEUS_CONSULTATION_FEE * quantity;
+  if (item.type === "facial") return getFacialPrice(item).amount * quantity;
+  if (item.type === "med-spa") return getMedSpaPrice(item).amount * quantity;
+  if (item.type === "membership") return getMembershipPrice(item).amount * quantity;
+  if (item.type === "laser") return (LASER_DOLLAR_PRICES[item.area]?.[item.package] || 0) * quantity;
+  if (item.type === "full-body") {
+    return (FULL_BODY_DOLLAR_PRICES[item.package]?.[item.addon || "none"] || 0) * quantity;
+  }
+
+  return 0;
+}
+
 async function resolveDiscounts(customer, items) {
-  const resolvedItems = items
-    .filter((item) => item.type !== "morpheus")
-    .map((item) => {
-      const priceId = resolvePriceId(item);
-      if (!priceId) throw new Error("Produto inválido");
-      return { priceId, quantity: item.quantity || 1 };
-    });
-
-  const laserIds = [
-    ...Object.values(priceMap.laser).flatMap((area) => Object.values(area)),
-    ...Object.values(priceMap["full-body"]).flatMap((pkg) => Object.values(pkg))
-  ];
-
-  const facialIds = [
-    ...Object.values(priceMap["ll-signature"]),
-    ...Object.values(priceMap["classic-deluxe"]),
-    ...Object.values(priceMap["ll-teen"])
-  ];
-
-  const microneedlingSingleId = priceMap["med-spa"].microneedling.single.none;
-  const membershipPlatinumId = priceMap.membership.platinum["6"];
-  const otherFullFaceId = otherServicesPrices["combo-full-face"];
-
   let hasFacial = false;
-  let hasMicroneedling = false;
-  let hasMembershipPlatinum = false;
-  let hasOtherFullFace = false;
+  let hasMicroneedlingSingle = false;
   let currentFacialPurchase = 0;
 
-  for (const item of resolvedItems) {
-    if (laserIds.includes(item.priceId)) {
-      // laser products are handled by cashback, not Stripe coupon here
+  for (const item of items) {
+    if (item.type === "facial") {
+      hasFacial = true;
+      currentFacialPurchase += getFacialPrice(item).amount * (item.quantity || 1);
     }
 
-    if (facialIds.includes(item.priceId)) hasFacial = true;
-    if (item.priceId === microneedlingSingleId) hasMicroneedling = true;
-    if (item.priceId === membershipPlatinumId) hasMembershipPlatinum = true;
-    if (item.priceId === otherFullFaceId) hasOtherFullFace = true;
+    if (
+      item.type === "med-spa" &&
+      item.service === "microneedling" &&
+      getMedSpaPackageKey(item) === "single" &&
+      (!item.addon || item.addon === "none")
+    ) {
+      hasMicroneedlingSingle = true;
+    }
   }
+
+  // Note: the old "membership platinum" and "other-service combo-full-face"
+  // auto-coupons were removed along with the Platinum/Gold/Teen plans and
+  // the Other Services page — those Stripe coupons (thCriSEx, oLmALLlo) are
+  // now unused but were left untouched in the Stripe Dashboard.
 
   if (customer.popup_unlocked && !customer.first_purchase_used) {
     return {
@@ -1421,35 +1448,14 @@ async function resolveDiscounts(customer, items) {
     };
   }
 
-  if (hasMicroneedling && !customer.microneedling_discount_used) {
+  if (hasMicroneedlingSingle && !customer.microneedling_discount_used) {
     return {
       discounts: [{ coupon: "U2VFw8Yj" }],
       metadata: { discount_type: "microneedling" }
     };
   }
 
-  if (hasMembershipPlatinum) {
-    return {
-      discounts: [{ coupon: "thCriSEx" }],
-      metadata: { discount_type: "membership" }
-    };
-  }
-
-  if (hasOtherFullFace) {
-    return {
-      discounts: [{ coupon: "oLmALLlo" }],
-      metadata: { discount_type: "other" }
-    };
-  }
-
   if (hasFacial) {
-    for (const item of resolvedItems) {
-      if (facialIds.includes(item.priceId)) {
-        const stripePrice = await stripe.prices.retrieve(item.priceId);
-        currentFacialPurchase += (stripePrice.unit_amount / 100) * item.quantity;
-      }
-    }
-
     let discountTier = 0;
 
     if (currentFacialPurchase >= 1500) discountTier = 10;
@@ -1471,19 +1477,10 @@ async function resolveDiscounts(customer, items) {
   }
 
   if (customer.cashback_balance > 0) {
-    let currentCartTotal = 0;
-
-    for (const item of items) {
-      if (item.type === "morpheus") {
-        currentCartTotal += MORPHEUS_CONSULTATION_FEE * (item.quantity || 1);
-        continue;
-      }
-
-      const priceId = resolvePriceId(item);
-      const stripePrice = await stripe.prices.retrieve(priceId);
-
-      currentCartTotal += (stripePrice.unit_amount / 100) * (item.quantity || 1);
-    }
+    const currentCartTotal = items.reduce(
+      (acc, item) => acc + computeLocalItemAmount(item),
+      0
+    );
 
     const maxAllowedDiscount = currentCartTotal * 0.5;
 
@@ -1868,6 +1865,82 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
             unit_amount: consultationFee * 100
           },
           quantity: 1
+        };
+      }
+
+      if (item.type === "facial") {
+        const priced = getFacialPrice(item);
+        const description =
+          priced.addon && priced.addon !== "none"
+            ? `${priced.packageLabel} + ${priced.addonLabel}`
+            : priced.packageLabel;
+
+        return {
+          quantity: item.quantity || 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: Math.round(priced.amount * 100),
+            product_data: {
+              name: priced.name,
+              description,
+              metadata: {
+                source: "lltouch-site",
+                mode: "facial",
+                service: item.service,
+                package: priced.package,
+                addon: priced.addon
+              }
+            }
+          }
+        };
+      }
+
+      if (item.type === "med-spa") {
+        const priced = getMedSpaPrice(item);
+        const description =
+          priced.addon && priced.addon !== "none"
+            ? `${priced.packageLabel} + ${priced.addonLabel}`
+            : priced.packageLabel;
+
+        return {
+          quantity: item.quantity || 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: Math.round(priced.amount * 100),
+            product_data: {
+              name: priced.name,
+              description,
+              metadata: {
+                source: "lltouch-site",
+                mode: "med-spa",
+                service: item.service,
+                package: priced.package,
+                addon: priced.addon
+              }
+            }
+          }
+        };
+      }
+
+      if (item.type === "membership") {
+        const priced = getMembershipPrice(item);
+
+        return {
+          quantity: 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: Math.round(priced.amount * 100),
+            product_data: {
+              name: priced.name,
+              description: `$${priced.monthlyPrice}/month × ${priced.months} months (6-month commitment)`,
+              metadata: {
+                source: "lltouch-site",
+                mode: "membership",
+                plan: item.plan,
+                package: "6"
+              }
+            }
+          }
         };
       }
 
