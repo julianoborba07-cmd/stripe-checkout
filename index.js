@@ -710,7 +710,10 @@ const VAGARO_LISTING_URL =
 // LL Brows Academy uses a fixed 45-minute scheduling service only to search
 // real availability. Its service ID must be configured in Render.
 const VAGARO_ACADEMY_SERVICE_ID =
-  String(process.env.VAGARO_ACADEMY_SERVICE_ID || "").trim();
+  String(
+    process.env.VAGARO_ACADEMY_SERVICE_ID ||
+      "B15PxW3jHP3aZ9eO7JyaPA=="
+  ).trim();
 
 const VAGARO_ACADEMY_SERVICE_TITLE =
   String(
@@ -2271,6 +2274,32 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
 // ROUTES - VAGARO FASE 1
 // ==============================
 
+// LL BROWS ACADEMY — permission check.
+// This only verifies that Vagaro can issue a token with write_employee.
+// It does NOT create, update or delete any task.
+app.get("/vagaro/academy-write-access-check", checkoutLimiter, async (req, res) => {
+  try {
+    await getVagaroAccessToken(VAGARO_WRITE_EMPLOYEE_SCOPE);
+
+    return res.json({
+      status: 200,
+      ok: true,
+      scope: VAGARO_WRITE_EMPLOYEE_SCOPE,
+      message: "Vagaro write_employee access is available."
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/academy-write-access-check:", err);
+
+    return res.status(403).json({
+      status: 403,
+      ok: false,
+      scope: VAGARO_WRITE_EMPLOYEE_SCOPE,
+      error: "Vagaro write_employee access is not available.",
+      details: err.message
+    });
+  }
+});
+
 // LL BROWS ACADEMY — service discovery helper.
 // Returns only services assigned to Ludimilla. No access token or credentials
 // are exposed to the browser. This route can be removed after the Academy
@@ -2713,6 +2742,7 @@ app.get("/health", (_, res) => {
       businessId: VAGARO_BUSINESS_ID,
       professional: "Ludimilla Leite",
       academy: {
+        writeAccessCheckRoute: "/vagaro/academy-write-access-check",
         serviceCandidatesRoute: "/vagaro/academy-service-candidates",
         availabilityRoute: "/vagaro/academy-availability",
         reserveRoute: "/vagaro/academy-reserve",
