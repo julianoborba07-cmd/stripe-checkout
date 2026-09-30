@@ -1741,10 +1741,14 @@ async function googleCalendarRequest(path, options = {}) {
       error: data?.error
     });
 
-    throw new Error(
+    const error = new Error(
       data?.error?.message ||
       `Google Calendar API request failed (${response.status}).`
     );
+
+    error.status = response.status;
+    error.google = data;
+    throw error;
   }
 
   return data;
@@ -1762,6 +1766,234 @@ function normalizeAcademyAvailability(availability, fallbackDate) {
       durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
     }))
   );
+}
+
+function academyTruthy(value) {
+  if (value === true) return true;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+function normalizeAcademyTime(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  // Accepts 2:30 PM, 02:30 PM, 14:30, 14:30:00 and ISO-like timestamps.
+  const isoTimeMatch = raw.match(/T(\d{2}):(\d{2})/);
+  if (isoTimeMatch) {
+    return `${isoTimeMatch[1]}:${isoTimeMatch[2]}`;
+  }
+
+  const match = raw.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  if (!match) return null;
+
+  let hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const meridiem = String(match[3] || "").toUpperCase();
+
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+    return null;
+  }
+
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null;
+    if (meridiem === "AM") {
+      if (hour === 12) hour = 0;
+    } else if (meridiem === "PM") {
+      if (hour !== 12) hour += 12;
+    }
+  } else if (hour < 0 || hour > 23) {
+    return null;
+  }
+
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function academyDisplayTime(hhmm) {
+  const normalized = normalizeAcademyTime(hhmm);
+  if (!normalized) return String(hhmm || "");
+
+  const [hourText, minuteText] = normalized.split(":");
+  const hour = Number(hourText);
+  const suffix = hour >= 12 ? "PM" : "AM";
+  const displayHour = hour % 12 || 12;
+
+  return `${displayHour}:${minuteText} ${suffix}`;
+}
+
+function addAcademyMinutes(date, hhmm, minutes) {
+  const [year, month, day] = String(date).split("-").map(Number);
+  const normalized = normalizeAcademyTime(hhmm);
+  if (!year || !month || !day || !normalized) return null;
+
+  const [hour, minute] = normalized.split(":").map(Number);
+  const value = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+  value.setUTCMinutes(value.getUTCMinutes() + Number(minutes || 0));
+
+  return {
+    date: `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, "0")}-${String(value.getUTCDate()).padStart(2, "0")}`,
+    time: `${String(value.getUTCHours()).padStart(2, "0")}:${String(value.getUTCMinutes()).padStart(2, "0")}`
+  };
+}
+
+function zonedAcademyDateToUtc(date, hhmm, timeZone = GOOGLE_CALENDAR_TIMEZONE) {
+  const [year, month, day] = String(date).split("-").map(Number);
+  const normalized = normalizeAcademyTime(hhmm);
+
+  if (!year || !month || !day || !normalized) {
+    throw new Error("Invalid Academy date/time.");
+  }
+
+  const [hour, minute] = normalized.split(":").map(Number);
+  const targetWallClock = Date.UTC(year, month - 1, day, hour, minute, 0);
+
+  let guess = targetWallClock;
+
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+
+  for (let i = 0; i < 3; i += 1) {
+    const parts = Object.fromEntries(
+      formatter
+        .formatToParts(new Date(guess))
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, part.value])
+    );
+
+    const observedWallClock = Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour),
+      Number(parts.minute),
+      Number(parts.second)
+    );
+
+    const offset = observedWallClock - guess;
+    const nextGuess = targetWallClock - offset;
+
+    if (Math.abs(nextGuess - guess) < 1000) {
+      guess = nextGuess;
+      break;
+    }
+
+    guess = nextGuess;
+  }
+
+  return new Date(guess);
+}
+
+function academySlotEventId(date, hhmm) {
+  const normalized = normalizeAcademyTime(hhmm) || String(hhmm || "");
+  const digest = crypto
+    .createHash("sha256")
+    .update(`llbrows-academy|${VAGARO_LUDIMILLA_PROVIDER_ID}|${date}|${normalized}`)
+    .digest("hex")
+    .slice(0, 48);
+
+  // Google custom event IDs accept base32hex-compatible lowercase chars;
+  // 0-9 and a-f are valid, so the SHA-256 hex digest is safe here.
+  return `llba${digest}`;
+}
+
+function academyBookingFingerprint(email, date, hhmm) {
+  return crypto
+    .createHash("sha256")
+    .update(`${String(email || "").trim().toLowerCase()}|${date}|${normalizeAcademyTime(hhmm) || hhmm}`)
+    .digest("hex");
+}
+
+async function getAcademyGoogleConflicts(startUtc, endUtc) {
+  const encodedCalendarId = encodeURIComponent(GOOGLE_CALENDAR_ID);
+  const query = new URLSearchParams({
+    timeMin: startUtc.toISOString(),
+    timeMax: endUtc.toISOString(),
+    singleEvents: "true",
+    showDeleted: "false",
+    orderBy: "startTime",
+    maxResults: "50"
+  });
+
+  const data = await googleCalendarRequest(
+    `/calendars/${encodedCalendarId}/events?${query.toString()}`
+  );
+
+  return (Array.isArray(data?.items) ? data.items : []).filter((event) => {
+    if (!event || event.status === "cancelled") return false;
+    if (event.transparency === "transparent") return false;
+    return true;
+  });
+}
+
+function extractAcademyCandidate(body = {}) {
+  const candidate = body.candidate && typeof body.candidate === "object"
+    ? body.candidate
+    : {};
+
+  return {
+    fullName: cleanLeadField(
+      candidate.fullName ||
+      candidate.full_name ||
+      body.fullName ||
+      body.full_name ||
+      body.name,
+      120
+    ),
+    email: cleanLeadField(candidate.email || body.email, 180).toLowerCase(),
+    phone: cleanLeadField(candidate.phone || body.phone, 60)
+  };
+}
+
+function extractAcademyAppointment(body = {}) {
+  const appointment = body.appointment && typeof body.appointment === "object"
+    ? body.appointment
+    : {};
+
+  return {
+    date: formatDateOnly(appointment.date || body.date),
+    timeRaw: cleanLeadField(
+      appointment.time ||
+      appointment.startTime ||
+      appointment.start_time ||
+      body.time ||
+      body.startTime ||
+      body.start_time,
+      80
+    )
+  };
+}
+
+function extractAcademyTerms(body = {}) {
+  const terms = body.terms && typeof body.terms === "object" ? body.terms : {};
+  const agreements = body.agreements && typeof body.agreements === "object"
+    ? body.agreements
+    : {};
+
+  return {
+    attend: academyTruthy(terms.attend ?? agreements.attend ?? body.attend),
+    quietSpace: academyTruthy(
+      terms.quietSpace ??
+      terms.quiet_space ??
+      agreements.quietSpace ??
+      agreements.quiet_space ??
+      body.quietSpace ??
+      body.quiet_space
+    ),
+    reminders: academyTruthy(
+      terms.reminders ??
+      agreements.reminders ??
+      body.reminders
+    )
+  };
 }
 
 // ==============================
@@ -2374,6 +2606,309 @@ app.get("/academy/google-calendar-check", checkoutLimiter, async (req, res) => {
   }
 });
 
+// Final LL Brows Academy booking confirmation.
+// Revalidates Vagaro, checks Google Calendar conflicts, then creates one
+// deterministic BUSY event. The deterministic event ID protects the slot
+// against duplicate submissions across Render instances.
+app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
+  const candidate = extractAcademyCandidate(req.body || {});
+  const appointment = extractAcademyAppointment(req.body || {});
+  const terms = extractAcademyTerms(req.body || {});
+
+  if (!candidate.fullName || !isValidEmail(candidate.email) || !candidate.phone) {
+    return res.status(400).json({
+      ok: false,
+      code: "INVALID_CANDIDATE",
+      error: "Full name, valid email and phone are required."
+    });
+  }
+
+  if (!appointment.date) {
+    return res.status(400).json({
+      ok: false,
+      code: "INVALID_DATE",
+      error: "A valid appointment date is required."
+    });
+  }
+
+  const selectedTime = normalizeAcademyTime(appointment.timeRaw);
+
+  if (!selectedTime) {
+    return res.status(400).json({
+      ok: false,
+      code: "INVALID_TIME",
+      error: "A valid appointment time is required."
+    });
+  }
+
+  if (!terms.attend || !terms.quietSpace) {
+    return res.status(400).json({
+      ok: false,
+      code: "TERMS_REQUIRED",
+      error: "Required session commitments must be accepted."
+    });
+  }
+
+  if (!isGoogleCalendarConfigured()) {
+    return res.status(503).json({
+      ok: false,
+      code: "CALENDAR_NOT_CONFIGURED",
+      error: "Google Calendar is not configured."
+    });
+  }
+
+  // 1) Revalidate against the real Vagaro availability immediately before booking.
+  let availability;
+
+  try {
+    availability = await searchVagaroAvailability({
+      date: appointment.date,
+      serviceId: VAGARO_ACADEMY_SERVICE_ID,
+      addOnIds: []
+    });
+  } catch (err) {
+    console.error("Academy confirmation Vagaro revalidation failed:", err);
+
+    return res.status(503).json({
+      ok: false,
+      code: "VAGARO_REVALIDATION_FAILED",
+      error: "We could not re-check the selected time. Please try again."
+    });
+  }
+
+  const currentSlots = normalizeAcademyAvailability(
+    availability,
+    appointment.date
+  );
+
+  const matchingSlot = currentSlots.find(
+    (slot) =>
+      formatDateOnly(slot.date || appointment.date) === appointment.date &&
+      normalizeAcademyTime(slot.time) === selectedTime
+  );
+
+  if (!matchingSlot) {
+    return res.status(409).json({
+      ok: false,
+      code: "SLOT_NO_LONGER_AVAILABLE",
+      error: "That time is no longer available. Please choose another time."
+    });
+  }
+
+  const endWallClock = addAcademyMinutes(
+    appointment.date,
+    selectedTime,
+    VAGARO_ACADEMY_DURATION_MINUTES
+  );
+
+  if (!endWallClock) {
+    return res.status(400).json({
+      ok: false,
+      code: "INVALID_APPOINTMENT",
+      error: "Could not calculate the appointment duration."
+    });
+  }
+
+  let startUtc;
+  let endUtc;
+
+  try {
+    startUtc = zonedAcademyDateToUtc(
+      appointment.date,
+      selectedTime,
+      GOOGLE_CALENDAR_TIMEZONE
+    );
+
+    endUtc = zonedAcademyDateToUtc(
+      endWallClock.date,
+      endWallClock.time,
+      GOOGLE_CALENDAR_TIMEZONE
+    );
+  } catch (err) {
+    console.error("Academy timezone conversion failed:", err);
+
+    return res.status(400).json({
+      ok: false,
+      code: "INVALID_TIMEZONE_VALUE",
+      error: "Could not process the selected appointment time."
+    });
+  }
+
+  const eventId = academySlotEventId(appointment.date, selectedTime);
+  const bookingFingerprint = academyBookingFingerprint(
+    candidate.email,
+    appointment.date,
+    selectedTime
+  );
+
+  // 2) Check the Google calendar as a second source of truth.
+  let conflicts;
+
+  try {
+    conflicts = await getAcademyGoogleConflicts(startUtc, endUtc);
+  } catch (err) {
+    console.error("Academy Google Calendar conflict check failed:", err);
+
+    return res.status(503).json({
+      ok: false,
+      code: "GOOGLE_CONFLICT_CHECK_FAILED",
+      error: "We could not verify the calendar. Please try again."
+    });
+  }
+
+  const existingSameBooking = conflicts.find(
+    (event) =>
+      event.id === eventId &&
+      event.extendedProperties?.private?.bookingFingerprint === bookingFingerprint
+  );
+
+  // Idempotency: if this exact candidate already confirmed this exact slot,
+  // return the existing booking instead of creating a duplicate.
+  if (existingSameBooking) {
+    return res.json({
+      status: 200,
+      ok: true,
+      bookingConfirmed: true,
+      alreadyConfirmed: true,
+      appointment: {
+        date: appointment.date,
+        time: academyDisplayTime(selectedTime),
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
+        timeZone: GOOGLE_CALENDAR_TIMEZONE,
+        professional: "Ludimilla Leite",
+        service: VAGARO_ACADEMY_SERVICE_TITLE
+      },
+      eventId: existingSameBooking.id
+    });
+  }
+
+  if (conflicts.length > 0) {
+    return res.status(409).json({
+      ok: false,
+      code: "GOOGLE_SLOT_CONFLICT",
+      error: "That time has just been taken. Please choose another time."
+    });
+  }
+
+  // 3) Create a BUSY event. We intentionally do not add an attendee here:
+  // service accounts on consumer/shared calendars can be restricted from
+  // sending invitations. Candidate email/SMS confirmation will be handled
+  // separately without risking the booking itself.
+  const eventBody = {
+    id: eventId,
+    summary: `LL Brows Academy – Consultation Call | ${candidate.fullName}`,
+    description: [
+      "Private PMU Career & Business Audit",
+      `Candidate: ${candidate.fullName}`,
+      `Email: ${candidate.email}`,
+      `Phone: ${candidate.phone}`,
+      `Reminder consent: ${terms.reminders ? "yes" : "no"}`,
+      "Source: LL Brows Academy funnel"
+    ].join("\n"),
+    location: "Private online session",
+    status: "confirmed",
+    visibility: "private",
+    transparency: "opaque",
+    start: {
+      dateTime: `${appointment.date}T${selectedTime}:00`,
+      timeZone: GOOGLE_CALENDAR_TIMEZONE
+    },
+    end: {
+      dateTime: `${endWallClock.date}T${endWallClock.time}:00`,
+      timeZone: GOOGLE_CALENDAR_TIMEZONE
+    },
+    extendedProperties: {
+      private: {
+        llBrowsAcademy: "1",
+        bookingFingerprint,
+        candidateEmail: candidate.email,
+        appointmentDate: appointment.date,
+        appointmentTime: selectedTime
+      }
+    }
+  };
+
+  const encodedCalendarId = encodeURIComponent(GOOGLE_CALENDAR_ID);
+
+  try {
+    const createdEvent = await googleCalendarRequest(
+      `/calendars/${encodedCalendarId}/events?sendUpdates=none`,
+      {
+        method: "POST",
+        body: eventBody
+      }
+    );
+
+    return res.status(201).json({
+      status: 201,
+      ok: true,
+      bookingConfirmed: true,
+      alreadyConfirmed: false,
+      appointment: {
+        date: appointment.date,
+        time: academyDisplayTime(selectedTime),
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
+        timeZone: GOOGLE_CALENDAR_TIMEZONE,
+        professional: "Ludimilla Leite",
+        service: VAGARO_ACADEMY_SERVICE_TITLE
+      },
+      eventId: createdEvent.id
+    });
+  } catch (err) {
+    // Race-condition protection: two requests for the same slot use the same
+    // Google event ID. Only one can win. If the winner was this same booking,
+    // return success; otherwise return a slot conflict.
+    if (Number(err.status) === 409) {
+      try {
+        const afterRaceConflicts = await getAcademyGoogleConflicts(
+          startUtc,
+          endUtc
+        );
+
+        const sameBookingAfterRace = afterRaceConflicts.find(
+          (event) =>
+            event.id === eventId &&
+            event.extendedProperties?.private?.bookingFingerprint === bookingFingerprint
+        );
+
+        if (sameBookingAfterRace) {
+          return res.json({
+            status: 200,
+            ok: true,
+            bookingConfirmed: true,
+            alreadyConfirmed: true,
+            appointment: {
+              date: appointment.date,
+              time: academyDisplayTime(selectedTime),
+              durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
+              timeZone: GOOGLE_CALENDAR_TIMEZONE,
+              professional: "Ludimilla Leite",
+              service: VAGARO_ACADEMY_SERVICE_TITLE
+            },
+            eventId: sameBookingAfterRace.id
+          });
+        }
+      } catch (raceCheckError) {
+        console.error("Academy post-race conflict check failed:", raceCheckError);
+      }
+
+      return res.status(409).json({
+        ok: false,
+        code: "SLOT_JUST_TAKEN",
+        error: "That time has just been taken. Please choose another time."
+      });
+    }
+
+    console.error("Academy Google Calendar event creation failed:", err);
+
+    return res.status(503).json({
+      ok: false,
+      code: "GOOGLE_EVENT_CREATE_FAILED",
+      error: "We could not confirm the appointment. Please try again."
+    });
+  }
+});
+
 app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
   try {
     const sessionId = cleanLeadField(req.body.session_id, 120);
@@ -2605,7 +3140,8 @@ app.get("/health", (_, res) => {
       configured: isGoogleCalendarConfigured(),
       timezone: GOOGLE_CALENDAR_TIMEZONE,
       availabilityRoute: "/vagaro/academy-availability",
-      googleCheckRoute: "/academy/google-calendar-check"
+      googleCheckRoute: "/academy/google-calendar-check",
+      confirmRoute: "/academy/confirm-session"
     }
   });
 });
