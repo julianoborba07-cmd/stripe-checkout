@@ -4,6 +4,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import rateLimit from "express-rate-limit";
+import crypto from "node:crypto";
 
 dotenv.config();
 
@@ -691,15 +692,7 @@ const MORPHEUS_CONSULTATION_FEE = 50;
 // ==============================
 
 const VAGARO_REGION = process.env.VAGARO_REGION || "us03";
-
-// Keep read access for availability/search operations already used by LL Touch.
 const VAGARO_SCOPE = process.env.VAGARO_SCOPE || "read_access";
-
-// Personal Task creation requires the write_employee scope according to the
-// Vagaro Create Personal Task API documentation.
-const VAGARO_WRITE_EMPLOYEE_SCOPE =
-  process.env.VAGARO_WRITE_EMPLOYEE_SCOPE || "write_employee";
-
 const VAGARO_BUSINESS_ID =
   process.env.VAGARO_BUSINESS_ID || "u70rCIZg8Li86bNB7KxwcA==";
 const VAGARO_LUDIMILLA_PROVIDER_ID =
@@ -707,49 +700,58 @@ const VAGARO_LUDIMILLA_PROVIDER_ID =
 const VAGARO_LISTING_URL =
   process.env.VAGARO_LISTING_URL || "https://www.vagaro.com/llbrows/book-now";
 
-// LL Brows Academy uses a fixed 45-minute scheduling service only to search
-// real availability. Its service ID must be configured in Render.
-const VAGARO_ACADEMY_SERVICE_ID =
-  String(
-    process.env.VAGARO_ACADEMY_SERVICE_ID ||
-      "B15PxW3jHP3aZ9eO7JyaPA=="
-  ).trim();
-
-const VAGARO_ACADEMY_SERVICE_TITLE =
-  String(
-    process.env.VAGARO_ACADEMY_SERVICE_TITLE ||
-      "Private PMU Career & Business Audit"
-  ).trim();
-
-const VAGARO_ACADEMY_DURATION_MINUTES = 45;
-const VAGARO_ACADEMY_TASK_COLOR =
-  String(process.env.VAGARO_ACADEMY_TASK_COLOR || "#8B55B3").trim();
-
 const VAGARO_BASE_URL = `https://api.vagaro.com/${VAGARO_REGION}`;
 
-// Tokens are cached separately by scope so read_access and write_employee
-// never interfere with one another.
-const vagaroTokenCache = new Map();
+let vagaroTokenCache = {
+  accessToken: null,
+  expiresAt: 0
+};
+
+// ==============================
+// LL BROWS ACADEMY / GOOGLE CALENDAR
+// Added independently from LL Touch checkout/Vagaro booking logic.
+// ==============================
+
+const VAGARO_ACADEMY_SERVICE_ID = "B15PxW3jHP3aZ9eO7JyaPA==";
+const VAGARO_ACADEMY_SERVICE_TITLE = "LL Brows Academy – Consultation Call";
+const VAGARO_ACADEMY_DURATION_MINUTES = 45;
+
+const GOOGLE_SERVICE_ACCOUNT_EMAIL =
+  String(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || "").trim();
+
+const GOOGLE_PRIVATE_KEY =
+  String(process.env.GOOGLE_PRIVATE_KEY || "")
+    .replace(/\\n/g, "\n")
+    .trim();
+
+const GOOGLE_CALENDAR_ID =
+  String(process.env.GOOGLE_CALENDAR_ID || "").trim();
+
+const GOOGLE_CALENDAR_TIMEZONE =
+  String(process.env.GOOGLE_CALENDAR_TIMEZONE || "America/New_York").trim();
+
+let googleAccessTokenCache = {
+  accessToken: null,
+  expiresAt: 0
+};
 
 function isVagaroConfigured() {
   return Boolean(process.env.VAGARO_CLIENT_ID && process.env.VAGARO_CLIENT_SECRET);
 }
 
-async function getVagaroAccessToken(scope = VAGARO_SCOPE) {
+async function getVagaroAccessToken() {
   if (!isVagaroConfigured()) {
     throw new Error("Vagaro credentials are missing in Render environment variables.");
   }
 
-  const normalizedScope = String(scope || VAGARO_SCOPE).trim();
-  const cached = vagaroTokenCache.get(normalizedScope);
   const now = Date.now();
 
   if (
-    cached?.accessToken &&
-    cached?.expiresAt &&
-    now < cached.expiresAt - 60 * 1000
+    vagaroTokenCache.accessToken &&
+    vagaroTokenCache.expiresAt &&
+    now < vagaroTokenCache.expiresAt - 60 * 1000
   ) {
-    return cached.accessToken;
+    return vagaroTokenCache.accessToken;
   }
 
   const response = await fetch(
@@ -763,7 +765,7 @@ async function getVagaroAccessToken(scope = VAGARO_SCOPE) {
       body: JSON.stringify({
         clientId: process.env.VAGARO_CLIENT_ID,
         clientSecretKey: process.env.VAGARO_CLIENT_SECRET,
-        scope: normalizedScope
+        scope: VAGARO_SCOPE
       })
     }
   );
@@ -771,30 +773,22 @@ async function getVagaroAccessToken(scope = VAGARO_SCOPE) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok || data?.status !== 200 || !data?.data?.access_token) {
-    console.error("Erro gerando token Vagaro:", {
-      scope: normalizedScope,
-      status: response.status,
-      data
-    });
-    throw new Error(
-      data?.message ||
-        `Could not generate Vagaro access token for scope ${normalizedScope}`
-    );
+    console.error("Erro gerando token Vagaro:", data);
+    throw new Error(data?.message || "Could not generate Vagaro access token");
   }
 
   const expiresIn = Number(data.data.expires_in || 3600);
 
-  vagaroTokenCache.set(normalizedScope, {
+  vagaroTokenCache = {
     accessToken: data.data.access_token,
     expiresAt: Date.now() + expiresIn * 1000
-  });
+  };
 
-  return data.data.access_token;
+  return vagaroTokenCache.accessToken;
 }
 
 async function vagaroRequest(path, options = {}) {
-  const scope = options.scope || VAGARO_SCOPE;
-  const accessToken = await getVagaroAccessToken(scope);
+  const accessToken = await getVagaroAccessToken();
 
   const response = await fetch(`${VAGARO_BASE_URL}${path}`, {
     method: options.method || "POST",
@@ -1570,7 +1564,6 @@ async function searchVagaroAvailability({ date, serviceId, addOnIds = [] }) {
 
   const data = await vagaroRequest("/api/v2/appointments/availability", {
     method: "POST",
-    scope: VAGARO_SCOPE,
     body
   });
 
@@ -1591,161 +1584,158 @@ async function searchVagaroAvailability({ date, serviceId, addOnIds = [] }) {
   };
 }
 
-function parseVagaroTimeToMinutes(value) {
-  const raw = String(value || "").trim().toUpperCase();
+// ==============================
+// LL BROWS ACADEMY - GOOGLE CALENDAR HELPERS
+// ==============================
 
-  let match = raw.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/);
-  if (match) {
-    let hour = Number(match[1]);
-    const minute = Number(match[2]);
-    const meridiem = match[3];
-
-    if (
-      !Number.isInteger(hour) ||
-      !Number.isInteger(minute) ||
-      hour < 1 ||
-      hour > 12 ||
-      minute < 0 ||
-      minute > 59
-    ) {
-      return null;
-    }
-
-    if (hour === 12) hour = 0;
-    if (meridiem === "PM") hour += 12;
-
-    return hour * 60 + minute;
-  }
-
-  match = raw.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
-  if (match) {
-    const hour = Number(match[1]);
-    const minute = Number(match[2]);
-
-    if (
-      !Number.isInteger(hour) ||
-      !Number.isInteger(minute) ||
-      hour < 0 ||
-      hour > 23 ||
-      minute < 0 ||
-      minute > 59
-    ) {
-      return null;
-    }
-
-    return hour * 60 + minute;
-  }
-
-  return null;
+function isGoogleCalendarConfigured() {
+  return Boolean(
+    GOOGLE_SERVICE_ACCOUNT_EMAIL &&
+    GOOGLE_PRIVATE_KEY &&
+    GOOGLE_CALENDAR_ID
+  );
 }
 
-function buildLocalDateTime(date, minutesFromMidnight) {
-  const safeDate = formatDateOnly(date);
-  if (!safeDate || !Number.isInteger(minutesFromMidnight)) return null;
-
-  const [year, month, day] = safeDate.split("-").map(Number);
-
-  // Use UTC only as a timezone-neutral arithmetic container. We intentionally
-  // return a local date-time string without Z because Vagaro documents
-  // startTime/endTime as local time.
-  const d = new Date(Date.UTC(year, month - 1, day, 0, minutesFromMidnight, 0));
-
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const mm = String(d.getUTCMinutes()).padStart(2, "0");
-
-  return `${y}-${m}-${dd}T${hh}:${mm}:00`;
+function base64UrlJson(value) {
+  return Buffer.from(JSON.stringify(value))
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
 }
 
-function normalizeAvailableSlots(availability, fallbackDate) {
+async function getGoogleCalendarAccessToken() {
+  if (!isGoogleCalendarConfigured()) {
+    throw new Error(
+      "Google Calendar credentials are missing in Render environment variables."
+    );
+  }
+
+  const now = Date.now();
+
+  if (
+    googleAccessTokenCache.accessToken &&
+    googleAccessTokenCache.expiresAt &&
+    now < googleAccessTokenCache.expiresAt - 60 * 1000
+  ) {
+    return googleAccessTokenCache.accessToken;
+  }
+
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const expiresAt = issuedAt + 3600;
+
+  const header = {
+    alg: "RS256",
+    typ: "JWT"
+  };
+
+  const claim = {
+    iss: GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    scope: "https://www.googleapis.com/auth/calendar.events",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: issuedAt,
+    exp: expiresAt
+  };
+
+  const unsignedToken =
+    `${base64UrlJson(header)}.${base64UrlJson(claim)}`;
+
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(unsignedToken);
+  signer.end();
+
+  const signature = signer
+    .sign(GOOGLE_PRIVATE_KEY)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+
+  const assertion = `${unsignedToken}.${signature}`;
+
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion
+    }).toString()
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || !data?.access_token) {
+    console.error("Google OAuth error:", {
+      status: response.status,
+      error: data?.error,
+      error_description: data?.error_description
+    });
+
+    throw new Error(
+      data?.error_description ||
+      data?.error ||
+      "Could not generate Google Calendar access token."
+    );
+  }
+
+  const tokenExpiresIn = Number(data.expires_in || 3600);
+
+  googleAccessTokenCache = {
+    accessToken: data.access_token,
+    expiresAt: Date.now() + tokenExpiresIn * 1000
+  };
+
+  return googleAccessTokenCache.accessToken;
+}
+
+async function googleCalendarRequest(path, options = {}) {
+  const accessToken = await getGoogleCalendarAccessToken();
+
+  const response = await fetch(
+    `https://www.googleapis.com/calendar/v3${path}`,
+    {
+      method: options.method || "GET",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        accept: "application/json",
+        ...(options.body ? { "content-type": "application/json" } : {})
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    console.error("Google Calendar API error:", {
+      path,
+      status: response.status,
+      error: data?.error
+    });
+
+    throw new Error(
+      data?.error?.message ||
+      `Google Calendar API request failed (${response.status}).`
+    );
+  }
+
+  return data;
+}
+
+function normalizeAcademyAvailability(availability, fallbackDate) {
   return (availability?.data || []).flatMap((day) =>
     (day.timeSlot || []).map((time) => ({
       date: day.appointmentDate || fallbackDate,
       time,
-      minutes: parseVagaroTimeToMinutes(time)
+      professional: "Ludimilla Leite",
+      serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
+      serviceId: VAGARO_ACADEMY_SERVICE_ID,
+      serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
+      durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
     }))
   );
-}
-
-async function createVagaroPersonalTask({
-  name,
-  comment,
-  startTime,
-  endTime
-}) {
-  const body = {
-    businessId: VAGARO_BUSINESS_ID,
-    serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
-    personalTaskName: String(name || "LL Brows Academy").slice(0, 100),
-    personalTaskComment: String(comment || "").slice(0, 500),
-    personalTaskHexCode: VAGARO_ACADEMY_TASK_COLOR,
-    blockOnlineBooking: true,
-    startTime,
-    endTime
-  };
-
-  return vagaroRequest("/api/v2/personal-tasks/create", {
-    method: "POST",
-    scope: VAGARO_WRITE_EMPLOYEE_SCOPE,
-    body
-  });
-}
-
-async function retrieveAllVagaroServices() {
-  const pageSize = 100;
-  const allServices = [];
-
-  for (let pageNumber = 1; pageNumber <= 20; pageNumber++) {
-    const data = await vagaroRequest(
-      `/api/v2/services?pageNumber=${pageNumber}&pageSize=${pageSize}`,
-      {
-        method: "POST",
-        scope: VAGARO_SCOPE,
-        body: {
-          businessId: VAGARO_BUSINESS_ID
-        }
-      }
-    );
-
-    const services = Array.isArray(data?.data?.services)
-      ? data.data.services
-      : [];
-
-    allServices.push(...services);
-
-    const nextPage = String(data?.data?.nextPage || "").trim();
-    if (!nextPage || services.length < pageSize) break;
-  }
-
-  return allServices;
-}
-
-function getLudimillaServiceSummary(service = {}) {
-  const performers = Array.isArray(service.servicePerformedBy)
-    ? service.servicePerformedBy
-    : [];
-
-  const ludimilla = performers.find(
-    (item) => item?.serviceProviderId === VAGARO_LUDIMILLA_PROVIDER_ID
-  );
-
-  if (!ludimilla) return null;
-
-  return {
-    serviceId: service.serviceId || "",
-    serviceTitle: service.serviceTitle || "",
-    parentServiceId: service.parentServiceId || "",
-    parentServiceTitle: service.parentServiceTitle || "",
-    showOnlineStatus: service.showOnlineStatus || "",
-    type: service.type || "",
-    serviceProviderId: ludimilla.serviceProviderId,
-    durationMinutes: Number(ludimilla.durationMinutes || 0),
-    price: Number(ludimilla.price || 0),
-    priceWithTax: Number(ludimilla.priceWithTax || 0),
-    currency: ludimilla.currency || service.currency || "USD"
-  };
 }
 
 // ==============================
@@ -2274,82 +2264,9 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
 // ROUTES - VAGARO FASE 1
 // ==============================
 
-// LL BROWS ACADEMY — permission check.
-// This only verifies that Vagaro can issue a token with write_employee.
-// It does NOT create, update or delete any task.
-app.get("/vagaro/academy-write-access-check", checkoutLimiter, async (req, res) => {
-  try {
-    await getVagaroAccessToken(VAGARO_WRITE_EMPLOYEE_SCOPE);
-
-    return res.json({
-      status: 200,
-      ok: true,
-      scope: VAGARO_WRITE_EMPLOYEE_SCOPE,
-      message: "Vagaro write_employee access is available."
-    });
-  } catch (err) {
-    console.error("Erro /vagaro/academy-write-access-check:", err);
-
-    return res.status(403).json({
-      status: 403,
-      ok: false,
-      scope: VAGARO_WRITE_EMPLOYEE_SCOPE,
-      error: "Vagaro write_employee access is not available.",
-      details: err.message
-    });
-  }
-});
-
-// LL BROWS ACADEMY — service discovery helper.
-// Returns only services assigned to Ludimilla. No access token or credentials
-// are exposed to the browser. This route can be removed after the Academy
-// service ID is confirmed and saved in Render.
-app.get("/vagaro/academy-service-candidates", checkoutLimiter, async (req, res) => {
-  try {
-    const services = await retrieveAllVagaroServices();
-
-    const candidates = services
-      .map(getLudimillaServiceSummary)
-      .filter(Boolean)
-      .sort((a, b) => {
-        const a45 = a.durationMinutes === VAGARO_ACADEMY_DURATION_MINUTES ? 0 : 1;
-        const b45 = b.durationMinutes === VAGARO_ACADEMY_DURATION_MINUTES ? 0 : 1;
-        if (a45 !== b45) return a45 - b45;
-        return a.serviceTitle.localeCompare(b.serviceTitle);
-      });
-
-    const exactTitle = normalizeKey(VAGARO_ACADEMY_SERVICE_TITLE);
-    const recommended = candidates.filter(
-      (item) =>
-        normalizeKey(item.serviceTitle) === exactTitle ||
-        item.durationMinutes === VAGARO_ACADEMY_DURATION_MINUTES
-    );
-
-    return res.json({
-      status: 200,
-      professional: {
-        name: "Ludimilla Leite",
-        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
-      },
-      target: {
-        title: VAGARO_ACADEMY_SERVICE_TITLE,
-        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
-        configuredServiceId: VAGARO_ACADEMY_SERVICE_ID || null
-      },
-      recommended,
-      services: candidates
-    });
-  } catch (err) {
-    console.error("Erro /vagaro/academy-service-candidates:", err);
-    return res.status(500).json({
-      error: "Could not retrieve Vagaro services",
-      details: err.message
-    });
-  }
-});
-
-// LL BROWS ACADEMY — availability search.
-// Independent from Stripe; uses the same Vagaro business/calendar and Ludimilla.
+// LL Brows Academy availability.
+// Uses the same Vagaro business/provider as LL Touch, but does not depend on
+// Stripe checkout or alter the existing LL Touch /vagaro/availability route.
 app.post("/vagaro/academy-availability", checkoutLimiter, async (req, res) => {
   try {
     const date = formatDateOnly(req.body?.date);
@@ -2360,28 +2277,11 @@ app.post("/vagaro/academy-availability", checkoutLimiter, async (req, res) => {
       });
     }
 
-    if (!VAGARO_ACADEMY_SERVICE_ID) {
-      return res.status(503).json({
-        error:
-          "Academy scheduling is not configured. Set VAGARO_ACADEMY_SERVICE_ID in Render."
-      });
-    }
-
     const availability = await searchVagaroAvailability({
       date,
       serviceId: VAGARO_ACADEMY_SERVICE_ID,
       addOnIds: []
     });
-
-    const slots = normalizeAvailableSlots(availability, date).map((slot) => ({
-      date: slot.date,
-      time: slot.time,
-      professional: "Ludimilla Leite",
-      serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
-      serviceId: VAGARO_ACADEMY_SERVICE_ID,
-      serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
-      durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
-    }));
 
     return res.json({
       status: 200,
@@ -2397,7 +2297,7 @@ app.post("/vagaro/academy-availability", checkoutLimiter, async (req, res) => {
         name: "Ludimilla Leite",
         serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
       },
-      slots
+      slots: normalizeAcademyAvailability(availability, date)
     });
   } catch (err) {
     console.error("Erro /vagaro/academy-availability:", err);
@@ -2409,138 +2309,41 @@ app.post("/vagaro/academy-availability", checkoutLimiter, async (req, res) => {
   }
 });
 
-// LL BROWS ACADEMY — final reservation.
-// Re-checks the selected slot and then creates a Vagaro Personal Task that
-// blocks online booking for 45 minutes on Ludimilla's calendar.
-app.post("/vagaro/academy-reserve", checkoutLimiter, async (req, res) => {
+// Safe Google Calendar connectivity test.
+// READ-ONLY: it does not create, update or delete any event.
+app.get("/academy/google-calendar-check", checkoutLimiter, async (req, res) => {
   try {
-    const date = formatDateOnly(req.body?.date);
-    const time = cleanLeadField(req.body?.time, 30);
-    const fullName = cleanLeadField(req.body?.full_name || req.body?.name, 100);
-    const email = cleanLeadField(req.body?.email, 180);
-    const phone = cleanLeadField(req.body?.phone, 60);
-
-    if (!date) {
-      return res.status(400).json({
-        error: "Invalid date. Use YYYY-MM-DD."
-      });
-    }
-
-    const requestedMinutes = parseVagaroTimeToMinutes(time);
-    if (requestedMinutes === null) {
-      return res.status(400).json({
-        error: "Invalid time."
-      });
-    }
-
-    if (email && !isValidEmail(email)) {
-      return res.status(400).json({
-        error: "Invalid email."
-      });
-    }
-
-    if (!VAGARO_ACADEMY_SERVICE_ID) {
+    if (!isGoogleCalendarConfigured()) {
       return res.status(503).json({
-        error:
-          "Academy scheduling is not configured. Set VAGARO_ACADEMY_SERVICE_ID in Render."
+        ok: false,
+        error: "Google Calendar environment variables are incomplete."
       });
     }
 
-    // Important race-condition protection:
-    // re-check Vagaro immediately before creating the blocking Personal Task.
-    const availability = await searchVagaroAvailability({
-      date,
-      serviceId: VAGARO_ACADEMY_SERVICE_ID,
-      addOnIds: []
-    });
-
-    const availableSlots = normalizeAvailableSlots(availability, date);
-
-    const matchedSlot = availableSlots.find(
-      (slot) =>
-        slot.date === date &&
-        slot.minutes !== null &&
-        slot.minutes === requestedMinutes
+    const encodedCalendarId = encodeURIComponent(GOOGLE_CALENDAR_ID);
+    const data = await googleCalendarRequest(
+      `/calendars/${encodedCalendarId}/events?maxResults=1&singleEvents=true`
     );
-
-    if (!matchedSlot) {
-      return res.status(409).json({
-        error:
-          "This time is no longer available. Please return to the calendar and choose another time.",
-        code: "SLOT_NO_LONGER_AVAILABLE"
-      });
-    }
-
-    const startTime = buildLocalDateTime(date, requestedMinutes);
-    const endTime = buildLocalDateTime(
-      date,
-      requestedMinutes + VAGARO_ACADEMY_DURATION_MINUTES
-    );
-
-    if (!startTime || !endTime) {
-      return res.status(400).json({
-        error: "Could not build appointment time."
-      });
-    }
-
-    const taskName = fullName
-      ? `LL Brows Academy — ${fullName}`
-      : "LL Brows Academy — Private Career Audit";
-
-    const taskComment = [
-      VAGARO_ACADEMY_SERVICE_TITLE,
-      fullName ? `Candidate: ${fullName}` : "",
-      email ? `Email: ${email}` : "",
-      phone ? `Phone: ${phone}` : "",
-      "Source: LL Brows Academy funnel"
-    ]
-      .filter(Boolean)
-      .join(" | ");
-
-    const created = await createVagaroPersonalTask({
-      name: taskName,
-      comment: taskComment,
-      startTime,
-      endTime
-    });
-
-    const personalTaskIds = Array.isArray(created?.data?.personalTaskIds)
-      ? created.data.personalTaskIds
-      : [];
 
     return res.json({
       status: 200,
-      success: true,
-      message: "Academy session reserved successfully.",
-      reservation: {
-        date,
-        time: matchedSlot.time,
-        startTime,
-        endTime,
-        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
-        professional: "Ludimilla Leite",
-        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
-        serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
-        blockOnlineBooking: true,
-        personalTaskIds
-      }
+      ok: true,
+      calendarConfigured: true,
+      serviceAccount: GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      timezone: GOOGLE_CALENDAR_TIMEZONE,
+      calendarAccessible: true,
+      sampleEventsReturned: Array.isArray(data?.items) ? data.items.length : 0,
+      message: "Google Calendar connection is working."
     });
   } catch (err) {
-    console.error("Erro /vagaro/academy-reserve:", err);
-
-    const message = String(err?.message || "");
-
-    if (/unauthor|forbidden|scope|access/i.test(message)) {
-      return res.status(403).json({
-        error:
-          "Vagaro did not authorize Personal Task creation. Confirm that the API credentials have the write_employee access level.",
-        details: message
-      });
-    }
+    console.error("Erro /academy/google-calendar-check:", err);
 
     return res.status(500).json({
-      error: "Could not reserve the Academy session in Vagaro",
-      details: message
+      status: 500,
+      ok: false,
+      calendarAccessible: false,
+      error: "Google Calendar connection failed.",
+      details: err.message
     });
   }
 });
@@ -2738,19 +2541,14 @@ app.get("/health", (_, res) => {
       configured: isVagaroConfigured(),
       region: VAGARO_REGION,
       scope: VAGARO_SCOPE,
-      writeEmployeeScope: VAGARO_WRITE_EMPLOYEE_SCOPE,
       businessId: VAGARO_BUSINESS_ID,
-      professional: "Ludimilla Leite",
-      academy: {
-        writeAccessCheckRoute: "/vagaro/academy-write-access-check",
-        serviceCandidatesRoute: "/vagaro/academy-service-candidates",
-        availabilityRoute: "/vagaro/academy-availability",
-        reserveRoute: "/vagaro/academy-reserve",
-        serviceConfigured: Boolean(VAGARO_ACADEMY_SERVICE_ID),
-        serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
-        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
-        blockOnlineBooking: true
-      }
+      professional: "Ludimilla Leite"
+    },
+    academyCalendar: {
+      configured: isGoogleCalendarConfigured(),
+      timezone: GOOGLE_CALENDAR_TIMEZONE,
+      availabilityRoute: "/vagaro/academy-availability",
+      googleCheckRoute: "/academy/google-calendar-check"
     }
   });
 });
