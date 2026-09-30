@@ -691,7 +691,15 @@ const MORPHEUS_CONSULTATION_FEE = 50;
 // ==============================
 
 const VAGARO_REGION = process.env.VAGARO_REGION || "us03";
+
+// Keep read access for availability/search operations already used by LL Touch.
 const VAGARO_SCOPE = process.env.VAGARO_SCOPE || "read_access";
+
+// Personal Task creation requires the write_employee scope according to the
+// Vagaro Create Personal Task API documentation.
+const VAGARO_WRITE_EMPLOYEE_SCOPE =
+  process.env.VAGARO_WRITE_EMPLOYEE_SCOPE || "write_employee";
+
 const VAGARO_BUSINESS_ID =
   process.env.VAGARO_BUSINESS_ID || "u70rCIZg8Li86bNB7KxwcA==";
 const VAGARO_LUDIMILLA_PROVIDER_ID =
@@ -699,30 +707,46 @@ const VAGARO_LUDIMILLA_PROVIDER_ID =
 const VAGARO_LISTING_URL =
   process.env.VAGARO_LISTING_URL || "https://www.vagaro.com/llbrows/book-now";
 
+// LL Brows Academy uses a fixed 45-minute scheduling service only to search
+// real availability. Its service ID must be configured in Render.
+const VAGARO_ACADEMY_SERVICE_ID =
+  String(process.env.VAGARO_ACADEMY_SERVICE_ID || "").trim();
+
+const VAGARO_ACADEMY_SERVICE_TITLE =
+  String(
+    process.env.VAGARO_ACADEMY_SERVICE_TITLE ||
+      "Private PMU Career & Business Audit"
+  ).trim();
+
+const VAGARO_ACADEMY_DURATION_MINUTES = 45;
+const VAGARO_ACADEMY_TASK_COLOR =
+  String(process.env.VAGARO_ACADEMY_TASK_COLOR || "#8B55B3").trim();
+
 const VAGARO_BASE_URL = `https://api.vagaro.com/${VAGARO_REGION}`;
 
-let vagaroTokenCache = {
-  accessToken: null,
-  expiresAt: 0
-};
+// Tokens are cached separately by scope so read_access and write_employee
+// never interfere with one another.
+const vagaroTokenCache = new Map();
 
 function isVagaroConfigured() {
   return Boolean(process.env.VAGARO_CLIENT_ID && process.env.VAGARO_CLIENT_SECRET);
 }
 
-async function getVagaroAccessToken() {
+async function getVagaroAccessToken(scope = VAGARO_SCOPE) {
   if (!isVagaroConfigured()) {
     throw new Error("Vagaro credentials are missing in Render environment variables.");
   }
 
+  const normalizedScope = String(scope || VAGARO_SCOPE).trim();
+  const cached = vagaroTokenCache.get(normalizedScope);
   const now = Date.now();
 
   if (
-    vagaroTokenCache.accessToken &&
-    vagaroTokenCache.expiresAt &&
-    now < vagaroTokenCache.expiresAt - 60 * 1000
+    cached?.accessToken &&
+    cached?.expiresAt &&
+    now < cached.expiresAt - 60 * 1000
   ) {
-    return vagaroTokenCache.accessToken;
+    return cached.accessToken;
   }
 
   const response = await fetch(
@@ -736,7 +760,7 @@ async function getVagaroAccessToken() {
       body: JSON.stringify({
         clientId: process.env.VAGARO_CLIENT_ID,
         clientSecretKey: process.env.VAGARO_CLIENT_SECRET,
-        scope: VAGARO_SCOPE
+        scope: normalizedScope
       })
     }
   );
@@ -744,22 +768,30 @@ async function getVagaroAccessToken() {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok || data?.status !== 200 || !data?.data?.access_token) {
-    console.error("Erro gerando token Vagaro:", data);
-    throw new Error(data?.message || "Could not generate Vagaro access token");
+    console.error("Erro gerando token Vagaro:", {
+      scope: normalizedScope,
+      status: response.status,
+      data
+    });
+    throw new Error(
+      data?.message ||
+        `Could not generate Vagaro access token for scope ${normalizedScope}`
+    );
   }
 
   const expiresIn = Number(data.data.expires_in || 3600);
 
-  vagaroTokenCache = {
+  vagaroTokenCache.set(normalizedScope, {
     accessToken: data.data.access_token,
     expiresAt: Date.now() + expiresIn * 1000
-  };
+  });
 
-  return vagaroTokenCache.accessToken;
+  return data.data.access_token;
 }
 
 async function vagaroRequest(path, options = {}) {
-  const accessToken = await getVagaroAccessToken();
+  const scope = options.scope || VAGARO_SCOPE;
+  const accessToken = await getVagaroAccessToken(scope);
 
   const response = await fetch(`${VAGARO_BASE_URL}${path}`, {
     method: options.method || "POST",
@@ -1535,6 +1567,7 @@ async function searchVagaroAvailability({ date, serviceId, addOnIds = [] }) {
 
   const data = await vagaroRequest("/api/v2/appointments/availability", {
     method: "POST",
+    scope: VAGARO_SCOPE,
     body
   });
 
@@ -1552,6 +1585,163 @@ async function searchVagaroAvailability({ date, serviceId, addOnIds = [] }) {
     responseCode: data.responseCode,
     message: data.message,
     data: normalized
+  };
+}
+
+function parseVagaroTimeToMinutes(value) {
+  const raw = String(value || "").trim().toUpperCase();
+
+  let match = raw.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/);
+  if (match) {
+    let hour = Number(match[1]);
+    const minute = Number(match[2]);
+    const meridiem = match[3];
+
+    if (
+      !Number.isInteger(hour) ||
+      !Number.isInteger(minute) ||
+      hour < 1 ||
+      hour > 12 ||
+      minute < 0 ||
+      minute > 59
+    ) {
+      return null;
+    }
+
+    if (hour === 12) hour = 0;
+    if (meridiem === "PM") hour += 12;
+
+    return hour * 60 + minute;
+  }
+
+  match = raw.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (match) {
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+
+    if (
+      !Number.isInteger(hour) ||
+      !Number.isInteger(minute) ||
+      hour < 0 ||
+      hour > 23 ||
+      minute < 0 ||
+      minute > 59
+    ) {
+      return null;
+    }
+
+    return hour * 60 + minute;
+  }
+
+  return null;
+}
+
+function buildLocalDateTime(date, minutesFromMidnight) {
+  const safeDate = formatDateOnly(date);
+  if (!safeDate || !Number.isInteger(minutesFromMidnight)) return null;
+
+  const [year, month, day] = safeDate.split("-").map(Number);
+
+  // Use UTC only as a timezone-neutral arithmetic container. We intentionally
+  // return a local date-time string without Z because Vagaro documents
+  // startTime/endTime as local time.
+  const d = new Date(Date.UTC(year, month - 1, day, 0, minutesFromMidnight, 0));
+
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+
+  return `${y}-${m}-${dd}T${hh}:${mm}:00`;
+}
+
+function normalizeAvailableSlots(availability, fallbackDate) {
+  return (availability?.data || []).flatMap((day) =>
+    (day.timeSlot || []).map((time) => ({
+      date: day.appointmentDate || fallbackDate,
+      time,
+      minutes: parseVagaroTimeToMinutes(time)
+    }))
+  );
+}
+
+async function createVagaroPersonalTask({
+  name,
+  comment,
+  startTime,
+  endTime
+}) {
+  const body = {
+    businessId: VAGARO_BUSINESS_ID,
+    serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
+    personalTaskName: String(name || "LL Brows Academy").slice(0, 100),
+    personalTaskComment: String(comment || "").slice(0, 500),
+    personalTaskHexCode: VAGARO_ACADEMY_TASK_COLOR,
+    blockOnlineBooking: true,
+    startTime,
+    endTime
+  };
+
+  return vagaroRequest("/api/v2/personal-tasks/create", {
+    method: "POST",
+    scope: VAGARO_WRITE_EMPLOYEE_SCOPE,
+    body
+  });
+}
+
+async function retrieveAllVagaroServices() {
+  const pageSize = 100;
+  const allServices = [];
+
+  for (let pageNumber = 1; pageNumber <= 20; pageNumber++) {
+    const data = await vagaroRequest(
+      `/api/v2/services?pageNumber=${pageNumber}&pageSize=${pageSize}`,
+      {
+        method: "POST",
+        scope: VAGARO_SCOPE,
+        body: {
+          businessId: VAGARO_BUSINESS_ID
+        }
+      }
+    );
+
+    const services = Array.isArray(data?.data?.services)
+      ? data.data.services
+      : [];
+
+    allServices.push(...services);
+
+    const nextPage = String(data?.data?.nextPage || "").trim();
+    if (!nextPage || services.length < pageSize) break;
+  }
+
+  return allServices;
+}
+
+function getLudimillaServiceSummary(service = {}) {
+  const performers = Array.isArray(service.servicePerformedBy)
+    ? service.servicePerformedBy
+    : [];
+
+  const ludimilla = performers.find(
+    (item) => item?.serviceProviderId === VAGARO_LUDIMILLA_PROVIDER_ID
+  );
+
+  if (!ludimilla) return null;
+
+  return {
+    serviceId: service.serviceId || "",
+    serviceTitle: service.serviceTitle || "",
+    parentServiceId: service.parentServiceId || "",
+    parentServiceTitle: service.parentServiceTitle || "",
+    showOnlineStatus: service.showOnlineStatus || "",
+    type: service.type || "",
+    serviceProviderId: ludimilla.serviceProviderId,
+    durationMinutes: Number(ludimilla.durationMinutes || 0),
+    price: Number(ludimilla.price || 0),
+    priceWithTax: Number(ludimilla.priceWithTax || 0),
+    currency: ludimilla.currency || service.currency || "USD"
   };
 }
 
@@ -2081,6 +2271,251 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
 // ROUTES - VAGARO FASE 1
 // ==============================
 
+// LL BROWS ACADEMY — service discovery helper.
+// Returns only services assigned to Ludimilla. No access token or credentials
+// are exposed to the browser. This route can be removed after the Academy
+// service ID is confirmed and saved in Render.
+app.get("/vagaro/academy-service-candidates", checkoutLimiter, async (req, res) => {
+  try {
+    const services = await retrieveAllVagaroServices();
+
+    const candidates = services
+      .map(getLudimillaServiceSummary)
+      .filter(Boolean)
+      .sort((a, b) => {
+        const a45 = a.durationMinutes === VAGARO_ACADEMY_DURATION_MINUTES ? 0 : 1;
+        const b45 = b.durationMinutes === VAGARO_ACADEMY_DURATION_MINUTES ? 0 : 1;
+        if (a45 !== b45) return a45 - b45;
+        return a.serviceTitle.localeCompare(b.serviceTitle);
+      });
+
+    const exactTitle = normalizeKey(VAGARO_ACADEMY_SERVICE_TITLE);
+    const recommended = candidates.filter(
+      (item) =>
+        normalizeKey(item.serviceTitle) === exactTitle ||
+        item.durationMinutes === VAGARO_ACADEMY_DURATION_MINUTES
+    );
+
+    return res.json({
+      status: 200,
+      professional: {
+        name: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+      },
+      target: {
+        title: VAGARO_ACADEMY_SERVICE_TITLE,
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
+        configuredServiceId: VAGARO_ACADEMY_SERVICE_ID || null
+      },
+      recommended,
+      services: candidates
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/academy-service-candidates:", err);
+    return res.status(500).json({
+      error: "Could not retrieve Vagaro services",
+      details: err.message
+    });
+  }
+});
+
+// LL BROWS ACADEMY — availability search.
+// Independent from Stripe; uses the same Vagaro business/calendar and Ludimilla.
+app.post("/vagaro/academy-availability", checkoutLimiter, async (req, res) => {
+  try {
+    const date = formatDateOnly(req.body?.date);
+
+    if (!date) {
+      return res.status(400).json({
+        error: "Invalid date. Use YYYY-MM-DD."
+      });
+    }
+
+    if (!VAGARO_ACADEMY_SERVICE_ID) {
+      return res.status(503).json({
+        error:
+          "Academy scheduling is not configured. Set VAGARO_ACADEMY_SERVICE_ID in Render."
+      });
+    }
+
+    const availability = await searchVagaroAvailability({
+      date,
+      serviceId: VAGARO_ACADEMY_SERVICE_ID,
+      addOnIds: []
+    });
+
+    const slots = normalizeAvailableSlots(availability, date).map((slot) => ({
+      date: slot.date,
+      time: slot.time,
+      professional: "Ludimilla Leite",
+      serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
+      serviceId: VAGARO_ACADEMY_SERVICE_ID,
+      serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
+      durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
+    }));
+
+    return res.json({
+      status: 200,
+      message: "Success",
+      source: "LL Brows Academy",
+      date,
+      service: {
+        serviceId: VAGARO_ACADEMY_SERVICE_ID,
+        title: VAGARO_ACADEMY_SERVICE_TITLE,
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
+      },
+      professional: {
+        name: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+      },
+      slots
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/academy-availability:", err);
+
+    return res.status(500).json({
+      error: "Could not load Academy Vagaro availability",
+      details: err.message
+    });
+  }
+});
+
+// LL BROWS ACADEMY — final reservation.
+// Re-checks the selected slot and then creates a Vagaro Personal Task that
+// blocks online booking for 45 minutes on Ludimilla's calendar.
+app.post("/vagaro/academy-reserve", checkoutLimiter, async (req, res) => {
+  try {
+    const date = formatDateOnly(req.body?.date);
+    const time = cleanLeadField(req.body?.time, 30);
+    const fullName = cleanLeadField(req.body?.full_name || req.body?.name, 100);
+    const email = cleanLeadField(req.body?.email, 180);
+    const phone = cleanLeadField(req.body?.phone, 60);
+
+    if (!date) {
+      return res.status(400).json({
+        error: "Invalid date. Use YYYY-MM-DD."
+      });
+    }
+
+    const requestedMinutes = parseVagaroTimeToMinutes(time);
+    if (requestedMinutes === null) {
+      return res.status(400).json({
+        error: "Invalid time."
+      });
+    }
+
+    if (email && !isValidEmail(email)) {
+      return res.status(400).json({
+        error: "Invalid email."
+      });
+    }
+
+    if (!VAGARO_ACADEMY_SERVICE_ID) {
+      return res.status(503).json({
+        error:
+          "Academy scheduling is not configured. Set VAGARO_ACADEMY_SERVICE_ID in Render."
+      });
+    }
+
+    // Important race-condition protection:
+    // re-check Vagaro immediately before creating the blocking Personal Task.
+    const availability = await searchVagaroAvailability({
+      date,
+      serviceId: VAGARO_ACADEMY_SERVICE_ID,
+      addOnIds: []
+    });
+
+    const availableSlots = normalizeAvailableSlots(availability, date);
+
+    const matchedSlot = availableSlots.find(
+      (slot) =>
+        slot.date === date &&
+        slot.minutes !== null &&
+        slot.minutes === requestedMinutes
+    );
+
+    if (!matchedSlot) {
+      return res.status(409).json({
+        error:
+          "This time is no longer available. Please return to the calendar and choose another time.",
+        code: "SLOT_NO_LONGER_AVAILABLE"
+      });
+    }
+
+    const startTime = buildLocalDateTime(date, requestedMinutes);
+    const endTime = buildLocalDateTime(
+      date,
+      requestedMinutes + VAGARO_ACADEMY_DURATION_MINUTES
+    );
+
+    if (!startTime || !endTime) {
+      return res.status(400).json({
+        error: "Could not build appointment time."
+      });
+    }
+
+    const taskName = fullName
+      ? `LL Brows Academy — ${fullName}`
+      : "LL Brows Academy — Private Career Audit";
+
+    const taskComment = [
+      VAGARO_ACADEMY_SERVICE_TITLE,
+      fullName ? `Candidate: ${fullName}` : "",
+      email ? `Email: ${email}` : "",
+      phone ? `Phone: ${phone}` : "",
+      "Source: LL Brows Academy funnel"
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    const created = await createVagaroPersonalTask({
+      name: taskName,
+      comment: taskComment,
+      startTime,
+      endTime
+    });
+
+    const personalTaskIds = Array.isArray(created?.data?.personalTaskIds)
+      ? created.data.personalTaskIds
+      : [];
+
+    return res.json({
+      status: 200,
+      success: true,
+      message: "Academy session reserved successfully.",
+      reservation: {
+        date,
+        time: matchedSlot.time,
+        startTime,
+        endTime,
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
+        professional: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
+        serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
+        blockOnlineBooking: true,
+        personalTaskIds
+      }
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/academy-reserve:", err);
+
+    const message = String(err?.message || "");
+
+    if (/unauthor|forbidden|scope|access/i.test(message)) {
+      return res.status(403).json({
+        error:
+          "Vagaro did not authorize Personal Task creation. Confirm that the API credentials have the write_employee access level.",
+        details: message
+      });
+    }
+
+    return res.status(500).json({
+      error: "Could not reserve the Academy session in Vagaro",
+      details: message
+    });
+  }
+});
+
 app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
   try {
     const sessionId = cleanLeadField(req.body.session_id, 120);
@@ -2274,8 +2709,18 @@ app.get("/health", (_, res) => {
       configured: isVagaroConfigured(),
       region: VAGARO_REGION,
       scope: VAGARO_SCOPE,
+      writeEmployeeScope: VAGARO_WRITE_EMPLOYEE_SCOPE,
       businessId: VAGARO_BUSINESS_ID,
-      professional: "Ludimilla Leite"
+      professional: "Ludimilla Leite",
+      academy: {
+        serviceCandidatesRoute: "/vagaro/academy-service-candidates",
+        availabilityRoute: "/vagaro/academy-availability",
+        reserveRoute: "/vagaro/academy-reserve",
+        serviceConfigured: Boolean(VAGARO_ACADEMY_SERVICE_ID),
+        serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES,
+        blockOnlineBooking: true
+      }
     }
   });
 });
