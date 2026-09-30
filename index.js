@@ -75,35 +75,56 @@ const supabase = createClient(
 // CUSTOMER HELPERS
 // ==============================
 
-async function getOrCreateCustomer(email) {
-  let { data: customer } = await supabase
-    .from("customers")
-    .select("*")
-    .eq("email", email)
-    .single();
+function buildFallbackCustomer(email = "") {
+  return {
+    email,
+    lifetime_total: 0,
+    laser_total: 0,
+    laser_tier: 0,
+    cashback_balance: 0,
+    first_purchase_used: false,
+    microneedling_discount_used: false,
+    facial_total: 0,
+    facial_discount_next: 0,
+    popup_unlocked: false
+  };
+}
 
-  if (!customer) {
-    const { data } = await supabase
+async function getOrCreateCustomer(email) {
+  const fallbackCustomer = buildFallbackCustomer(email);
+
+  try {
+    const { data: customer, error: selectError } = await supabase
       .from("customers")
-      .insert([{
-        email,
-        lifetime_total: 0,
-        laser_total: 0,
-        laser_tier: 0,
-        cashback_balance: 0,
-        first_purchase_used: false,
-        microneedling_discount_used: false,
-        facial_total: 0,
-        facial_discount_next: 0,
-        popup_unlocked: false
-      }])
+      .select("*")
+      .eq("email", email)
+      .maybeSingle();
+
+    if (selectError) {
+      console.error("Supabase customer lookup failed; checkout will continue without VIP/cashback discounts:", selectError);
+      return fallbackCustomer;
+    }
+
+    if (customer) {
+      return customer;
+    }
+
+    const { data: createdCustomer, error: insertError } = await supabase
+      .from("customers")
+      .insert([fallbackCustomer])
       .select()
       .single();
 
-    customer = data;
-  }
+    if (insertError || !createdCustomer) {
+      console.error("Supabase customer creation failed; checkout will continue without VIP/cashback discounts:", insertError);
+      return fallbackCustomer;
+    }
 
-  return customer;
+    return createdCustomer;
+  } catch (err) {
+    console.error("Supabase customer helper failed; checkout will continue without VIP/cashback discounts:", err);
+    return fallbackCustomer;
+  }
 }
 
 // ==============================
@@ -1445,6 +1466,11 @@ function computeLocalItemAmount(item) {
 }
 
 async function resolveDiscounts(customer, items) {
+  // Checkout must never fail only because the customer database is unavailable.
+  // When Supabase is down, use a zero-balance customer and create Stripe checkout
+  // normally; VIP/cashback/first-purchase discounts are simply not applied.
+  customer = customer || buildFallbackCustomer("");
+
   let hasFacial = false;
   let hasMicroneedlingSingle = false;
   let currentFacialPurchase = 0;
@@ -2525,6 +2551,37 @@ app.post("/unlock-popup", async (req, res) => {
 
 app.get("/", (_, res) => {
   res.send("LL Touch + LL Brows Stripe/Vagaro API running 🚀");
+});
+
+app.get("/health/supabase", async (_, res) => {
+  try {
+    const { error } = await supabase
+      .from("customers")
+      .select("email")
+      .limit(1);
+
+    if (error) {
+      return res.status(503).json({
+        ok: false,
+        supabaseReachable: false,
+        message: "Supabase responded with an error.",
+        details: error.message || String(error)
+      });
+    }
+
+    return res.json({
+      ok: true,
+      supabaseReachable: true,
+      message: "Supabase connection is working."
+    });
+  } catch (err) {
+    return res.status(503).json({
+      ok: false,
+      supabaseReachable: false,
+      message: "Supabase connection failed.",
+      details: err.message || String(err)
+    });
+  }
 });
 
 app.get("/health", (_, res) => {
