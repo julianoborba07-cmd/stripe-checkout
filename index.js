@@ -71,6 +71,13 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
+// LL Brows Academy uses a backend-only service-role key when available.
+// This is deliberately separate from the existing LL Touch Supabase client.
+const academySupabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY
+);
+
 // ==============================
 // CUSTOMER HELPERS
 // ==============================
@@ -755,6 +762,41 @@ let googleAccessTokenCache = {
   accessToken: null,
   expiresAt: 0
 };
+
+// ==============================
+// LL BROWS ACADEMY - PERSISTENCE / NOTIFICATIONS
+// ==============================
+
+const RESEND_API_KEY = String(process.env.RESEND_API_KEY || "").trim();
+const ACADEMY_EMAIL_FROM = String(process.env.ACADEMY_EMAIL_FROM || "").trim();
+const ACADEMY_REPLY_TO_EMAIL = String(
+  process.env.ACADEMY_REPLY_TO_EMAIL || ""
+).trim();
+
+const TWILIO_ACCOUNT_SID = String(
+  process.env.TWILIO_ACCOUNT_SID || ""
+).trim();
+const TWILIO_AUTH_TOKEN = String(
+  process.env.TWILIO_AUTH_TOKEN || ""
+).trim();
+const TWILIO_FROM_NUMBER = String(
+  process.env.TWILIO_FROM_NUMBER || ""
+).trim();
+const TWILIO_MESSAGING_SERVICE_SID = String(
+  process.env.TWILIO_MESSAGING_SERVICE_SID || ""
+).trim();
+
+const ACADEMY_PRECALL_URL = String(
+  process.env.ACADEMY_PRECALL_URL ||
+  "https://www.llbrows.com/pre-call"
+).trim();
+
+const ACADEMY_CRON_SECRET = String(
+  process.env.ACADEMY_CRON_SECRET || ""
+).trim();
+
+const ACADEMY_NOTIFICATION_MAX_ATTEMPTS = 3;
+const ACADEMY_NOTIFICATION_BATCH_SIZE = 25;
 
 function isVagaroConfigured() {
   return Boolean(process.env.VAGARO_CLIENT_ID && process.env.VAGARO_CLIENT_SECRET);
@@ -1996,6 +2038,718 @@ function extractAcademyTerms(body = {}) {
   };
 }
 
+function academyArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => cleanLeadField(item, 220)).filter(Boolean);
+  }
+
+  const single = cleanLeadField(value, 220);
+  return single ? [single] : [];
+}
+
+function academyUuid(value) {
+  const str = String(value || "").trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str)
+    ? str
+    : null;
+}
+
+function normalizeAcademyApplication(body = {}) {
+  return {
+    fullName: cleanLeadField(body.full_name || body.fullName || body.name, 120),
+    phone: cleanLeadField(body.phone, 60),
+    email: cleanLeadField(body.email, 180).toLowerCase(),
+    instagram: cleanLeadField(body.instagram, 120),
+    city: cleanLeadField(body.city, 120),
+    state: cleanLeadField(body.state, 120),
+    stage: cleanLeadField(body.stage, 220),
+    interest: cleanLeadField(body.interest, 120),
+    previousTraining: cleanLeadField(
+      body.previous_training || body.previousTraining,
+      220
+    ),
+    experience: cleanLeadField(body.experience, 3000),
+    goals: academyArray(body.goals),
+    challenges: academyArray(body.challenges),
+    timeline: cleanLeadField(body.timeline, 220),
+    investmentReadiness: cleanLeadField(
+      body.investment_readiness || body.investmentReadiness,
+      220
+    ),
+    notes: cleanLeadField(body.notes, 3000),
+    attendanceAgreement: academyTruthy(
+      body.attendance_agreement || body.attendanceAgreement
+    ),
+    smsReminders: academyTruthy(
+      body.sms_reminders || body.smsReminders
+    ),
+    marketingOptin: academyTruthy(
+      body.marketing_optin || body.marketingOptin
+    ),
+    source: cleanLeadField(
+      body.source || "LL Brows Academy Application",
+      160
+    )
+  };
+}
+
+function isAcademyEmailConfigured() {
+  return Boolean(RESEND_API_KEY && ACADEMY_EMAIL_FROM);
+}
+
+function isAcademySmsConfigured() {
+  return Boolean(
+    TWILIO_ACCOUNT_SID &&
+    TWILIO_AUTH_TOKEN &&
+    (TWILIO_FROM_NUMBER || TWILIO_MESSAGING_SERVICE_SID)
+  );
+}
+
+function normalizeAcademyPhoneE164(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  if (/^\+[1-9]\d{7,14}$/.test(raw.replace(/[^\d+]/g, ""))) {
+    return raw.replace(/[^\d+]/g, "");
+  }
+
+  const digits = raw.replace(/\D/g, "");
+
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+
+  return null;
+}
+
+function escapeAcademyHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function formatAcademyStart(startIso) {
+  const date = new Date(startIso);
+
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: GOOGLE_CALENDAR_TIMEZONE,
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short"
+  }).format(date);
+}
+
+function academyNotificationCopy(notification) {
+  const booking = notification.academy_bookings || notification.booking || {};
+  const fullName = cleanLeadField(booking.full_name, 120);
+  const firstName = fullName.split(/\s+/).filter(Boolean)[0] || "there";
+  const when = formatAcademyStart(booking.starts_at);
+  const safeWhen = escapeAcademyHtml(when);
+  const safeFirstName = escapeAcademyHtml(firstName);
+  const preCallUrl = escapeAcademyHtml(ACADEMY_PRECALL_URL);
+
+  if (notification.kind === "reminder_24h") {
+    return {
+      subject: "Your LL Brows Academy session is tomorrow",
+      text:
+        `Hi ${firstName}, this is a reminder that your private LL Brows Academy session with Ludimilla Leite is scheduled for ${when}. ` +
+        `Please set aside 45 minutes in a quiet place. Prepare here: ${ACADEMY_PRECALL_URL}`,
+      html:
+        `<p>Hi ${safeFirstName},</p>` +
+        `<p>Your private LL Brows Academy session with Ludimilla Leite is <strong>tomorrow</strong>.</p>` +
+        `<p><strong>${safeWhen}</strong></p>` +
+        `<p>Please set aside 45 minutes in a quiet place where you can focus.</p>` +
+        `<p><a href="${preCallUrl}">Review your pre-call preparation</a></p>` +
+        `<p>LL Brows Academy</p>`,
+      sms:
+        `LL Brows Academy reminder: your private session with Ludimilla is tomorrow, ${when}. Prepare: ${ACADEMY_PRECALL_URL}`
+    };
+  }
+
+  if (notification.kind === "reminder_2h") {
+    return {
+      subject: "Your LL Brows Academy session starts in about 2 hours",
+      text:
+        `Hi ${firstName}, your private LL Brows Academy session with Ludimilla Leite starts in about 2 hours. ` +
+        `Scheduled time: ${when}. Please join from a quiet place.`,
+      html:
+        `<p>Hi ${safeFirstName},</p>` +
+        `<p>Your private LL Brows Academy session with Ludimilla Leite starts in about <strong>2 hours</strong>.</p>` +
+        `<p><strong>${safeWhen}</strong></p>` +
+        `<p>Please join from a quiet place where you can focus.</p>` +
+        `<p>LL Brows Academy</p>`,
+      sms:
+        `LL Brows Academy reminder: your private session with Ludimilla starts in about 2 hours. ${when}.`
+    };
+  }
+
+  return {
+    subject: "Your LL Brows Academy private session is confirmed",
+    text:
+      `Hi ${firstName}, your private PMU Career & Business Audit with Ludimilla Leite is confirmed for ${when}. ` +
+      `The session is approximately 45 minutes. Prepare before the call: ${ACADEMY_PRECALL_URL}`,
+    html:
+      `<p>Hi ${safeFirstName},</p>` +
+      `<p>Your <strong>Private PMU Career &amp; Business Audit</strong> with Ludimilla Leite is confirmed.</p>` +
+      `<p><strong>${safeWhen}</strong></p>` +
+      `<p>Duration: approximately 45 minutes.</p>` +
+      `<p>Before the call, please complete the short preparation here:</p>` +
+      `<p><a href="${preCallUrl}">${preCallUrl}</a></p>` +
+      `<p>We look forward to learning more about your goals.</p>` +
+      `<p>LL Brows Academy</p>`,
+    sms:
+      `LL Brows Academy: your private session with Ludimilla is confirmed for ${when}. Prepare here: ${ACADEMY_PRECALL_URL}`
+  };
+}
+
+async function sendAcademyEmail({
+  to,
+  subject,
+  text,
+  html,
+  idempotencyKey
+}) {
+  if (!isAcademyEmailConfigured()) {
+    throw new Error("Resend email is not configured.");
+  }
+
+  const payload = {
+    from: ACADEMY_EMAIL_FROM,
+    to: [to],
+    subject,
+    text,
+    html
+  };
+
+  if (ACADEMY_REPLY_TO_EMAIL) {
+    payload.reply_to = ACADEMY_REPLY_TO_EMAIL;
+  }
+
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${RESEND_API_KEY}`,
+      "content-type": "application/json",
+      "Idempotency-Key": String(idempotencyKey || "").slice(0, 256)
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const message =
+      data?.message ||
+      data?.error?.message ||
+      `Resend request failed (${response.status}).`;
+    throw new Error(message);
+  }
+
+  return {
+    provider: "resend",
+    id: data?.id || null
+  };
+}
+
+async function sendAcademySms({
+  to,
+  body
+}) {
+  if (!isAcademySmsConfigured()) {
+    throw new Error("Twilio SMS is not configured.");
+  }
+
+  const normalizedTo = normalizeAcademyPhoneE164(to);
+
+  if (!normalizedTo) {
+    throw new Error("Candidate phone number is not valid for SMS.");
+  }
+
+  const form = new URLSearchParams({
+    To: normalizedTo,
+    Body: body
+  });
+
+  if (TWILIO_MESSAGING_SERVICE_SID) {
+    form.set("MessagingServiceSid", TWILIO_MESSAGING_SERVICE_SID);
+  } else {
+    form.set("From", TWILIO_FROM_NUMBER);
+  }
+
+  const basic = Buffer.from(
+    `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+  ).toString("base64");
+
+  const response = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Messages.json`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Basic ${basic}`,
+        "content-type": "application/x-www-form-urlencoded"
+      },
+      body: form.toString()
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(
+      data?.message ||
+      `Twilio request failed (${response.status}).`
+    );
+  }
+
+  return {
+    provider: "twilio",
+    id: data?.sid || null
+  };
+}
+
+async function resolveAcademyApplicationId(email, suppliedId) {
+  const validSuppliedId = academyUuid(suppliedId);
+  if (validSuppliedId) return validSuppliedId;
+
+  try {
+    const { data, error } = await academySupabase
+      .from("academy_applications")
+      .select("id")
+      .eq("email", String(email || "").trim().toLowerCase())
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Academy application lookup failed:", error);
+      return null;
+    }
+
+    return data?.id || null;
+  } catch (err) {
+    console.error("Academy application lookup exception:", err);
+    return null;
+  }
+}
+
+async function persistAcademyBooking({
+  applicationId,
+  candidate,
+  terms,
+  appointment,
+  selectedTime,
+  startUtc,
+  endUtc,
+  eventId,
+  bookingFingerprint
+}) {
+  const resolvedApplicationId = await resolveAcademyApplicationId(
+    candidate.email,
+    applicationId
+  );
+
+  const record = {
+    application_id: resolvedApplicationId,
+    google_event_id: eventId,
+    booking_fingerprint: bookingFingerprint,
+    full_name: candidate.fullName,
+    email: candidate.email,
+    phone: candidate.phone,
+    appointment_date: appointment.date,
+    appointment_time: selectedTime,
+    starts_at: startUtc.toISOString(),
+    ends_at: endUtc.toISOString(),
+    timezone: GOOGLE_CALENDAR_TIMEZONE,
+    service: VAGARO_ACADEMY_SERVICE_TITLE,
+    professional: "Ludimilla Leite",
+    reminders_consent: Boolean(terms.reminders),
+    status: "confirmed",
+    updated_at: new Date().toISOString()
+  };
+
+  const { data, error } = await academySupabase
+    .from("academy_bookings")
+    .upsert(record, { onConflict: "google_event_id" })
+    .select(
+      "id, application_id, google_event_id, booking_fingerprint, full_name, email, phone, appointment_date, appointment_time, starts_at, ends_at, timezone, service, professional, reminders_consent, status, created_at, updated_at"
+    )
+    .single();
+
+  if (error || !data) {
+    throw new Error(
+      error?.message ||
+      "Could not persist Academy booking."
+    );
+  }
+
+  return data;
+}
+
+async function queueAcademyNotifications(booking) {
+  const rows = [];
+  const now = Date.now();
+  const startsAtMs = new Date(booking.starts_at).getTime();
+  const email = String(booking.email || "").trim().toLowerCase();
+  const phone = normalizeAcademyPhoneE164(booking.phone);
+
+  if (email) {
+    rows.push({
+      booking_id: booking.id,
+      channel: "email",
+      kind: "confirmation",
+      recipient: email,
+      scheduled_at: new Date(now).toISOString(),
+      status: "pending"
+    });
+  }
+
+  if (booking.reminders_consent && phone) {
+    rows.push({
+      booking_id: booking.id,
+      channel: "sms",
+      kind: "confirmation",
+      recipient: phone,
+      scheduled_at: new Date(now).toISOString(),
+      status: "pending"
+    });
+  }
+
+  if (booking.reminders_consent) {
+    const reminderSchedule = [
+      ["reminder_24h", 24 * 60 * 60 * 1000],
+      ["reminder_2h", 2 * 60 * 60 * 1000]
+    ];
+
+    for (const [kind, beforeMs] of reminderSchedule) {
+      const scheduledAtMs = startsAtMs - beforeMs;
+
+      // Only create reminders that are still meaningfully in the future.
+      if (scheduledAtMs <= now + 5 * 60 * 1000) continue;
+
+      if (email) {
+        rows.push({
+          booking_id: booking.id,
+          channel: "email",
+          kind,
+          recipient: email,
+          scheduled_at: new Date(scheduledAtMs).toISOString(),
+          status: "pending"
+        });
+      }
+
+      if (phone) {
+        rows.push({
+          booking_id: booking.id,
+          channel: "sms",
+          kind,
+          recipient: phone,
+          scheduled_at: new Date(scheduledAtMs).toISOString(),
+          status: "pending"
+        });
+      }
+    }
+  }
+
+  if (!rows.length) {
+    return {
+      queued: 0
+    };
+  }
+
+  const { error } = await academySupabase
+    .from("academy_notifications")
+    .upsert(rows, {
+      onConflict: "booking_id,channel,kind",
+      ignoreDuplicates: true
+    });
+
+  if (error) {
+    throw new Error(
+      error.message ||
+      "Could not queue Academy notifications."
+    );
+  }
+
+  return {
+    queued: rows.length
+  };
+}
+
+async function claimAcademyNotification(row) {
+  const nextAttempts = Number(row.attempts || 0) + 1;
+
+  const { data, error } = await academySupabase
+    .from("academy_notifications")
+    .update({
+      status: "processing",
+      attempts: nextAttempts,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", row.id)
+    .in("status", ["pending", "failed"])
+    .select("id, attempts")
+    .maybeSingle();
+
+  if (error || !data) return null;
+
+  return {
+    ...row,
+    attempts: Number(data.attempts || nextAttempts)
+  };
+}
+
+async function processAcademyNotificationRow(row) {
+  const claimed = await claimAcademyNotification(row);
+  if (!claimed) {
+    return {
+      id: row.id,
+      skipped: true
+    };
+  }
+
+  try {
+    const copy = academyNotificationCopy(claimed);
+    let providerResult;
+
+    if (claimed.channel === "email") {
+      providerResult = await sendAcademyEmail({
+        to: claimed.recipient,
+        subject: copy.subject,
+        text: copy.text,
+        html: copy.html,
+        idempotencyKey:
+          `academy/${claimed.booking_id}/${claimed.kind}/email`
+      });
+    } else if (claimed.channel === "sms") {
+      providerResult = await sendAcademySms({
+        to: claimed.recipient,
+        body: copy.sms
+      });
+    } else {
+      throw new Error("Unsupported Academy notification channel.");
+    }
+
+    await academySupabase
+      .from("academy_notifications")
+      .update({
+        status: "sent",
+        provider_id: providerResult?.id || null,
+        provider: providerResult?.provider || null,
+        sent_at: new Date().toISOString(),
+        last_error: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", claimed.id);
+
+    return {
+      id: claimed.id,
+      sent: true,
+      channel: claimed.channel,
+      kind: claimed.kind,
+      providerId: providerResult?.id || null
+    };
+  } catch (err) {
+    const finalStatus =
+      claimed.attempts >= ACADEMY_NOTIFICATION_MAX_ATTEMPTS
+        ? "failed"
+        : "failed";
+
+    await academySupabase
+      .from("academy_notifications")
+      .update({
+        status: finalStatus,
+        last_error: String(err?.message || err).slice(0, 1200),
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", claimed.id);
+
+    return {
+      id: claimed.id,
+      sent: false,
+      channel: claimed.channel,
+      kind: claimed.kind,
+      error: String(err?.message || err)
+    };
+  }
+}
+
+async function processAcademyNotificationQueue({
+  bookingId = null,
+  confirmationOnly = false
+} = {}) {
+  const staleBefore = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+
+  // Recover notifications that were claimed by a process that died.
+  await academySupabase
+    .from("academy_notifications")
+    .update({
+      status: "failed",
+      updated_at: new Date().toISOString()
+    })
+    .eq("status", "processing")
+    .lt("updated_at", staleBefore);
+
+  let query = academySupabase
+    .from("academy_notifications")
+    .select(`
+      id,
+      booking_id,
+      channel,
+      kind,
+      recipient,
+      scheduled_at,
+      status,
+      attempts,
+      academy_bookings (
+        id,
+        full_name,
+        email,
+        phone,
+        starts_at,
+        timezone,
+        reminders_consent,
+        status
+      )
+    `)
+    .in("status", ["pending", "failed"])
+    .lt("attempts", ACADEMY_NOTIFICATION_MAX_ATTEMPTS)
+    .lte("scheduled_at", new Date().toISOString())
+    .order("scheduled_at", { ascending: true })
+    .limit(ACADEMY_NOTIFICATION_BATCH_SIZE);
+
+  if (bookingId) {
+    query = query.eq("booking_id", bookingId);
+  }
+
+  if (confirmationOnly) {
+    query = query.eq("kind", "confirmation");
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    throw new Error(
+      error.message ||
+      "Could not read Academy notification queue."
+    );
+  }
+
+  const results = [];
+
+  for (const row of data || []) {
+    // Do not send reminders for cancelled/non-confirmed bookings.
+    const booking = row.academy_bookings;
+
+    if (!booking || booking.status !== "confirmed") {
+      await academySupabase
+        .from("academy_notifications")
+        .update({
+          status: "skipped",
+          last_error: "Booking is not confirmed.",
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", row.id);
+
+      results.push({
+        id: row.id,
+        skipped: true,
+        reason: "booking_not_confirmed"
+      });
+      continue;
+    }
+
+    results.push(await processAcademyNotificationRow(row));
+  }
+
+  return {
+    processed: results.length,
+    results
+  };
+}
+
+async function finalizeAcademyBooking({
+  applicationId,
+  candidate,
+  terms,
+  appointment,
+  selectedTime,
+  startUtc,
+  endUtc,
+  eventId,
+  bookingFingerprint,
+  rollbackGoogleEventOnDatabaseFailure = false
+}) {
+  let booking;
+
+  try {
+    booking = await persistAcademyBooking({
+      applicationId,
+      candidate,
+      terms,
+      appointment,
+      selectedTime,
+      startUtc,
+      endUtc,
+      eventId,
+      bookingFingerprint
+    });
+  } catch (err) {
+    if (rollbackGoogleEventOnDatabaseFailure) {
+      try {
+        const encodedCalendarId = encodeURIComponent(GOOGLE_CALENDAR_ID);
+        await googleCalendarRequest(
+          `/calendars/${encodedCalendarId}/events/${encodeURIComponent(eventId)}`,
+          { method: "DELETE" }
+        );
+      } catch (rollbackError) {
+        console.error(
+          "Academy booking database rollback could not delete Google event:",
+          rollbackError
+        );
+      }
+    }
+
+    throw err;
+  }
+
+  let queueResult = {
+    queued: 0
+  };
+  let confirmationResult = {
+    processed: 0,
+    results: []
+  };
+  let notificationWarning = null;
+
+  try {
+    queueResult = await queueAcademyNotifications(booking);
+    confirmationResult = await processAcademyNotificationQueue({
+      bookingId: booking.id,
+      confirmationOnly: true
+    });
+  } catch (err) {
+    notificationWarning = String(err?.message || err);
+    console.error(
+      "Academy booking confirmed, but notification setup/send failed:",
+      err
+    );
+  }
+
+  return {
+    booking,
+    queueResult,
+    confirmationResult,
+    notificationWarning
+  };
+}
+
+
 // ==============================
 // ROUTES - CUSTOMER / CASHBACK / SESSION
 // ==============================
@@ -2522,6 +3276,97 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
 // ROUTES - VAGARO FASE 1
 // ==============================
 
+// LL Brows Academy application persistence.
+// Saves the complete application server-side before the candidate reaches
+// the scheduling page.
+app.post("/academy/application", checkoutLimiter, async (req, res) => {
+  try {
+    const application = normalizeAcademyApplication(req.body || {});
+
+    if (
+      !application.fullName ||
+      !application.phone ||
+      !isValidEmail(application.email) ||
+      !application.city ||
+      !application.state ||
+      !application.stage ||
+      !application.interest ||
+      !application.previousTraining ||
+      !application.timeline ||
+      !application.investmentReadiness
+    ) {
+      return res.status(400).json({
+        ok: false,
+        code: "INVALID_APPLICATION",
+        error: "Please complete all required application fields."
+      });
+    }
+
+    if (!application.attendanceAgreement) {
+      return res.status(400).json({
+        ok: false,
+        code: "ATTENDANCE_AGREEMENT_REQUIRED",
+        error: "The attendance agreement is required."
+      });
+    }
+
+    const record = {
+      full_name: application.fullName,
+      phone: application.phone,
+      email: application.email,
+      instagram: application.instagram || null,
+      city: application.city,
+      state: application.state,
+      stage: application.stage,
+      interest: application.interest,
+      previous_training: application.previousTraining,
+      experience: application.experience || null,
+      goals: application.goals,
+      challenges: application.challenges,
+      timeline: application.timeline,
+      investment_readiness: application.investmentReadiness,
+      notes: application.notes || null,
+      attendance_agreement: application.attendanceAgreement,
+      sms_reminders: application.smsReminders,
+      marketing_optin: application.marketingOptin,
+      source: application.source,
+      status: "submitted",
+      payload: req.body || {}
+    };
+
+    const { data, error } = await academySupabase
+      .from("academy_applications")
+      .insert(record)
+      .select("id, created_at")
+      .single();
+
+    if (error || !data) {
+      console.error("Academy application insert failed:", error);
+
+      return res.status(503).json({
+        ok: false,
+        code: "APPLICATION_DATABASE_ERROR",
+        error: "We couldn’t save your application. Please try again."
+      });
+    }
+
+    return res.status(201).json({
+      status: 201,
+      ok: true,
+      applicationId: data.id,
+      createdAt: data.created_at
+    });
+  } catch (err) {
+    console.error("Erro /academy/application:", err);
+
+    return res.status(500).json({
+      ok: false,
+      code: "APPLICATION_SAVE_FAILED",
+      error: "We couldn’t save your application. Please try again."
+    });
+  }
+});
+
 // LL Brows Academy availability.
 // Uses the same Vagaro business/provider as LL Touch, but does not depend on
 // Stripe checkout or alter the existing LL Touch /vagaro/availability route.
@@ -2614,6 +3459,10 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
   const candidate = extractAcademyCandidate(req.body || {});
   const appointment = extractAcademyAppointment(req.body || {});
   const terms = extractAcademyTerms(req.body || {});
+  const applicationId = academyUuid(
+    req.body?.applicationId ||
+    req.body?.application_id
+  );
 
   if (!candidate.fullName || !isValidEmail(candidate.email) || !candidate.phone) {
     return res.status(400).json({
@@ -2657,7 +3506,7 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
     });
   }
 
-  // 1) Revalidate against the real Vagaro availability immediately before booking.
+  // 1) Revalidate against Vagaro immediately before booking.
   let availability;
 
   try {
@@ -2741,7 +3590,7 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
     selectedTime
   );
 
-  // 2) Check the Google calendar as a second source of truth.
+  // 2) Check Google Calendar as a second source of truth.
   let conflicts;
 
   try {
@@ -2762,9 +3611,29 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
       event.extendedProperties?.private?.bookingFingerprint === bookingFingerprint
   );
 
-  // Idempotency: if this exact candidate already confirmed this exact slot,
-  // return the existing booking instead of creating a duplicate.
   if (existingSameBooking) {
+    let finalization = null;
+
+    try {
+      finalization = await finalizeAcademyBooking({
+        applicationId,
+        candidate,
+        terms,
+        appointment,
+        selectedTime,
+        startUtc,
+        endUtc,
+        eventId: existingSameBooking.id,
+        bookingFingerprint,
+        rollbackGoogleEventOnDatabaseFailure: false
+      });
+    } catch (err) {
+      console.error(
+        "Existing Academy booking could not be persisted:",
+        err
+      );
+    }
+
     return res.json({
       status: 200,
       ok: true,
@@ -2778,7 +3647,14 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
         professional: "Ludimilla Leite",
         service: VAGARO_ACADEMY_SERVICE_TITLE
       },
-      eventId: existingSameBooking.id
+      eventId: existingSameBooking.id,
+      bookingId: finalization?.booking?.id || null,
+      notifications: {
+        queued: finalization?.queueResult?.queued || 0,
+        confirmationProcessed:
+          finalization?.confirmationResult?.processed || 0,
+        warning: finalization?.notificationWarning || null
+      }
     });
   }
 
@@ -2790,10 +3666,7 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
     });
   }
 
-  // 3) Create a BUSY event. We intentionally do not add an attendee here:
-  // service accounts on consumer/shared calendars can be restricted from
-  // sending invitations. Candidate email/SMS confirmation will be handled
-  // separately without risking the booking itself.
+  // 3) Create one private BUSY event in the Academy Google Calendar.
   const eventBody = {
     id: eventId,
     summary: `LL Brows Academy – Consultation Call | ${candidate.fullName}`,
@@ -2839,6 +3712,35 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
       }
     );
 
+    let finalization;
+
+    try {
+      finalization = await finalizeAcademyBooking({
+        applicationId,
+        candidate,
+        terms,
+        appointment,
+        selectedTime,
+        startUtc,
+        endUtc,
+        eventId: createdEvent.id,
+        bookingFingerprint,
+        rollbackGoogleEventOnDatabaseFailure: true
+      });
+    } catch (err) {
+      console.error(
+        "Academy Google event was created but database persistence failed:",
+        err
+      );
+
+      return res.status(503).json({
+        ok: false,
+        code: "BOOKING_DATABASE_ERROR",
+        error:
+          "We couldn’t safely finish the reservation. Please try again."
+      });
+    }
+
     return res.status(201).json({
       status: 201,
       ok: true,
@@ -2852,12 +3754,16 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
         professional: "Ludimilla Leite",
         service: VAGARO_ACADEMY_SERVICE_TITLE
       },
-      eventId: createdEvent.id
+      eventId: createdEvent.id,
+      bookingId: finalization.booking.id,
+      notifications: {
+        queued: finalization.queueResult.queued,
+        confirmationProcessed:
+          finalization.confirmationResult.processed,
+        warning: finalization.notificationWarning
+      }
     });
   } catch (err) {
-    // Race-condition protection: two requests for the same slot use the same
-    // Google event ID. Only one can win. If the winner was this same booking,
-    // return success; otherwise return a slot conflict.
     if (Number(err.status) === 409) {
       try {
         const afterRaceConflicts = await getAcademyGoogleConflicts(
@@ -2872,6 +3778,28 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
         );
 
         if (sameBookingAfterRace) {
+          let finalization = null;
+
+          try {
+            finalization = await finalizeAcademyBooking({
+              applicationId,
+              candidate,
+              terms,
+              appointment,
+              selectedTime,
+              startUtc,
+              endUtc,
+              eventId: sameBookingAfterRace.id,
+              bookingFingerprint,
+              rollbackGoogleEventOnDatabaseFailure: false
+            });
+          } catch (finalizeError) {
+            console.error(
+              "Academy post-race persistence failed:",
+              finalizeError
+            );
+          }
+
           return res.json({
             status: 200,
             ok: true,
@@ -2885,11 +3813,21 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
               professional: "Ludimilla Leite",
               service: VAGARO_ACADEMY_SERVICE_TITLE
             },
-            eventId: sameBookingAfterRace.id
+            eventId: sameBookingAfterRace.id,
+            bookingId: finalization?.booking?.id || null,
+            notifications: {
+              queued: finalization?.queueResult?.queued || 0,
+              confirmationProcessed:
+                finalization?.confirmationResult?.processed || 0,
+              warning: finalization?.notificationWarning || null
+            }
           });
         }
       } catch (raceCheckError) {
-        console.error("Academy post-race conflict check failed:", raceCheckError);
+        console.error(
+          "Academy post-race conflict check failed:",
+          raceCheckError
+        );
       }
 
       return res.status(409).json({
@@ -2907,6 +3845,98 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
       error: "We could not confirm the appointment. Please try again."
     });
   }
+});
+
+// Secure worker endpoint for confirmation/remainder delivery.
+// Render Cron should call this route every 5 minutes.
+app.post("/academy/process-reminders", async (req, res) => {
+  const authorization = String(req.headers.authorization || "");
+  const suppliedSecret = authorization.startsWith("Bearer ")
+    ? authorization.slice(7).trim()
+    : "";
+
+  if (!ACADEMY_CRON_SECRET) {
+    return res.status(503).json({
+      ok: false,
+      error: "ACADEMY_CRON_SECRET is not configured."
+    });
+  }
+
+  const expected = Buffer.from(ACADEMY_CRON_SECRET);
+  const received = Buffer.from(suppliedSecret);
+
+  const authorized =
+    expected.length === received.length &&
+    crypto.timingSafeEqual(expected, received);
+
+  if (!authorized) {
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized."
+    });
+  }
+
+  try {
+    const result = await processAcademyNotificationQueue();
+
+    return res.json({
+      status: 200,
+      ok: true,
+      ...result
+    });
+  } catch (err) {
+    console.error("Erro /academy/process-reminders:", err);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Could not process Academy reminders.",
+      details: String(err?.message || err)
+    });
+  }
+});
+
+app.get("/academy/system-check", async (_, res) => {
+  const checks = {
+    databaseConfigured: Boolean(
+      process.env.SUPABASE_URL &&
+      (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY)
+    ),
+    googleCalendarConfigured: isGoogleCalendarConfigured(),
+    emailConfigured: isAcademyEmailConfigured(),
+    smsConfigured: isAcademySmsConfigured(),
+    cronSecretConfigured: Boolean(ACADEMY_CRON_SECRET)
+  };
+
+  let databaseTablesAccessible = false;
+  let databaseError = null;
+
+  try {
+    const { error } = await academySupabase
+      .from("academy_applications")
+      .select("id")
+      .limit(1);
+
+    if (error) {
+      databaseError = error.message || String(error);
+    } else {
+      databaseTablesAccessible = true;
+    }
+  } catch (err) {
+    databaseError = String(err?.message || err);
+  }
+
+  return res.json({
+    status: 200,
+    ok:
+      checks.databaseConfigured &&
+      databaseTablesAccessible &&
+      checks.googleCalendarConfigured,
+    checks: {
+      ...checks,
+      databaseTablesAccessible
+    },
+    databaseError
+  });
 });
 
 app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
@@ -3139,9 +4169,15 @@ app.get("/health", (_, res) => {
     academyCalendar: {
       configured: isGoogleCalendarConfigured(),
       timezone: GOOGLE_CALENDAR_TIMEZONE,
+      applicationRoute: "/academy/application",
       availabilityRoute: "/vagaro/academy-availability",
       googleCheckRoute: "/academy/google-calendar-check",
-      confirmRoute: "/academy/confirm-session"
+      confirmRoute: "/academy/confirm-session",
+      reminderWorkerRoute: "/academy/process-reminders",
+      systemCheckRoute: "/academy/system-check",
+      emailConfigured: isAcademyEmailConfigured(),
+      smsConfigured: isAcademySmsConfigured(),
+      cronSecretConfigured: Boolean(ACADEMY_CRON_SECRET)
     }
   });
 });
