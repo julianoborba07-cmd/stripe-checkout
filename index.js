@@ -2567,17 +2567,6 @@ async function queueAcademyNotifications(booking) {
     });
   }
 
-  if (isAcademyInternalEmailConfigured()) {
-    rows.push({
-      booking_id: booking.id,
-      channel: "internal",
-      kind: "internal_booking",
-      recipient: ACADEMY_INTERNAL_EMAIL,
-      scheduled_at: new Date(now).toISOString(),
-      status: "pending"
-    });
-  }
-
   if (booking.reminders_consent && phone) {
     rows.push({
       booking_id: booking.id,
@@ -2704,9 +2693,9 @@ async function processAcademyNotificationRow(row) {
         body: copy.sms
       });
     } else if (claimed.channel === "internal") {
-      providerResult = await sendAcademyInternalWeb3Forms({
-        booking: claimed.academy_bookings
-      });
+      throw new Error(
+        "Internal Web3Forms delivery has moved to the browser confirmation page."
+      );
     } else {
       throw new Error("Unsupported Academy notification channel.");
     }
@@ -2811,7 +2800,7 @@ async function processAcademyNotificationQueue({
   }
 
   if (confirmationOnly) {
-    query = query.in("kind", ["confirmation", "internal_booking"]);
+    query = query.eq("kind", "confirmation");
   }
 
   const { data, error } = await query;
@@ -4086,7 +4075,7 @@ app.get("/academy/system-check", async (_, res) => {
     ),
     googleCalendarConfigured: isGoogleCalendarConfigured(),
     emailConfigured: isAcademyEmailConfigured(),
-    internalEmailConfigured: isAcademyInternalEmailConfigured(),
+    internalEmailMode: "client-web3forms",
     smsConfigured: isAcademySmsConfigured(),
     cronSecretConfigured: Boolean(ACADEMY_CRON_SECRET)
   };
@@ -4360,8 +4349,8 @@ app.get("/health", (_, res) => {
       reminderWorkerRoute: "/academy/process-reminders",
       systemCheckRoute: "/academy/system-check",
       emailConfigured: isAcademyEmailConfigured(),
-      internalEmailConfigured: isAcademyInternalEmailConfigured(),
-      internalEmailRecipient: ACADEMY_INTERNAL_EMAIL,
+      internalEmailMode: "client-web3forms",
+      internalEmailRecipient: "lltouch@outlook.com",
       smsConfigured: isAcademySmsConfigured(),
       cronSecretConfigured: Boolean(ACADEMY_CRON_SECRET)
     }
