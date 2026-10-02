@@ -806,7 +806,7 @@ const ACADEMY_INTERNAL_EMAIL = String(
 const ACADEMY_NOTIFICATION_MAX_ATTEMPTS = 3;
 const ACADEMY_NOTIFICATION_BATCH_SIZE = 25;
 
-const ACADEMY_AVAILABLE_DATES_CACHE_MS = 2 * 60 * 1000;
+const ACADEMY_AVAILABLE_DATES_CACHE_MS = 30 * 1000;
 const ACADEMY_AVAILABLE_DATES_MAX_API_CALLS = 16;
 const academyAvailableDatesCache = new Map();
 
@@ -1912,6 +1912,159 @@ function academyGroupSlotsByDate(slots, minDate, maxDate) {
   return groups;
 }
 
+function academyGoogleEventInterval(event) {
+  if (!event || event.status === "cancelled") return null;
+  if (event.transparency === "transparent") return null;
+
+  try {
+    let start = null;
+    let end = null;
+
+    if (event.start?.dateTime) {
+      start = new Date(event.start.dateTime);
+    } else if (event.start?.date) {
+      start = zonedAcademyDateToUtc(
+        event.start.date,
+        "00:00",
+        GOOGLE_CALENDAR_TIMEZONE
+      );
+    }
+
+    if (event.end?.dateTime) {
+      end = new Date(event.end.dateTime);
+    } else if (event.end?.date) {
+      end = zonedAcademyDateToUtc(
+        event.end.date,
+        "00:00",
+        GOOGLE_CALENDAR_TIMEZONE
+      );
+    }
+
+    if (
+      !start ||
+      !end ||
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime())
+    ) {
+      return null;
+    }
+
+    return {
+      id: event.id || null,
+      start,
+      end
+    };
+  } catch (err) {
+    console.error("Academy Google event interval parse failed:", err);
+    return null;
+  }
+}
+
+async function getAcademyGoogleBusyEventsForRange(startDate, endDate) {
+  if (!isGoogleCalendarConfigured()) {
+    throw new Error("Google Calendar is not configured.");
+  }
+
+  const dayAfterEnd = academyAddDaysISO(endDate, 1);
+
+  const rangeStart = zonedAcademyDateToUtc(
+    startDate,
+    "00:00",
+    GOOGLE_CALENDAR_TIMEZONE
+  );
+
+  const rangeEnd = zonedAcademyDateToUtc(
+    dayAfterEnd,
+    "00:00",
+    GOOGLE_CALENDAR_TIMEZONE
+  );
+
+  const encodedCalendarId = encodeURIComponent(GOOGLE_CALENDAR_ID);
+  const events = [];
+  let pageToken = "";
+
+  do {
+    const query = new URLSearchParams({
+      timeMin: rangeStart.toISOString(),
+      timeMax: rangeEnd.toISOString(),
+      singleEvents: "true",
+      showDeleted: "false",
+      orderBy: "startTime",
+      maxResults: "2500"
+    });
+
+    if (pageToken) {
+      query.set("pageToken", pageToken);
+    }
+
+    const data = await googleCalendarRequest(
+      `/calendars/${encodedCalendarId}/events?${query.toString()}`
+    );
+
+    for (const event of Array.isArray(data?.items) ? data.items : []) {
+      const interval = academyGoogleEventInterval(event);
+      if (interval) events.push(interval);
+    }
+
+    pageToken = String(data?.nextPageToken || "");
+  } while (pageToken);
+
+  return events;
+}
+
+function academySlotInterval(slot) {
+  const date = normalizeAcademyDateValue(slot?.date, null);
+  const time = normalizeAcademyTime(slot?.time);
+
+  if (!date || !time) return null;
+
+  const endWallClock = addAcademyMinutes(
+    date,
+    time,
+    VAGARO_ACADEMY_DURATION_MINUTES
+  );
+
+  if (!endWallClock) return null;
+
+  const start = zonedAcademyDateToUtc(
+    date,
+    time,
+    GOOGLE_CALENDAR_TIMEZONE
+  );
+
+  const end = zonedAcademyDateToUtc(
+    endWallClock.date,
+    endWallClock.time,
+    GOOGLE_CALENDAR_TIMEZONE
+  );
+
+  return {
+    start,
+    end
+  };
+}
+
+function academySlotConflictsWithGoogle(slot, busyEvents) {
+  const interval = academySlotInterval(slot);
+  if (!interval) return true;
+
+  return (busyEvents || []).some(
+    (event) =>
+      interval.start < event.end &&
+      interval.end > event.start
+  );
+}
+
+function filterAcademySlotsAgainstGoogle(slots, busyEvents) {
+  return (slots || []).filter(
+    (slot) => !academySlotConflictsWithGoogle(slot, busyEvents)
+  );
+}
+
+function clearAcademyAvailableDatesCache() {
+  academyAvailableDatesCache.clear();
+}
+
 async function discoverAcademyAvailableDates({
   startDate,
   maxDays = 30,
@@ -1921,6 +2074,14 @@ async function discoverAcademyAvailableDates({
   const days = Math.max(1, Math.min(Number(maxDays) || 30, 45));
   const wantedDates = Math.max(1, Math.min(Number(maxDates) || 8, 12));
   const endDate = academyAddDaysISO(normalizedStart, days - 1);
+
+  // Vagaro is the scheduling source, but Google Calendar is also a BUSY
+  // source because Google -> Vagaro sync can have propagation delay.
+  // We therefore remove Google-busy intervals before showing any slot.
+  const googleBusyEvents = await getAcademyGoogleBusyEventsForRange(
+    normalizedStart,
+    endDate
+  );
 
   const cacheKey = `${normalizedStart}|${days}|${wantedDates}`;
   const cached = academyAvailableDatesCache.get(cacheKey);
@@ -1975,6 +2136,20 @@ async function discoverAcademyAvailableDates({
       endDate
     );
 
+    // Remove every slot that overlaps any BUSY Google Calendar event.
+    for (const [date, slots] of groups.entries()) {
+      const filtered = filterAcademySlotsAgainstGoogle(
+        slots,
+        googleBusyEvents
+      );
+
+      if (filtered.length) {
+        groups.set(date, filtered);
+      } else {
+        groups.delete(date);
+      }
+    }
+
     const groupDates = [...groups.keys()].sort();
 
     if (groupDates.length === 0) {
@@ -2018,6 +2193,7 @@ async function discoverAcademyAvailableDates({
     dates,
     availableDateCount: dates.length,
     apiCalls,
+    googleBusyEventsChecked: googleBusyEvents.length,
     searchedThrough: lastRequestedDate,
     cached: false
   };
@@ -3823,6 +3999,23 @@ app.post("/vagaro/academy-availability", checkoutLimiter, async (req, res) => {
       addOnIds: []
     });
 
+    const googleBusyEvents = await getAcademyGoogleBusyEventsForRange(
+      date,
+      date
+    );
+
+    const vagaroSlots = normalizeAcademyAvailability(
+      availability,
+      date
+    ).filter(
+      (slot) => normalizeAcademyDateValue(slot.date, null) === date
+    );
+
+    const slots = filterAcademySlotsAgainstGoogle(
+      vagaroSlots,
+      googleBusyEvents
+    );
+
     return res.json({
       status: 200,
       message: "Success",
@@ -3837,9 +4030,8 @@ app.post("/vagaro/academy-availability", checkoutLimiter, async (req, res) => {
         name: "Ludimilla Leite",
         serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
       },
-      slots: normalizeAcademyAvailability(availability, date).filter(
-        (slot) => normalizeAcademyDateValue(slot.date, null) === date
-      )
+      googleBusyEventsChecked: googleBusyEvents.length,
+      slots
     });
   } catch (err) {
     console.error("Erro /vagaro/academy-availability:", err);
@@ -4073,6 +4265,8 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
       );
     }
 
+    clearAcademyAvailableDatesCache();
+
     return res.json({
       status: 200,
       ok: true,
@@ -4180,6 +4374,8 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
       });
     }
 
+    clearAcademyAvailableDatesCache();
+
     return res.status(201).json({
       status: 201,
       ok: true,
@@ -4238,6 +4434,8 @@ app.post("/academy/confirm-session", checkoutLimiter, async (req, res) => {
               finalizeError
             );
           }
+
+          clearAcademyAvailableDatesCache();
 
           return res.json({
             status: 200,
