@@ -806,6 +806,10 @@ const ACADEMY_INTERNAL_EMAIL = String(
 const ACADEMY_NOTIFICATION_MAX_ATTEMPTS = 3;
 const ACADEMY_NOTIFICATION_BATCH_SIZE = 25;
 
+const ACADEMY_AVAILABLE_DATES_CACHE_MS = 2 * 60 * 1000;
+const ACADEMY_AVAILABLE_DATES_MAX_API_CALLS = 16;
+const academyAvailableDatesCache = new Map();
+
 function isVagaroConfigured() {
   return Boolean(process.env.VAGARO_CLIENT_ID && process.env.VAGARO_CLIENT_SECRET);
 }
@@ -1804,18 +1808,226 @@ async function googleCalendarRequest(path, options = {}) {
   return data;
 }
 
+function normalizeAcademyDateValue(value, fallbackDate = null) {
+  const raw = String(value || "").trim();
+
+  if (!raw) return fallbackDate;
+
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+
+  const usMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (usMatch) {
+    return `${usMatch[3]}-${String(usMatch[1]).padStart(2, "0")}-${String(usMatch[2]).padStart(2, "0")}`;
+  }
+
+  return fallbackDate;
+}
+
 function normalizeAcademyAvailability(availability, fallbackDate) {
-  return (availability?.data || []).flatMap((day) =>
-    (day.timeSlot || []).map((time) => ({
-      date: day.appointmentDate || fallbackDate,
+  return (availability?.data || []).flatMap((day) => {
+    const normalizedDate = normalizeAcademyDateValue(
+      day.appointmentDate,
+      fallbackDate
+    );
+
+    return (day.timeSlot || []).map((time) => ({
+      date: normalizedDate,
       time,
       professional: "Ludimilla Leite",
       serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
       serviceId: VAGARO_ACADEMY_SERVICE_ID,
       serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
       durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
-    }))
+    }));
+  });
+}
+
+function academyAddDaysISO(date, days) {
+  const normalized = formatDateOnly(date);
+  if (!normalized) return null;
+
+  const [year, month, day] = normalized.split("-").map(Number);
+  const value = new Date(Date.UTC(year, month - 1, day));
+  value.setUTCDate(value.getUTCDate() + Number(days || 0));
+
+  return [
+    value.getUTCFullYear(),
+    String(value.getUTCMonth() + 1).padStart(2, "0"),
+    String(value.getUTCDate()).padStart(2, "0")
+  ].join("-");
+}
+
+function academyEasternTodayISO() {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: GOOGLE_CALENDAR_TIMEZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    })
+      .formatToParts(new Date())
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
   );
+
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function academyGroupSlotsByDate(slots, minDate, maxDate) {
+  const groups = new Map();
+
+  for (const slot of slots || []) {
+    const date = normalizeAcademyDateValue(slot?.date, null);
+    const time = cleanLeadField(slot?.time, 80);
+
+    if (!date || !time) continue;
+    if (date < minDate || date > maxDate) continue;
+
+    if (!groups.has(date)) {
+      groups.set(date, []);
+    }
+
+    const existing = groups.get(date);
+
+    if (!existing.some((item) => item.time === time)) {
+      existing.push({
+        ...slot,
+        date,
+        time
+      });
+    }
+  }
+
+  for (const [, items] of groups) {
+    items.sort((a, b) => {
+      const timeA = normalizeAcademyTime(a.time) || a.time;
+      const timeB = normalizeAcademyTime(b.time) || b.time;
+      return String(timeA).localeCompare(String(timeB));
+    });
+  }
+
+  return groups;
+}
+
+async function discoverAcademyAvailableDates({
+  startDate,
+  maxDays = 30,
+  maxDates = 8
+}) {
+  const normalizedStart = formatDateOnly(startDate) || academyEasternTodayISO();
+  const days = Math.max(1, Math.min(Number(maxDays) || 30, 45));
+  const wantedDates = Math.max(1, Math.min(Number(maxDates) || 8, 12));
+  const endDate = academyAddDaysISO(normalizedStart, days - 1);
+
+  const cacheKey = `${normalizedStart}|${days}|${wantedDates}`;
+  const cached = academyAvailableDatesCache.get(cacheKey);
+
+  if (cached && cached.expiresAt > Date.now()) {
+    return {
+      ...cached.value,
+      cached: true
+    };
+  }
+
+  const found = new Map();
+  let cursor = normalizedStart;
+  let apiCalls = 0;
+  let lastRequestedDate = normalizedStart;
+
+  while (
+    cursor &&
+    cursor <= endDate &&
+    found.size < wantedDates &&
+    apiCalls < ACADEMY_AVAILABLE_DATES_MAX_API_CALLS
+  ) {
+    lastRequestedDate = cursor;
+    apiCalls += 1;
+
+    let availability;
+
+    try {
+      availability = await searchVagaroAvailability({
+        date: cursor,
+        serviceId: VAGARO_ACADEMY_SERVICE_ID,
+        addOnIds: []
+      });
+    } catch (err) {
+      console.error("Academy available-date discovery request failed:", {
+        date: cursor,
+        error: err?.message || String(err)
+      });
+
+      cursor = academyAddDaysISO(cursor, 1);
+      continue;
+    }
+
+    const normalizedSlots = normalizeAcademyAvailability(
+      availability,
+      cursor
+    );
+
+    const groups = academyGroupSlotsByDate(
+      normalizedSlots,
+      cursor,
+      endDate
+    );
+
+    const groupDates = [...groups.keys()].sort();
+
+    if (groupDates.length === 0) {
+      cursor = academyAddDaysISO(cursor, 1);
+      continue;
+    }
+
+    for (const date of groupDates) {
+      if (!found.has(date) && groups.get(date)?.length) {
+        found.set(date, groups.get(date));
+      }
+
+      if (found.size >= wantedDates) break;
+    }
+
+    // Vagaro may return the next available date instead of the exact
+    // requested day. Jump to the day after the latest returned date
+    // so we do not need to query every empty day one by one.
+    const latestReturnedDate = groupDates[groupDates.length - 1];
+
+    if (latestReturnedDate && latestReturnedDate >= cursor) {
+      cursor = academyAddDaysISO(latestReturnedDate, 1);
+    } else {
+      cursor = academyAddDaysISO(cursor, 1);
+    }
+  }
+
+  const dates = [...found.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(0, wantedDates)
+    .map(([date, slots]) => ({
+      date,
+      slots
+    }));
+
+  const result = {
+    startDate: normalizedStart,
+    endDate,
+    maxDays: days,
+    maxDates: wantedDates,
+    dates,
+    availableDateCount: dates.length,
+    apiCalls,
+    searchedThrough: lastRequestedDate,
+    cached: false
+  };
+
+  academyAvailableDatesCache.set(cacheKey, {
+    expiresAt: Date.now() + ACADEMY_AVAILABLE_DATES_CACHE_MS,
+    value: result
+  });
+
+  return result;
 }
 
 function academyTruthy(value) {
@@ -3539,6 +3751,59 @@ app.post("/academy/application", checkoutLimiter, async (req, res) => {
   }
 });
 
+// LL Brows Academy — next dates that actually contain openings.
+// Scans forward using Vagaro's returned appointmentDate as a jump cursor,
+// which avoids querying every empty calendar day one by one.
+app.post("/vagaro/academy-available-dates", checkoutLimiter, async (req, res) => {
+  try {
+    const startDate =
+      formatDateOnly(req.body?.startDate) ||
+      formatDateOnly(req.body?.start_date) ||
+      academyEasternTodayISO();
+
+    const maxDays = Math.max(
+      1,
+      Math.min(Number(req.body?.maxDays) || 30, 45)
+    );
+
+    const maxDates = Math.max(
+      1,
+      Math.min(Number(req.body?.maxDates) || 8, 12)
+    );
+
+    const result = await discoverAcademyAvailableDates({
+      startDate,
+      maxDays,
+      maxDates
+    });
+
+    return res.json({
+      status: 200,
+      ok: true,
+      message: "Success",
+      source: "LL Brows Academy",
+      service: {
+        serviceId: VAGARO_ACADEMY_SERVICE_ID,
+        title: VAGARO_ACADEMY_SERVICE_TITLE,
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
+      },
+      professional: {
+        name: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+      },
+      ...result
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/academy-available-dates:", err);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Could not load Academy available dates",
+      details: err.message
+    });
+  }
+});
+
 // LL Brows Academy availability.
 // Uses the same Vagaro business/provider as LL Touch, but does not depend on
 // Stripe checkout or alter the existing LL Touch /vagaro/availability route.
@@ -3572,7 +3837,9 @@ app.post("/vagaro/academy-availability", checkoutLimiter, async (req, res) => {
         name: "Ludimilla Leite",
         serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
       },
-      slots: normalizeAcademyAvailability(availability, date)
+      slots: normalizeAcademyAvailability(availability, date).filter(
+        (slot) => normalizeAcademyDateValue(slot.date, null) === date
+      )
     });
   } catch (err) {
     console.error("Erro /vagaro/academy-availability:", err);
@@ -4343,6 +4610,7 @@ app.get("/health", (_, res) => {
       configured: isGoogleCalendarConfigured(),
       timezone: GOOGLE_CALENDAR_TIMEZONE,
       applicationRoute: "/academy/application",
+      availableDatesRoute: "/vagaro/academy-available-dates",
       availabilityRoute: "/vagaro/academy-availability",
       googleCheckRoute: "/academy/google-calendar-check",
       confirmRoute: "/academy/confirm-session",
