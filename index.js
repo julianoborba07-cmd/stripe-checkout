@@ -795,6 +795,14 @@ const ACADEMY_CRON_SECRET = String(
   process.env.ACADEMY_CRON_SECRET || ""
 ).trim();
 
+const WEB3FORMS_ACCESS_KEY = String(
+  process.env.WEB3FORMS_ACCESS_KEY || ""
+).trim();
+
+const ACADEMY_INTERNAL_EMAIL = String(
+  process.env.ACADEMY_INTERNAL_EMAIL || "lltouch@outlook.com"
+).trim();
+
 const ACADEMY_NOTIFICATION_MAX_ATTEMPTS = 3;
 const ACADEMY_NOTIFICATION_BATCH_SIZE = 25;
 
@@ -2105,6 +2113,156 @@ function isAcademySmsConfigured() {
   );
 }
 
+function isAcademyInternalEmailConfigured() {
+  return Boolean(WEB3FORMS_ACCESS_KEY);
+}
+
+function academyDisplayArray(value) {
+  if (Array.isArray(value)) {
+    return value.filter(Boolean).join(", ");
+  }
+
+  return String(value || "").trim();
+}
+
+async function getAcademyApplicationForInternalEmail(booking) {
+  try {
+    let query = academySupabase
+      .from("academy_applications")
+      .select(
+        "id, full_name, phone, email, instagram, city, state, stage, interest, previous_training, experience, goals, challenges, timeline, investment_readiness, notes, attendance_agreement, sms_reminders, marketing_optin, source, status, created_at"
+      );
+
+    if (booking?.application_id) {
+      const { data, error } = await query
+        .eq("id", booking.application_id)
+        .maybeSingle();
+
+      if (!error && data) return data;
+    }
+
+    const email = String(booking?.email || "").trim().toLowerCase();
+
+    if (!email) return null;
+
+    const { data, error } = await academySupabase
+      .from("academy_applications")
+      .select(
+        "id, full_name, phone, email, instagram, city, state, stage, interest, previous_training, experience, goals, challenges, timeline, investment_readiness, notes, attendance_agreement, sms_reminders, marketing_optin, source, status, created_at"
+      )
+      .eq("email", email)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Academy internal email application lookup failed:", error);
+      return null;
+    }
+
+    return data || null;
+  } catch (err) {
+    console.error("Academy internal email application lookup exception:", err);
+    return null;
+  }
+}
+
+async function sendAcademyInternalWeb3Forms({ booking }) {
+  if (!isAcademyInternalEmailConfigured()) {
+    throw new Error("Web3Forms internal email is not configured.");
+  }
+
+  const application = await getAcademyApplicationForInternalEmail(booking);
+  const when = formatAcademyStart(booking.starts_at);
+
+  const goals = academyDisplayArray(application?.goals);
+  const challenges = academyDisplayArray(application?.challenges);
+
+  const message = [
+    "NEW LL BROWS ACADEMY APPLICATION + CONFIRMED BOOKING",
+    "",
+    "STUDENT",
+    `Name: ${booking.full_name || application?.full_name || ""}`,
+    `Email: ${booking.email || application?.email || ""}`,
+    `Phone: ${booking.phone || application?.phone || ""}`,
+    `Instagram: ${application?.instagram || ""}`,
+    `City / State: ${[application?.city, application?.state].filter(Boolean).join(", ")}`,
+    "",
+    "APPLICATION",
+    `Current stage: ${application?.stage || ""}`,
+    `Interest: ${application?.interest || ""}`,
+    `Previous PMU training: ${application?.previous_training || ""}`,
+    `Experience: ${application?.experience || ""}`,
+    `Goals: ${goals}`,
+    `Challenges: ${challenges}`,
+    `Timeline: ${application?.timeline || ""}`,
+    `Investment readiness: ${application?.investment_readiness || ""}`,
+    `Additional notes: ${application?.notes || ""}`,
+    `SMS reminders consent (application): ${application?.sms_reminders ? "Yes" : "No"}`,
+    `Marketing opt-in: ${application?.marketing_optin ? "Yes" : "No"}`,
+    "",
+    "CONFIRMED SESSION",
+    `Date / Time: ${when}`,
+    `Duration: 45 minutes`,
+    `Professional: ${booking.professional || "Ludimilla Leite"}`,
+    `Service: ${booking.service || VAGARO_ACADEMY_SERVICE_TITLE}`,
+    `Reminder consent (confirmation): ${booking.reminders_consent ? "Yes" : "No"}`,
+    "",
+    "REFERENCES",
+    `Application ID: ${application?.id || booking.application_id || ""}`,
+    `Booking ID: ${booking.id || ""}`,
+    `Google Event ID: ${booking.google_event_id || ""}`,
+    "",
+    "Source: LL Brows Academy funnel"
+  ].join("\n");
+
+  const payload = {
+    access_key: WEB3FORMS_ACCESS_KEY,
+    subject: `New LL Brows Academy Booking — ${booking.full_name || "Candidate"}`,
+    from_name: "LL Brows Academy Funnel",
+    name: booking.full_name || application?.full_name || "LL Brows Academy Candidate",
+    email: booking.email || application?.email || ACADEMY_INTERNAL_EMAIL,
+    phone: booking.phone || application?.phone || "",
+    instagram: application?.instagram || "",
+    city_state: [application?.city, application?.state].filter(Boolean).join(", "),
+    current_stage: application?.stage || "",
+    interest: application?.interest || "",
+    previous_training: application?.previous_training || "",
+    goals,
+    challenges,
+    timeline: application?.timeline || "",
+    investment_readiness: application?.investment_readiness || "",
+    confirmed_session: when,
+    professional: booking.professional || "Ludimilla Leite",
+    application_id: application?.id || booking.application_id || "",
+    booking_id: booking.id || "",
+    message
+  };
+
+  const response = await fetch("https://api.web3forms.com/submit", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || data?.success !== true) {
+    throw new Error(
+      data?.message ||
+      `Web3Forms request failed (${response.status}).`
+    );
+  }
+
+  return {
+    provider: "web3forms",
+    id: data?.data?.id || data?.id || null
+  };
+}
+
 function normalizeAcademyPhoneE164(value) {
   const raw = String(value || "").trim();
   if (!raw) return null;
@@ -2409,6 +2567,17 @@ async function queueAcademyNotifications(booking) {
     });
   }
 
+  if (isAcademyInternalEmailConfigured()) {
+    rows.push({
+      booking_id: booking.id,
+      channel: "internal",
+      kind: "internal_booking",
+      recipient: ACADEMY_INTERNAL_EMAIL,
+      scheduled_at: new Date(now).toISOString(),
+      status: "pending"
+    });
+  }
+
   if (booking.reminders_consent && phone) {
     rows.push({
       booking_id: booking.id,
@@ -2514,10 +2683,11 @@ async function processAcademyNotificationRow(row) {
   }
 
   try {
-    const copy = academyNotificationCopy(claimed);
     let providerResult;
 
     if (claimed.channel === "email") {
+      const copy = academyNotificationCopy(claimed);
+
       providerResult = await sendAcademyEmail({
         to: claimed.recipient,
         subject: copy.subject,
@@ -2527,9 +2697,15 @@ async function processAcademyNotificationRow(row) {
           `academy/${claimed.booking_id}/${claimed.kind}/email`
       });
     } else if (claimed.channel === "sms") {
+      const copy = academyNotificationCopy(claimed);
+
       providerResult = await sendAcademySms({
         to: claimed.recipient,
         body: copy.sms
+      });
+    } else if (claimed.channel === "internal") {
+      providerResult = await sendAcademyInternalWeb3Forms({
+        booking: claimed.academy_bookings
       });
     } else {
       throw new Error("Unsupported Academy notification channel.");
@@ -2608,11 +2784,18 @@ async function processAcademyNotificationQueue({
       attempts,
       academy_bookings (
         id,
+        application_id,
+        google_event_id,
         full_name,
         email,
         phone,
+        appointment_date,
+        appointment_time,
         starts_at,
+        ends_at,
         timezone,
+        service,
+        professional,
         reminders_consent,
         status
       )
@@ -2628,7 +2811,7 @@ async function processAcademyNotificationQueue({
   }
 
   if (confirmationOnly) {
-    query = query.eq("kind", "confirmation");
+    query = query.in("kind", ["confirmation", "internal_booking"]);
   }
 
   const { data, error } = await query;
@@ -3903,6 +4086,7 @@ app.get("/academy/system-check", async (_, res) => {
     ),
     googleCalendarConfigured: isGoogleCalendarConfigured(),
     emailConfigured: isAcademyEmailConfigured(),
+    internalEmailConfigured: isAcademyInternalEmailConfigured(),
     smsConfigured: isAcademySmsConfigured(),
     cronSecretConfigured: Boolean(ACADEMY_CRON_SECRET)
   };
@@ -4176,6 +4360,8 @@ app.get("/health", (_, res) => {
       reminderWorkerRoute: "/academy/process-reminders",
       systemCheckRoute: "/academy/system-check",
       emailConfigured: isAcademyEmailConfigured(),
+      internalEmailConfigured: isAcademyInternalEmailConfigured(),
+      internalEmailRecipient: ACADEMY_INTERNAL_EMAIL,
       smsConfigured: isAcademySmsConfigured(),
       cronSecretConfigured: Boolean(ACADEMY_CRON_SECRET)
     }
