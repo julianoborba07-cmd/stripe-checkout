@@ -786,6 +786,17 @@ const TWILIO_MESSAGING_SERVICE_SID = String(
   process.env.TWILIO_MESSAGING_SERVICE_SID || ""
 ).trim();
 
+// LL Brows Academy - Zoom Server-to-Server OAuth
+const ZOOM_ACCOUNT_ID = String(process.env.ZOOM_ACCOUNT_ID || "").trim();
+const ZOOM_CLIENT_ID = String(process.env.ZOOM_CLIENT_ID || "").trim();
+const ZOOM_CLIENT_SECRET = String(process.env.ZOOM_CLIENT_SECRET || "").trim();
+const ZOOM_HOST_EMAIL = String(process.env.ZOOM_HOST_EMAIL || "").trim();
+
+let zoomAccessTokenCache = {
+  accessToken: null,
+  expiresAt: 0
+};
+
 const ACADEMY_PRECALL_URL = String(
   process.env.ACADEMY_PRECALL_URL ||
   "https://www.llbrows.com/pre-call"
@@ -2489,6 +2500,241 @@ function normalizeAcademyApplication(body = {}) {
   };
 }
 
+function isAcademyZoomConfigured() {
+  return Boolean(
+    ZOOM_ACCOUNT_ID &&
+    ZOOM_CLIENT_ID &&
+    ZOOM_CLIENT_SECRET &&
+    ZOOM_HOST_EMAIL
+  );
+}
+
+async function getAcademyZoomAccessToken() {
+  if (!isAcademyZoomConfigured()) {
+    throw new Error("Zoom credentials are missing in Render environment variables.");
+  }
+
+  const now = Date.now();
+
+  if (
+    zoomAccessTokenCache.accessToken &&
+    zoomAccessTokenCache.expiresAt &&
+    now < zoomAccessTokenCache.expiresAt - 60 * 1000
+  ) {
+    return zoomAccessTokenCache.accessToken;
+  }
+
+  const basic = Buffer.from(
+    `${ZOOM_CLIENT_ID}:${ZOOM_CLIENT_SECRET}`
+  ).toString("base64");
+
+  const params = new URLSearchParams({
+    grant_type: "account_credentials",
+    account_id: ZOOM_ACCOUNT_ID
+  });
+
+  const response = await fetch(
+    `https://zoom.us/oauth/token?${params.toString()}`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Basic ${basic}`,
+        accept: "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+      }
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || !data?.access_token) {
+    console.error("Zoom OAuth error:", {
+      status: response.status,
+      reason: data?.reason,
+      error: data?.error
+    });
+
+    throw new Error(
+      data?.reason ||
+      data?.error ||
+      `Could not generate Zoom access token (${response.status}).`
+    );
+  }
+
+  const expiresIn = Number(data.expires_in || 3600);
+
+  zoomAccessTokenCache = {
+    accessToken: data.access_token,
+    expiresAt: Date.now() + expiresIn * 1000
+  };
+
+  return zoomAccessTokenCache.accessToken;
+}
+
+async function academyZoomRequest(path, options = {}) {
+  const accessToken = await getAcademyZoomAccessToken();
+
+  const response = await fetch(
+    `https://api.zoom.us/v2${path}`,
+    {
+      method: options.method || "GET",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        accept: "application/json",
+        ...(options.body ? { "content-type": "application/json" } : {})
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    console.error("Zoom API error:", {
+      path,
+      status: response.status,
+      code: data?.code,
+      message: data?.message
+    });
+
+    const error = new Error(
+      data?.message ||
+      `Zoom API request failed (${response.status}).`
+    );
+
+    error.status = response.status;
+    error.zoom = data;
+    throw error;
+  }
+
+  return data;
+}
+
+async function createAcademyZoomMeeting(booking) {
+  const fullName = cleanLeadField(booking?.full_name, 120) || "Candidate";
+  const timezone = cleanLeadField(
+    booking?.timezone || GOOGLE_CALENDAR_TIMEZONE,
+    100
+  ) || GOOGLE_CALENDAR_TIMEZONE;
+
+  const meeting = await academyZoomRequest(
+    `/users/${encodeURIComponent(ZOOM_HOST_EMAIL)}/meetings`,
+    {
+      method: "POST",
+      body: {
+        topic: `LL Brows Academy - Private PMU Career & Business Audit - ${fullName}`.slice(0, 200),
+        type: 2,
+        start_time: new Date(booking.starts_at).toISOString(),
+        duration: VAGARO_ACADEMY_DURATION_MINUTES,
+        timezone,
+        agenda: "Private PMU Career & Business Audit with Ludimilla Leite"
+      }
+    }
+  );
+
+  if (!meeting?.id || !meeting?.join_url) {
+    throw new Error("Zoom did not return a meeting ID and participant join URL.");
+  }
+
+  return {
+    meetingId: String(meeting.id),
+    joinUrl: String(meeting.join_url),
+    createdAt: new Date().toISOString()
+  };
+}
+
+async function updateAcademyGoogleEventWithZoom(booking) {
+  if (!booking?.google_event_id || !booking?.zoom_join_url) return;
+
+  const encodedCalendarId = encodeURIComponent(GOOGLE_CALENDAR_ID);
+  const eventId = encodeURIComponent(booking.google_event_id);
+
+  const description = [
+    "Private PMU Career & Business Audit",
+    `Candidate: ${booking.full_name || ""}`,
+    `Email: ${booking.email || ""}`,
+    `Phone: ${booking.phone || ""}`,
+    `Join Zoom Meeting: ${booking.zoom_join_url}`,
+    "Source: LL Brows Academy funnel"
+  ].join("\\n");
+
+  await googleCalendarRequest(
+    `/calendars/${encodedCalendarId}/events/${eventId}?sendUpdates=none`,
+    {
+      method: "PATCH",
+      body: {
+        location: "Zoom",
+        description
+      }
+    }
+  );
+}
+
+async function ensureAcademyZoomMeeting(booking) {
+  if (!booking?.id) {
+    throw new Error("Academy booking ID is required before creating Zoom meeting.");
+  }
+
+  if (booking.zoom_meeting_id && booking.zoom_join_url) {
+    return booking;
+  }
+
+  if (!isAcademyZoomConfigured()) {
+    throw new Error("Zoom is not configured for LL Brows Academy.");
+  }
+
+  try {
+    const zoom = await createAcademyZoomMeeting(booking);
+
+    const { data, error } = await academySupabase
+      .from("academy_bookings")
+      .update({
+        zoom_meeting_id: zoom.meetingId,
+        zoom_join_url: zoom.joinUrl,
+        zoom_created_at: zoom.createdAt,
+        zoom_last_error: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", booking.id)
+      .select(
+        "id, application_id, google_event_id, booking_fingerprint, full_name, email, phone, appointment_date, appointment_time, starts_at, ends_at, timezone, service, professional, reminders_consent, status, zoom_meeting_id, zoom_join_url, zoom_created_at, zoom_last_error, created_at, updated_at"
+      )
+      .single();
+
+    if (error || !data) {
+      throw new Error(
+        error?.message ||
+        "Zoom meeting was created but could not be saved to the Academy booking."
+      );
+    }
+
+    try {
+      await updateAcademyGoogleEventWithZoom(data);
+    } catch (calendarError) {
+      console.error(
+        "Academy Zoom meeting saved, but Google Calendar event could not be updated with Zoom link:",
+        calendarError
+      );
+    }
+
+    return data;
+  } catch (err) {
+    try {
+      await academySupabase
+        .from("academy_bookings")
+        .update({
+          zoom_last_error: String(err?.message || err).slice(0, 1200),
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", booking.id);
+    } catch (saveError) {
+      console.error("Could not save Academy Zoom error:", saveError);
+    }
+
+    throw err;
+  }
+}
+
 function isAcademyEmailConfigured() {
   return Boolean(RESEND_API_KEY && ACADEMY_EMAIL_FROM);
 }
@@ -2714,24 +2960,28 @@ function academyNotificationCopy(notification) {
         `<p><a href="${preCallUrl}">Review your pre-call preparation</a></p>` +
         `<p>LL Brows Academy</p>`,
       sms:
-        `LL Brows Academy reminder: Your private session with Ludimilla Leite is tomorrow, ${when}. Please plan for approximately 45 minutes. Reply STOP to opt out or HELP for help.`
+        `LL Brows Academy reminder: your private session with Ludimilla is tomorrow, ${when}. Prepare: ${ACADEMY_PRECALL_URL}`
     };
   }
 
   if (notification.kind === "reminder_2h") {
+    const zoomJoinUrl = cleanLeadField(booking.zoom_join_url, 2000);
+    const safeZoomJoinUrl = escapeAcademyHtml(zoomJoinUrl);
+
     return {
       subject: "Your LL Brows Academy session starts in about 2 hours",
       text:
         `Hi ${firstName}, your private LL Brows Academy session with Ludimilla Leite starts in about 2 hours. ` +
-        `Scheduled time: ${when}. Please join from a quiet place.`,
+        `Scheduled time: ${when}. Join Zoom: ${zoomJoinUrl}`,
       html:
         `<p>Hi ${safeFirstName},</p>` +
         `<p>Your private LL Brows Academy session with Ludimilla Leite starts in about <strong>2 hours</strong>.</p>` +
         `<p><strong>${safeWhen}</strong></p>` +
+        `<p><a href="${safeZoomJoinUrl}"><strong>Join your Zoom session</strong></a></p>` +
         `<p>Please join from a quiet place where you can focus.</p>` +
         `<p>LL Brows Academy</p>`,
       sms:
-        `LL Brows Academy reminder: Your private session with Ludimilla Leite begins in about 2 hours. ${when}. We look forward to speaking with you. Reply STOP to opt out or HELP for help.`
+        `LL Brows Academy reminder: your private session with Ludimilla starts in about 2 hours. ${when}. Join Zoom: ${zoomJoinUrl} Reply STOP to opt out or HELP for help.`
     };
   }
 
@@ -2750,7 +3000,7 @@ function academyNotificationCopy(notification) {
       `<p>We look forward to learning more about your goals.</p>` +
       `<p>LL Brows Academy</p>`,
     sms:
-      `LL Brows Academy: Your Private PMU Career & Business Audit with Ludimilla Leite is confirmed for ${when}. Prepare here: ${ACADEMY_PRECALL_URL}. Reply STOP to opt out or HELP for help.`
+      `LL Brows Academy: your private session with Ludimilla is confirmed for ${when}. Prepare here: ${ACADEMY_PRECALL_URL}`
   };
 }
 
@@ -2923,7 +3173,7 @@ async function persistAcademyBooking({
     .from("academy_bookings")
     .upsert(record, { onConflict: "google_event_id" })
     .select(
-      "id, application_id, google_event_id, booking_fingerprint, full_name, email, phone, appointment_date, appointment_time, starts_at, ends_at, timezone, service, professional, reminders_consent, status, created_at, updated_at"
+      "id, application_id, google_event_id, booking_fingerprint, full_name, email, phone, appointment_date, appointment_time, starts_at, ends_at, timezone, service, professional, reminders_consent, status, zoom_meeting_id, zoom_join_url, zoom_created_at, zoom_last_error, created_at, updated_at"
     )
     .single();
 
@@ -3062,6 +3312,21 @@ async function processAcademyNotificationRow(row) {
   try {
     let providerResult;
 
+    if (claimed.kind === "reminder_2h") {
+      const booking = claimed.academy_bookings || claimed.booking || {};
+
+      if (!booking.zoom_join_url || !booking.zoom_meeting_id) {
+        const bookingWithZoom = await ensureAcademyZoomMeeting(booking);
+        claimed.academy_bookings = bookingWithZoom;
+      }
+
+      if (!claimed.academy_bookings?.zoom_join_url) {
+        throw new Error(
+          "The 2-hour reminder was not sent because the Zoom join URL is unavailable."
+        );
+      }
+    }
+
     if (claimed.channel === "email") {
       const copy = academyNotificationCopy(claimed);
 
@@ -3174,7 +3439,11 @@ async function processAcademyNotificationQueue({
         service,
         professional,
         reminders_consent,
-        status
+        status,
+        zoom_meeting_id,
+        zoom_join_url,
+        zoom_created_at,
+        zoom_last_error
       )
     `)
     .in("status", ["pending", "failed"])
@@ -3278,6 +3547,18 @@ async function finalizeAcademyBooking({
     throw err;
   }
 
+  let zoomWarning = null;
+
+  try {
+    booking = await ensureAcademyZoomMeeting(booking);
+  } catch (err) {
+    zoomWarning = String(err?.message || err);
+    console.error(
+      "Academy booking confirmed, but Zoom meeting creation failed. It will be retried before the 2-hour reminder:",
+      err
+    );
+  }
+
   let queueResult = {
     queued: 0
   };
@@ -3305,7 +3586,8 @@ async function finalizeAcademyBooking({
     booking,
     queueResult,
     confirmationResult,
-    notificationWarning
+    notificationWarning,
+    zoomWarning
   };
 }
 
@@ -4532,6 +4814,39 @@ app.post("/academy/process-reminders", async (req, res) => {
   }
 });
 
+app.get("/academy/zoom-check", async (_, res) => {
+  if (!isAcademyZoomConfigured()) {
+    return res.status(503).json({
+      status: 503,
+      ok: false,
+      zoomConfigured: false,
+      error: "Zoom is not fully configured in Render environment variables."
+    });
+  }
+
+  try {
+    await getAcademyZoomAccessToken();
+
+    return res.json({
+      status: 200,
+      ok: true,
+      zoomConfigured: true,
+      hostConfigured: Boolean(ZOOM_HOST_EMAIL),
+      message: "Zoom Server-to-Server OAuth connection is working."
+    });
+  } catch (err) {
+    console.error("Erro /academy/zoom-check:", err);
+
+    return res.status(503).json({
+      status: 503,
+      ok: false,
+      zoomConfigured: true,
+      error: "Zoom OAuth connection failed.",
+      details: String(err?.message || err)
+    });
+  }
+});
+
 app.get("/academy/system-check", async (_, res) => {
   const checks = {
     databaseConfigured: Boolean(
@@ -4542,6 +4857,8 @@ app.get("/academy/system-check", async (_, res) => {
     emailConfigured: isAcademyEmailConfigured(),
     internalEmailMode: "client-web3forms",
     smsConfigured: isAcademySmsConfigured(),
+    zoomConfigured: isAcademyZoomConfigured(),
+    zoomHostConfigured: Boolean(ZOOM_HOST_EMAIL),
     cronSecretConfigured: Boolean(ACADEMY_CRON_SECRET)
   };
 
@@ -4814,10 +5131,13 @@ app.get("/health", (_, res) => {
       confirmRoute: "/academy/confirm-session",
       reminderWorkerRoute: "/academy/process-reminders",
       systemCheckRoute: "/academy/system-check",
+      zoomCheckRoute: "/academy/zoom-check",
       emailConfigured: isAcademyEmailConfigured(),
       internalEmailMode: "client-web3forms",
       internalEmailRecipient: "lltouch@outlook.com",
       smsConfigured: isAcademySmsConfigured(),
+      zoomConfigured: isAcademyZoomConfigured(),
+      zoomHostConfigured: Boolean(ZOOM_HOST_EMAIL),
       cronSecretConfigured: Boolean(ACADEMY_CRON_SECRET)
     }
   });
