@@ -2714,7 +2714,7 @@ function academyNotificationCopy(notification) {
         `<p><a href="${preCallUrl}">Review your pre-call preparation</a></p>` +
         `<p>LL Brows Academy</p>`,
       sms:
-        `LL Brows Academy reminder: your private session with Ludimilla is tomorrow, ${when}. Prepare: ${ACADEMY_PRECALL_URL}`
+        `LL Brows Academy reminder: Your private session with Ludimilla Leite is tomorrow, ${when}. Please plan for approximately 45 minutes. Reply STOP to opt out or HELP for help.`
     };
   }
 
@@ -2731,7 +2731,7 @@ function academyNotificationCopy(notification) {
         `<p>Please join from a quiet place where you can focus.</p>` +
         `<p>LL Brows Academy</p>`,
       sms:
-        `LL Brows Academy reminder: your private session with Ludimilla starts in about 2 hours. ${when}.`
+        `LL Brows Academy reminder: Your private session with Ludimilla Leite begins in about 2 hours. ${when}. We look forward to speaking with you. Reply STOP to opt out or HELP for help.`
     };
   }
 
@@ -2750,7 +2750,7 @@ function academyNotificationCopy(notification) {
       `<p>We look forward to learning more about your goals.</p>` +
       `<p>LL Brows Academy</p>`,
     sms:
-      `LL Brows Academy: your private session with Ludimilla is confirmed for ${when}. Prepare here: ${ACADEMY_PRECALL_URL}`
+      `LL Brows Academy: Your Private PMU Career & Business Audit with Ludimilla Leite is confirmed for ${when}. Prepare here: ${ACADEMY_PRECALL_URL}. Reply STOP to opt out or HELP for help.`
   };
 }
 
