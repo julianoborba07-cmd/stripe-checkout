@@ -1971,6 +1971,35 @@ function academyGoogleEventInterval(event) {
   }
 }
 
+function isAcademyFunnelGoogleEvent(event) {
+  return String(
+    event?.extendedProperties?.private?.llBrowsAcademy || ""
+  ).trim() === "1";
+}
+
+function isVagaroSyncedGoogleEvent(event) {
+  // Events created by our own Academy funnel must continue blocking time,
+  // even if a later sync adds other metadata.
+  if (isAcademyFunnelGoogleEvent(event)) {
+    return false;
+  }
+
+  const searchable = [
+    event?.description,
+    event?.location,
+    event?.source?.url,
+    event?.htmlLink
+  ]
+    .filter(Boolean)
+    .map((value) => String(value))
+    .join("\n");
+
+  // Vagaro -> Google imported events include a Vagaro googlecalendar link.
+  // Vagaro is already the authoritative availability source, so counting
+  // these imported mirror events again would double-block the same schedule.
+  return /vagaro\.com\/merchants\/googlecalendar/i.test(searchable);
+}
+
 async function getAcademyGoogleBusyEventsForRange(startDate, endDate) {
   if (!isGoogleCalendarConfigured()) {
     throw new Error("Google Calendar is not configured.");
@@ -2013,6 +2042,10 @@ async function getAcademyGoogleBusyEventsForRange(startDate, endDate) {
     );
 
     for (const event of Array.isArray(data?.items) ? data.items : []) {
+      if (isVagaroSyncedGoogleEvent(event)) {
+        continue;
+      }
+
       const interval = academyGoogleEventInterval(event);
       if (interval) events.push(interval);
     }
