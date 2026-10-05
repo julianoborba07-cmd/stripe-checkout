@@ -4432,6 +4432,107 @@ app.post("/vagaro/academy-available-dates", checkoutLimiter, async (req, res) =>
   }
 });
 
+// TEMPORARY DIAGNOSTIC — compares Vagaro slots against Google Calendar BUSY filtering.
+// Example:
+//   /vagaro/academy-availability-debug?date=2026-10-16
+// This endpoint exposes only scheduling times/intervals, never credentials or event titles.
+app.get("/vagaro/academy-availability-debug", checkoutLimiter, async (req, res) => {
+  try {
+    const date = formatDateOnly(req.query?.date);
+
+    if (!date) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid date. Use ?date=YYYY-MM-DD."
+      });
+    }
+
+    const availability = await searchVagaroAvailability({
+      date,
+      serviceId: VAGARO_ACADEMY_SERVICE_ID,
+      addOnIds: []
+    });
+
+    const vagaroSlots = normalizeAcademyAvailability(
+      availability,
+      date
+    ).filter(
+      (slot) => normalizeAcademyDateValue(slot.date, null) === date
+    );
+
+    const googleBusyEvents = await getAcademyGoogleBusyEventsForRange(
+      date,
+      date
+    );
+
+    const finalSlots = filterAcademySlotsAgainstGoogle(
+      vagaroSlots,
+      googleBusyEvents
+    );
+
+    const slotAnalysis = vagaroSlots.map((slot) => {
+      const interval = academySlotInterval(slot);
+
+      const conflicts = interval
+        ? googleBusyEvents.filter(
+            (event) =>
+              interval.start < event.end &&
+              interval.end > event.start
+          )
+        : [];
+
+      return {
+        time: slot.time,
+        normalizedTime: normalizeAcademyTime(slot.time),
+        startUtc: interval?.start?.toISOString?.() || null,
+        endUtc: interval?.end?.toISOString?.() || null,
+        blockedByGoogle: conflicts.length > 0,
+        conflictingBusyIntervals: conflicts.map((event) => ({
+          startUtc: event.start?.toISOString?.() || null,
+          endUtc: event.end?.toISOString?.() || null
+        }))
+      };
+    });
+
+    return res.json({
+      status: 200,
+      ok: true,
+      date,
+      service: {
+        serviceId: VAGARO_ACADEMY_SERVICE_ID,
+        configuredTitle: VAGARO_ACADEMY_SERVICE_TITLE,
+        actualServiceFoundByDiagnostic:
+          "45 min Discovery Call - LL Brows Academy –",
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
+      },
+      professional: {
+        name: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+      },
+      counts: {
+        vagaroSlots: vagaroSlots.length,
+        googleBusyIntervals: googleBusyEvents.length,
+        finalSlots: finalSlots.length
+      },
+      vagaroTimes: vagaroSlots.map((slot) => slot.time),
+      finalTimes: finalSlots.map((slot) => slot.time),
+      googleBusyIntervals: googleBusyEvents.map((event) => ({
+        startUtc: event.start?.toISOString?.() || null,
+        endUtc: event.end?.toISOString?.() || null
+      })),
+      slotAnalysis
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/academy-availability-debug:", err);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Could not compare Vagaro and Google availability",
+      details: String(err?.message || err || "")
+    });
+  }
+});
+
 // LL Brows Academy availability.
 // Uses the same Vagaro business/provider as LL Touch, but does not depend on
 // Stripe checkout or alter the existing LL Touch /vagaro/availability route.
