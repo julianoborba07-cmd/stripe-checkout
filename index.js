@@ -2169,8 +2169,38 @@ async function discoverAcademyAvailableDates({
     }
 
     for (const date of groupDates) {
-      if (!found.has(date) && groups.get(date)?.length) {
-        found.set(date, groups.get(date));
+      const incoming = Array.isArray(groups.get(date))
+        ? groups.get(date)
+        : [];
+
+      if (incoming.length) {
+        const existing = Array.isArray(found.get(date))
+          ? found.get(date)
+          : [];
+
+        const merged = [...existing];
+
+        for (const slot of incoming) {
+          const normalizedTime = normalizeAcademyTime(slot?.time);
+
+          if (
+            normalizedTime &&
+            !merged.some(
+              (item) =>
+                normalizeAcademyTime(item?.time) === normalizedTime
+            )
+          ) {
+            merged.push(slot);
+          }
+        }
+
+        merged.sort((a, b) =>
+          String(normalizeAcademyTime(a?.time) || "").localeCompare(
+            String(normalizeAcademyTime(b?.time) || "")
+          )
+        );
+
+        found.set(date, merged);
       }
 
       if (found.size >= wantedDates) break;
