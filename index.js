@@ -4253,6 +4253,132 @@ app.post("/academy/application", checkoutLimiter, async (req, res) => {
   }
 });
 
+// TEMPORARY DIAGNOSTIC — LL Brows Academy Vagaro service discovery.
+// Lists only services assigned to Ludimilla that are relevant to Academy
+// discovery (title contains "academy" or "discovery", or duration is 45 min).
+// No Vagaro credentials or access tokens are exposed.
+app.get("/vagaro/academy-service-candidates", checkoutLimiter, async (req, res) => {
+  try {
+    const pageSize = 100;
+    const allServices = [];
+
+    for (let pageNumber = 1; pageNumber <= 20; pageNumber++) {
+      const data = await vagaroRequest(
+        `/api/v2/services?pageNumber=${pageNumber}&pageSize=${pageSize}`,
+        {
+          method: "POST",
+          scope: VAGARO_SCOPE,
+          body: {
+            businessId: VAGARO_BUSINESS_ID
+          }
+        }
+      );
+
+      const services = Array.isArray(data?.data?.services)
+        ? data.data.services
+        : [];
+
+      allServices.push(...services);
+
+      const nextPage = String(data?.data?.nextPage || "").trim();
+
+      if (!nextPage || services.length < pageSize) {
+        break;
+      }
+    }
+
+    const ludimillaServices = allServices
+      .map((service = {}) => {
+        const performers = Array.isArray(service.servicePerformedBy)
+          ? service.servicePerformedBy
+          : [];
+
+        const ludimilla = performers.find(
+          (item) =>
+            item?.serviceProviderId === VAGARO_LUDIMILLA_PROVIDER_ID
+        );
+
+        if (!ludimilla) return null;
+
+        return {
+          serviceId: service.serviceId || "",
+          serviceTitle: service.serviceTitle || "",
+          parentServiceId: service.parentServiceId || "",
+          parentServiceTitle: service.parentServiceTitle || "",
+          showOnlineStatus: service.showOnlineStatus || "",
+          type: service.type || "",
+          serviceProviderId: ludimilla.serviceProviderId,
+          durationMinutes: Number(ludimilla.durationMinutes || 0),
+          price: Number(ludimilla.price || 0),
+          priceWithTax: Number(ludimilla.priceWithTax || 0),
+          currency: ludimilla.currency || service.currency || "USD"
+        };
+      })
+      .filter(Boolean);
+
+    const relevant = ludimillaServices
+      .filter((item) => {
+        const title = String(item.serviceTitle || "").toLowerCase();
+        const parent = String(item.parentServiceTitle || "").toLowerCase();
+
+        return (
+          item.durationMinutes === VAGARO_ACADEMY_DURATION_MINUTES ||
+          title.includes("academy") ||
+          title.includes("discovery") ||
+          parent.includes("academy")
+        );
+      })
+      .sort((a, b) => {
+        const aDiscovery = /discovery/i.test(a.serviceTitle) ? 0 : 1;
+        const bDiscovery = /discovery/i.test(b.serviceTitle) ? 0 : 1;
+
+        if (aDiscovery !== bDiscovery) {
+          return aDiscovery - bDiscovery;
+        }
+
+        const aAcademy = /academy/i.test(
+          `${a.serviceTitle} ${a.parentServiceTitle}`
+        ) ? 0 : 1;
+
+        const bAcademy = /academy/i.test(
+          `${b.serviceTitle} ${b.parentServiceTitle}`
+        ) ? 0 : 1;
+
+        if (aAcademy !== bAcademy) {
+          return aAcademy - bAcademy;
+        }
+
+        return String(a.serviceTitle || "").localeCompare(
+          String(b.serviceTitle || "")
+        );
+      });
+
+    return res.json({
+      status: 200,
+      ok: true,
+      professional: {
+        name: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+      },
+      currentlyConfigured: {
+        serviceId: VAGARO_ACADEMY_SERVICE_ID,
+        serviceTitle: VAGARO_ACADEMY_SERVICE_TITLE,
+        durationMinutes: VAGARO_ACADEMY_DURATION_MINUTES
+      },
+      relevantServicesFound: relevant.length,
+      services: relevant
+    });
+  } catch (err) {
+    console.error("Erro /vagaro/academy-service-candidates:", err);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Could not retrieve Vagaro Academy service candidates",
+      details: String(err?.message || err || "")
+    });
+  }
+});
+
 // LL Brows Academy — next dates that actually contain openings.
 // Scans forward using Vagaro's returned appointmentDate as a jump cursor,
 // which avoids querying every empty calendar day one by one.
