@@ -2442,6 +2442,11 @@ async function getAcademyGoogleConflicts(startUtc, endUtc) {
   return (Array.isArray(data?.items) ? data.items : []).filter((event) => {
     if (!event || event.status === "cancelled") return false;
     if (event.transparency === "transparent") return false;
+    // Keep final confirmation consistent with availability.
+    // Vagaro-synced Google events are mirrors of data already considered by Vagaro,
+    // so they must not block the same slot a second time.
+    if (isVagaroSyncedGoogleEvent(event)) return false;
+
     return true;
   });
 }
