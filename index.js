@@ -3067,6 +3067,27 @@ function academyNotificationCopy(notification) {
     };
   }
 
+  if (notification.kind === "reminder_30m") {
+    const zoomJoinUrl = cleanLeadField(booking.zoom_join_url, 2000);
+    const safeZoomJoinUrl = escapeAcademyHtml(zoomJoinUrl);
+
+    return {
+      subject: "Your LL Brows Academy session starts in 30 minutes",
+      text:
+        `Hi ${firstName}, your private LL Brows Academy session with Ludimilla Leite starts in 30 minutes. ` +
+        `Scheduled time: ${when}. Join Zoom: ${zoomJoinUrl}`,
+      html:
+        `<p>Hi ${safeFirstName},</p>` +
+        `<p>Your private LL Brows Academy session with Ludimilla Leite starts in <strong>30 minutes</strong>.</p>` +
+        `<p><strong>${safeWhen}</strong></p>` +
+        `<p><a href="${safeZoomJoinUrl}"><strong>Join your Zoom session</strong></a></p>` +
+        `<p>Please be ready to join from a quiet place where you can focus.</p>` +
+        `<p>LL Brows Academy</p>`,
+      sms:
+        `LL Brows Academy reminder: your private session with Ludimilla starts in 30 minutes. Join Zoom: ${zoomJoinUrl} Reply STOP to opt out or HELP for help.`
+    };
+  }
+
   return {
     subject: "Your LL Brows Academy private session is confirmed",
     text:
@@ -3301,7 +3322,8 @@ async function queueAcademyNotifications(booking) {
   if (booking.reminders_consent) {
     const reminderSchedule = [
       ["reminder_24h", 24 * 60 * 60 * 1000],
-      ["reminder_2h", 2 * 60 * 60 * 1000]
+      ["reminder_2h", 2 * 60 * 60 * 1000],
+      ["reminder_30m", 30 * 60 * 1000]
     ];
 
     for (const [kind, beforeMs] of reminderSchedule) {
@@ -3359,6 +3381,80 @@ async function queueAcademyNotifications(booking) {
   };
 }
 
+async function backfillAcademy30mReminders() {
+  const now = Date.now();
+  const minimumStart = new Date(now + 30 * 60 * 1000).toISOString();
+
+  const { data: bookings, error } = await academySupabase
+    .from("academy_bookings")
+    .select("id, email, phone, starts_at, reminders_consent, status")
+    .eq("status", "confirmed")
+    .eq("reminders_consent", true)
+    .gte("starts_at", minimumStart)
+    .order("starts_at", { ascending: true })
+    .limit(250);
+
+  if (error) {
+    throw new Error(
+      error.message ||
+      "Could not read confirmed Academy bookings for 30-minute reminder backfill."
+    );
+  }
+
+  const rows = [];
+
+  for (const booking of bookings || []) {
+    const startsAtMs = new Date(booking.starts_at).getTime();
+    if (!Number.isFinite(startsAtMs)) continue;
+
+    const scheduledAt = new Date(startsAtMs - 30 * 60 * 1000).toISOString();
+    const email = String(booking.email || "").trim().toLowerCase();
+    const phone = normalizeAcademyPhoneE164(booking.phone);
+
+    if (email) {
+      rows.push({
+        booking_id: booking.id,
+        channel: "email",
+        kind: "reminder_30m",
+        recipient: email,
+        scheduled_at: scheduledAt,
+        status: "pending"
+      });
+    }
+
+    if (phone) {
+      rows.push({
+        booking_id: booking.id,
+        channel: "sms",
+        kind: "reminder_30m",
+        recipient: phone,
+        scheduled_at: scheduledAt,
+        status: "pending"
+      });
+    }
+  }
+
+  if (!rows.length) {
+    return { queued: 0 };
+  }
+
+  const { error: upsertError } = await academySupabase
+    .from("academy_notifications")
+    .upsert(rows, {
+      onConflict: "booking_id,channel,kind",
+      ignoreDuplicates: true
+    });
+
+  if (upsertError) {
+    throw new Error(
+      upsertError.message ||
+      "Could not backfill Academy 30-minute reminders."
+    );
+  }
+
+  return { queued: rows.length };
+}
+
 async function claimAcademyNotification(row) {
   const nextAttempts = Number(row.attempts || 0) + 1;
 
@@ -3394,7 +3490,7 @@ async function processAcademyNotificationRow(row) {
   try {
     let providerResult;
 
-    if (claimed.kind === "reminder_2h") {
+    if (["reminder_2h", "reminder_30m"].includes(claimed.kind)) {
       const booking = claimed.academy_bookings || claimed.booking || {};
 
       if (!booking.zoom_join_url || !booking.zoom_meeting_id) {
@@ -3404,7 +3500,7 @@ async function processAcademyNotificationRow(row) {
 
       if (!claimed.academy_bookings?.zoom_join_url) {
         throw new Error(
-          "The 2-hour reminder was not sent because the Zoom join URL is unavailable."
+          `${claimed.kind} was not sent because the Zoom join URL is unavailable.`
         );
       }
     }
@@ -4880,11 +4976,13 @@ app.post("/academy/process-reminders", async (req, res) => {
   }
 
   try {
+    const backfill30m = await backfillAcademy30mReminders();
     const result = await processAcademyNotificationQueue();
 
     return res.json({
       status: 200,
       ok: true,
+      backfill30m,
       ...result
     });
   } catch (err) {
