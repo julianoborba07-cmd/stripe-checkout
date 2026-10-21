@@ -1253,29 +1253,17 @@ function resolveVagaroServiceFromSiteItem(siteItem = {}) {
     const exactKey = normalizeKey(exactName);
     const exact = VAGARO_SERVICE_MAP.laser.byServiceName[exactKey];
 
-    if (exact) {
-      return {
-        ...exact,
-        addOnIds: []
-      };
-    }
-
+    // Never silently substitute a different laser service or price tier.
     const area = normalizeKey(siteItem.area || siteItem.areaSize);
-    const fallback = VAGARO_SERVICE_MAP.laser.defaultByArea[area];
-
-    if (!fallback) return null;
-
-    return {
-      ...fallback,
-      addOnIds: []
-    };
+    if (!exact || !area || normalizeKey(exact.category) !== `lhr-${area}-area`) {
+      return null;
+    }
+    return { ...exact, addOnIds: [] };
   }
 
   if (type === "full-body") {
-    return {
-      ...VAGARO_SERVICE_MAP["full-body"],
-      addOnIds: []
-    };
+    // Requires a true procedure service ID and duration, not a 15-min Payment item.
+    return null;
   }
 
   return null;
@@ -1405,6 +1393,31 @@ function siteItemFromLineItem(lineItem) {
 function buildBookingOptionsFromSession(session) {
   const options = [];
   const seen = new Set();
+
+  // New LL Touch checkout: exact purchased service names are carried per item.
+  // Supports more than one *different* treatment in the same paid order.
+  // Packages (3/6/8 treatments) schedule their first appointment here.
+  const itemKeys = Object.keys(session.metadata || {})
+    .filter((key) => /^lltouch_item_\d+$/.test(key))
+    .sort((a, b) => Number(a.split("_").pop()) - Number(b.split("_").pop()));
+
+  for (const key of itemKeys) {
+    const purchased = safeJsonParse(session.metadata[key], null);
+    if (!purchased || !purchased.type) continue;
+    const service = resolveVagaroServiceFromSiteItem(purchased);
+    if (!service || seen.has(service.serviceId)) continue;
+    seen.add(service.serviceId);
+    options.push({
+      index: options.length,
+      source: "lltouch_checkout_metadata",
+      siteItem: purchased,
+      vagaroService: service,
+      professional: {
+        name: "Ludimilla Leite",
+        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+      }
+    });
+  }
 
   const primaryFromMetadata = safeJsonParse(session.metadata?.primary_site_item, null);
 
@@ -4178,6 +4191,28 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
 
     const primarySiteItem = buildPrimarySiteItemMetadata(items);
 
+    // Preserve the exact purchased treatment/area for scheduling. Fixed Stripe
+    // Price IDs alone identify the price tier, not the chosen laser area.
+    // One short metadata entry per cart item (Stripe max 500 chars/value).
+    const llTouchBookingItemsMetadata = {};
+    items.forEach((item, index) => {
+      const compact = {
+        type: item.type,
+        service: item.service || item.serviceKey || null,
+        area: item.area || item.areaSize || null,
+        package: item.package || item.packageKey || null,
+        addon: item.addon || item.addonKey || null,
+        quantity: Number(item.quantity || item.qty || 1),
+        services: Array.isArray(item.services)
+          ? item.services.slice(0, 6).map((value) =>
+              cleanLeadField(typeof value === "object" ? (value.service || value.name) : value, 50)
+            )
+          : undefined
+      };
+      llTouchBookingItemsMetadata[`lltouch_item_${index}`] =
+        JSON.stringify(compact).slice(0, 490);
+    });
+
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer_email: email,
@@ -4194,6 +4229,7 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
         cart_items_count: String(items.length),
         cashback_used_amount: String(cashbackUsedAmount),
         primary_site_item: primarySiteItem,
+        ...llTouchBookingItemsMetadata,
         ...metadata
       },
 
@@ -5076,6 +5112,364 @@ app.get("/academy/system-check", async (_, res) => {
   });
 });
 
+// ==============================
+// LL TOUCH — STRIPE-PAID CALENDAR RESERVATIONS
+// Same Google Calendar as LL Brows Academy; own table & event marker.
+// Google -> Vagaro creates a BUSY Personal Task, NOT a Vagaro appointment.
+// ==============================
+
+const LLTOUCH_SERVICE_CALENDAR_TIMEZONE = GOOGLE_CALENDAR_TIMEZONE;
+
+function llTouchPaidSession(session) {
+  return session?.mode === "payment" && session?.payment_status === "paid";
+}
+
+function llTouchAppointmentWindow(date, rawTime, durationMinutes) {
+  const isoDate = formatDateOnly(date);
+  const normalizedTime = normalizeAcademyTime(rawTime);
+  const duration = Number(durationMinutes);
+  if (!isoDate || !normalizedTime || !Number.isInteger(duration) || duration < 10 || duration > 240) {
+    return null;
+  }
+
+  const endWallClock = addAcademyMinutes(isoDate, normalizedTime, duration);
+  if (!endWallClock) return null;
+
+  const start = zonedAcademyDateToUtc(isoDate, normalizedTime, LLTOUCH_SERVICE_CALENDAR_TIMEZONE);
+  const end = zonedAcademyDateToUtc(endWallClock.date, endWallClock.time, LLTOUCH_SERVICE_CALENDAR_TIMEZONE);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start) {
+    return null;
+  }
+
+  return { date: isoDate, time: normalizedTime, start, end, endWallClock };
+}
+
+function llTouchAppointmentEventId(sessionId, serviceId, date, time) {
+  const digest = crypto.createHash("sha256")
+    .update(`lltouch|${VAGARO_LUDIMILLA_PROVIDER_ID}|${sessionId}|${serviceId}|${date}|${time}`)
+    .digest("hex").slice(0, 48);
+  return `llto${digest}`;
+}
+
+function llTouchCalendarIntervalOverlaps(window, event) {
+  return window.start < event.end && window.end > event.start;
+}
+
+function llTouchAppointmentsReadiness() {
+  return Boolean(
+    process.env.SUPABASE_SERVICE_ROLE_KEY &&
+    isGoogleCalendarConfigured() &&
+    isVagaroConfigured()
+  );
+}
+
+function llTouchPublicAppointment(record) {
+  return {
+    serviceId: record.service_id,
+    serviceTitle: record.service_title,
+    appointmentDate: record.appointment_date,
+    appointmentTime: record.appointment_time,
+    durationMinutes: record.duration_minutes,
+    startsAt: record.starts_at,
+    endsAt: record.ends_at,
+    timeZone: LLTOUCH_SERVICE_CALENDAR_TIMEZONE,
+    status: record.status,
+    bookingId: record.id
+  };
+}
+
+async function llTouchReadBookings(sessionId) {
+  const { data, error } = await academySupabase
+    .from("lltouch_appointments")
+    .select("id,stripe_session_id,service_id,service_title,appointment_date,appointment_time,duration_minutes,starts_at,ends_at,google_event_id,status,created_at")
+    .eq("stripe_session_id", sessionId)
+    .order("created_at", { ascending: true });
+
+  if (error) throw new Error(error.message || "Could not read LL Touch appointments.");
+  return data || [];
+}
+
+function llTouchBookedResponse(record, alreadyConfirmed = false) {
+  return {
+    ok: true,
+    alreadyConfirmed,
+    message: alreadyConfirmed ? "Appointment already confirmed." : "Appointment confirmed.",
+    appointment: llTouchPublicAppointment(record),
+    calendarSync: "Google Calendar → Vagaro Personal Task (busy)"
+  };
+}
+
+// Reads only appointments associated with a Stripe-paid checkout session.
+app.get("/lltouch/bookings/:sessionId", checkoutLimiter, async (req, res) => {
+  try {
+    const sessionId = cleanLeadField(req.params.sessionId, 160);
+    const session = await getStripeSessionExpanded(sessionId);
+    if (!llTouchPaidSession(session)) {
+      return res.status(403).json({ ok: false, error: "Payment has not been confirmed." });
+    }
+    const rows = await llTouchReadBookings(session.id);
+    return res.json({
+      ok: true,
+      appointments: rows.filter((row) => row.status === "confirmed").map(llTouchPublicAppointment)
+    });
+  } catch (error) {
+    console.error("LL Touch booking status error:", error);
+    return res.status(503).json({ ok: false, error: "Could not load booking status." });
+  }
+});
+
+// Confirms the first appointment for a purchased treatment. A package does
+// not imply booking all future sessions in one transaction.
+app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
+  const sessionId = cleanLeadField(req.body?.session_id, 160);
+  const date = formatDateOnly(req.body?.date);
+  const selectedTime = normalizeAcademyTime(req.body?.time);
+  const selectedIndex = Number(req.body?.item_index);
+
+  if (!sessionId || !date || !selectedTime || !Number.isInteger(selectedIndex) || selectedIndex < 0) {
+    return res.status(400).json({
+      ok: false, code: "INVALID_BOOKING", error: "Choose a valid treatment, date and time."
+    });
+  }
+
+  if (!llTouchAppointmentsReadiness()) {
+    return res.status(503).json({
+      ok: false, code: "BOOKING_NOT_CONFIGURED",
+      error: "Online booking is being prepared. Please contact LL Touch for assistance."
+    });
+  }
+
+  let session;
+  try {
+    session = await getStripeSessionExpanded(sessionId);
+  } catch (error) {
+    console.error("LL Touch Stripe session lookup failed:", error);
+    return res.status(400).json({ ok: false, code: "INVALID_PAYMENT", error: "Could not verify this payment." });
+  }
+
+  if (!llTouchPaidSession(session)) {
+    return res.status(403).json({ ok: false, code: "PAYMENT_NOT_PAID", error: "Payment is not confirmed." });
+  }
+
+  const options = buildBookingOptionsFromSession(session);
+  const selected = options[selectedIndex];
+  if (!selected) {
+    return res.status(400).json({
+      ok: false, code: "SERVICE_NOT_PURCHASED", error: "That treatment is not part of your paid order."
+    });
+  }
+
+  const service = selected.vagaroService;
+  const window = llTouchAppointmentWindow(date, selectedTime, service.durationMinutes);
+  if (!window || window.start.getTime() < Date.now() + 10 * 60 * 1000) {
+    return res.status(400).json({
+      ok: false, code: "INVALID_APPOINTMENT_TIME",
+      error: "Choose an available time at least 10 minutes from now."
+    });
+  }
+
+  // One initial appointment per distinct purchased treatment for this order.
+  let rows;
+  try {
+    rows = await llTouchReadBookings(session.id);
+  } catch (error) {
+    console.error("LL Touch database is not ready:", error);
+    return res.status(503).json({
+      ok: false, code: "BOOKING_DATABASE_UNAVAILABLE", error: "Appointment scheduling is temporarily unavailable. Please try again."
+    });
+  }
+
+  const existing = rows.find((row) => row.service_id === service.serviceId);
+  if (existing?.status === "confirmed") {
+    return res.json(llTouchBookedResponse(existing, true));
+  }
+
+  // Incomplete transactions are intentionally not silently replaced. They
+  // may already have created a Google event; contact the clinic for recovery.
+  if (existing) {
+    return res.status(409).json({
+      ok: false, code: "BOOKING_REVIEW_REQUIRED",
+      error: "We need to check a previous booking attempt. Please contact LL Touch before trying again."
+    });
+  }
+
+  // Recheck Vagaro immediately before booking: never trust a frontend slot.
+  let availability;
+  try {
+    availability = await searchVagaroAvailability({
+      date, serviceId: service.serviceId, addOnIds: service.addOnIds || []
+    });
+  } catch (error) {
+    console.error("LL Touch Vagaro revalidation failed:", error);
+    return res.status(503).json({
+      ok: false, code: "VAGARO_UNAVAILABLE", error: "We could not verify the selected time. Please try again."
+    });
+  }
+
+  const available = availability.data.some((day) =>
+    normalizeAcademyDateValue(day.appointmentDate, date) === date &&
+    (day.timeSlot || []).some((slotTime) => normalizeAcademyTime(slotTime) === selectedTime)
+  );
+
+  if (!available) {
+    return res.status(409).json({
+      ok: false, code: "SLOT_TAKEN", error: "This time is no longer available. Please select another time."
+    });
+  }
+
+  // Unlike Vagaro-synced mirror events, independently created Google BUSY
+  // events (including Academy sessions and existing LL Touch bookings) block.
+  try {
+    const busy = await getAcademyGoogleBusyEventsForRange(date, window.endWallClock.date);
+    if (busy.some((event) => llTouchCalendarIntervalOverlaps(window, event))) {
+      return res.status(409).json({
+        ok: false, code: "GOOGLE_SLOT_TAKEN", error: "This time has just been reserved. Please choose another."
+      });
+    }
+  } catch (error) {
+    console.error("LL Touch Google conflict check failed:", error);
+    return res.status(503).json({
+      ok: false, code: "GOOGLE_UNAVAILABLE", error: "We could not verify the calendar. Please try again."
+    });
+  }
+
+  const eventId = llTouchAppointmentEventId(session.id, service.serviceId, date, selectedTime);
+  const customerEmail = cleanLeadField(session.customer_details?.email || session.customer_email || session.metadata?.customer_email, 254).toLowerCase();
+  const customerName = cleanLeadField(session.metadata?.full_name || session.customer_details?.name || "LL Touch Client", 120);
+  const siteItem = selected.siteItem || {};
+  const itemSummary = [
+    siteItem.service || siteItem.serviceKey || service.title,
+    siteItem.area || "",
+    siteItem.package ? `Package: ${siteItem.package}` : "",
+    siteItem.addon && siteItem.addon !== "none" ? `Add-on: ${siteItem.addon}` : "",
+    Array.isArray(siteItem.services) && siteItem.services.length
+      ? `Areas: ${siteItem.services.join(", ")}` : ""
+  ].filter(Boolean).join(" | ");
+
+  const record = {
+    stripe_session_id: session.id,
+    customer_name: customerName,
+    customer_email: customerEmail,
+    service_id: service.serviceId,
+    service_title: service.title,
+    service_details: itemSummary,
+    item_index: selectedIndex,
+    provider_id: VAGARO_LUDIMILLA_PROVIDER_ID,
+    appointment_date: date,
+    appointment_time: selectedTime,
+    duration_minutes: Number(service.durationMinutes),
+    starts_at: window.start.toISOString(),
+    ends_at: window.end.toISOString(),
+    google_event_id: eventId,
+    paid_total_cents: session.amount_total,
+    status: "pending"
+  };
+
+  // Atomic booking hold: Postgres exclusion constraint prevents overlap of
+  // two LL Touch bookings even across parallel Render server instances.
+  const { data: pending, error: insertError } = await academySupabase
+    .from("lltouch_appointments")
+    .insert(record)
+    .select("*")
+    .single();
+
+  if (insertError || !pending) {
+    if (["23505", "23P01"].includes(String(insertError?.code || ""))) {
+      return res.status(409).json({
+        ok: false, code: "SLOT_RESERVED", error: "This time or treatment is already reserved. Please reload the schedule."
+      });
+    }
+    console.error("LL Touch database booking hold failed:", insertError);
+    return res.status(503).json({
+      ok: false, code: "DATABASE_ERROR", error: "We could not complete the reservation. Please try again."
+    });
+  }
+
+  const eventBody = {
+    id: eventId,
+    summary: `LL Touch | ${service.title} | ${customerName} | PAID`,
+    description: [
+      "LL Touch paid appointment — Google Calendar -> Vagaro BUSY Personal Task",
+      `Customer: ${customerName}`,
+      `Email: ${customerEmail}`,
+      `Service: ${service.title}`,
+      `Purchase details: ${itemSummary || service.title}`,
+      `Paid order total: ${((session.amount_total || 0) / 100).toFixed(2)} ${String(session.currency || "usd").toUpperCase()}`,
+      `Stripe checkout session: ${session.id}`,
+      `LL Touch booking reference: ${pending.id}`,
+      "If service history is required, convert this Personal Task into a Vagaro appointment."
+    ].join("\n"),
+    status: "confirmed",
+    visibility: "private",
+    transparency: "opaque",
+    start: { dateTime: `${date}T${selectedTime}:00`, timeZone: LLTOUCH_SERVICE_CALENDAR_TIMEZONE },
+    end: { dateTime: `${window.endWallClock.date}T${window.endWallClock.time}:00`, timeZone: LLTOUCH_SERVICE_CALENDAR_TIMEZONE },
+    extendedProperties: {
+      private: {
+        llTouchBooking: "1",
+        stripeSessionId: session.id,
+        llTouchBookingId: pending.id,
+        serviceId: service.serviceId
+      }
+    }
+  };
+
+  try {
+    const googleCalendarId = encodeURIComponent(GOOGLE_CALENDAR_ID);
+    await googleCalendarRequest(
+      `/calendars/${googleCalendarId}/events?sendUpdates=none`,
+      { method: "POST", body: eventBody }
+    );
+  } catch (error) {
+    console.error("LL Touch event creation failed:", error);
+
+    // On uncertain network failures the event might have been created;
+    // check its deterministic ID before deciding this reservation failed.
+    let exists = false;
+    try {
+      const remote = await googleCalendarRequest(
+        `/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events/${encodeURIComponent(eventId)}`
+      );
+      exists = remote?.extendedProperties?.private?.llTouchBookingId === pending.id;
+    } catch (checkError) {
+      console.error("LL Touch event recovery lookup failed:", checkError);
+    }
+
+    if (!exists) {
+      // A failed reservation doesn't block the calendar at DB level. Its
+      // unique Stripe+service record is retained for safe manual review.
+      await academySupabase.from("lltouch_appointments")
+        .update({ status: "failed", updated_at: new Date().toISOString() })
+        .eq("id", pending.id).eq("status", "pending");
+      return res.status(503).json({
+        ok: false, code: "CALENDAR_BOOKING_FAILED",
+        error: "We couldn't safely confirm your time. Please contact LL Touch to complete the booking."
+      });
+    }
+  }
+
+  const { data: confirmed, error: updateError } = await academySupabase
+    .from("lltouch_appointments")
+    .update({ status: "confirmed", updated_at: new Date().toISOString() })
+    .eq("id", pending.id)
+    .eq("status", "pending")
+    .select("*")
+    .single();
+
+  if (updateError || !confirmed) {
+    console.error("LL Touch event created but DB finalization failed:", updateError);
+    return res.status(503).json({
+      ok: false, code: "BOOKING_REVIEW_REQUIRED",
+      error: "Your time may already be reserved. Please contact LL Touch before retrying."
+    });
+  }
+
+  // Clear Academy's availability cache so this LL Touch slot disappears
+  // immediately for candidates using the shared Google Calendar.
+  clearAcademyAvailableDatesCache();
+  return res.status(201).json(llTouchBookedResponse(confirmed));
+});
+
 app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
   try {
     const sessionId = cleanLeadField(req.body.session_id, 120);
@@ -5119,9 +5513,9 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
       addOnIds: selected.vagaroService.addOnIds || []
     });
 
-    const slots = availability.data.flatMap((day) =>
+    const rawSlots = availability.data.flatMap((day) =>
       (day.timeSlot || []).map((time) => ({
-        date: day.appointmentDate,
+        date: normalizeAcademyDateValue(day.appointmentDate, date),
         time,
         professional: "Ludimilla Leite",
         serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
@@ -5129,6 +5523,29 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
         serviceTitle: selected.vagaroService.title
       }))
     );
+
+    if (!isGoogleCalendarConfigured()) {
+      return res.status(503).json({
+        ok: false, error: "Calendar verification is temporarily unavailable. Please try again."
+      });
+    }
+
+    const busyEvents = await getAcademyGoogleBusyEventsForRange(
+      date,
+      academyAddDaysISO(date, 1)
+    );
+    const slots = rawSlots.filter((slot) => {
+      const window = llTouchAppointmentWindow(
+        slot.date,
+        slot.time,
+        selected.vagaroService.durationMinutes
+      );
+      return Boolean(
+        window &&
+        window.start.getTime() >= Date.now() + 10 * 60 * 1000 &&
+        !busyEvents.some((event) => llTouchCalendarIntervalOverlaps(window, event))
+      );
+    });
 
     res.json({
       status: 200,
@@ -5150,7 +5567,7 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
       rawAvailability: availability.data,
       fallbackUrl: VAGARO_LISTING_URL,
       note:
-        "Vagaro API returned availability. Final appointment confirmation must happen through Vagaro because Create Appointment is not available in this API access level."
+        "Vagaro availability rechecked against shared Google Calendar. Final confirmation creates a Google BUSY event synced as a Vagaro Personal Task."
     });
   } catch (err) {
     console.error("Erro /vagaro/availability:", err);
