@@ -5199,6 +5199,132 @@ function llTouchBookedResponse(record, alreadyConfirmed = false) {
   };
 }
 
+// ==============================
+// LL TOUCH — READ-ONLY VAGARO DURATION AUDIT
+// Admin-only diagnostic: does not modify bookings, calendars, catalog or prices.
+// Compares our currently configured duration to Ludimilla's own Vagaro
+// durationMinutes entry for the exact serviceId.
+// ==============================
+function llTouchConfiguredServiceDurations() {
+  const entries = [];
+  const add = (siteArea, service) => {
+    if (!service?.serviceId) return;
+    entries.push({
+      siteArea,
+      serviceId: service.serviceId,
+      configuredTitle: service.title || "",
+      configuredCategory: service.category || "",
+      configuredDurationMinutes: Number(service.durationMinutes || 0)
+    });
+  };
+
+  add("morpheus", VAGARO_SERVICE_MAP.morpheus);
+  Object.entries(VAGARO_SERVICE_MAP.facial || {}).forEach(([key, service]) => add(`facial.${key}`, service));
+  Object.entries(VAGARO_SERVICE_MAP["med-spa"] || {}).forEach(([key, service]) => add(`med-spa.${key}`, service));
+  Object.entries(VAGARO_SERVICE_MAP.laser?.byServiceName || {}).forEach(([key, service]) => add(`laser.${key}`, service));
+  // Report Full Body, even though the current booking flow deliberately
+  // excludes this 15-minute payment item from direct booking.
+  add("full-body.NOT_AUTOMATICALLY_BOOKABLE", VAGARO_SERVICE_MAP["full-body"]);
+  return entries;
+}
+
+app.get("/lltouch/vagaro-duration-audit", checkoutLimiter, async (req, res) => {
+  const auth = String(req.headers.authorization || "");
+  const provided = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!ACADEMY_CRON_SECRET) {
+    return res.status(503).json({ ok: false, error: "Audit authorization is not configured." });
+  }
+  const expected = Buffer.from(ACADEMY_CRON_SECRET);
+  const received = Buffer.from(provided);
+  if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized." });
+  }
+
+  try {
+    const configured = llTouchConfiguredServiceDurations();
+    const requiredIds = new Set(configured.map((item) => item.serviceId));
+    const catalogById = new Map();
+    const pageSize = 100;
+    let pagesRead = 0;
+    let hasMore = false;
+
+    for (let page = 1; page <= 20; page++) {
+      const response = await vagaroRequest(
+        `/api/v2/services?pageNumber=${page}&pageSize=${pageSize}`,
+        { method: "POST", body: { businessId: VAGARO_BUSINESS_ID } }
+      );
+      const services = response?.data?.services;
+      if (!Array.isArray(services)) {
+        return res.status(502).json({
+          ok: false, error: "Vagaro did not return the expected services array. Nothing was verified."
+        });
+      }
+      pagesRead++;
+      services.forEach((service) => {
+        if (!requiredIds.has(service.serviceId)) return;
+        const performer = (Array.isArray(service.servicePerformedBy) ? service.servicePerformedBy : [])
+          .find((person) => person?.serviceProviderId === VAGARO_LUDIMILLA_PROVIDER_ID);
+        if (!catalogById.has(service.serviceId)) catalogById.set(service.serviceId, []);
+        catalogById.get(service.serviceId).push({
+          serviceTitle: String(service.serviceTitle || ""),
+          category: String(service.parentServiceTitle || ""),
+          showOnlineStatus: service.showOnlineStatus || null,
+          providerFound: Boolean(performer),
+          durationMinutes: performer ? Number(performer.durationMinutes) : null
+        });
+      });
+      const nextPage = response?.data?.nextPage;
+      hasMore = Boolean(nextPage);
+      if (!hasMore) break;
+    }
+
+    if (hasMore) {
+      return res.status(502).json({
+        ok: false, pagesRead, error: "Service catalog exceeded the audit page limit; results would be incomplete."
+      });
+    }
+
+    const report = configured.map((item) => {
+      const matches = catalogById.get(item.serviceId) || [];
+      const candidate = matches.find((entry) => entry.providerFound && Number.isInteger(entry.durationMinutes));
+      let status = "MATCH";
+      if (matches.length === 0) status = "NOT_FOUND_IN_VAGARO";
+      else if (matches.length > 1) status = "AMBIGUOUS_MULTIPLE_RECORDS";
+      else if (!candidate) status = "NO_VALID_LUDIMILLA_DURATION";
+      else if (candidate.durationMinutes <= 0) status = "INVALID_VAGARO_DURATION";
+      else if (candidate.durationMinutes !== item.configuredDurationMinutes) status = "DURATION_MISMATCH";
+      return {
+        ...item,
+        vagaroTitle: candidate?.serviceTitle ?? matches[0]?.serviceTitle ?? null,
+        vagaroDurationMinutes: candidate?.durationMinutes ?? null,
+        vagaroCategory: candidate?.category ?? matches[0]?.category ?? null,
+        status
+      };
+    });
+    const counts = report.reduce((all, row) => { all[row.status] = (all[row.status] || 0) + 1; return all; }, {});
+    return res.json({
+      ok: true,
+      readOnly: true,
+      professional: "Ludimilla Leite",
+      pagesRead,
+      totalMappedServices: report.length,
+      counts,
+      allExactDurationsMatch: report.every((row) => row.status === "MATCH"),
+      importantNotes: [
+        "Only the main service duration is checked against Vagaro. Add-on and cleanup times are NOT verified by this audit.",
+        "Full Body is listed for review but is intentionally not bookable through this Google Calendar flow.",
+        "This diagnostic does not alter Stripe, Vagaro, Google Calendar, Supabase, LL Brows Academy or LL Brows Studio."
+      ],
+      services: report
+    });
+  } catch (error) {
+    console.error("LL Touch duration audit failure:", String(error?.message || error));
+    return res.status(503).json({
+      ok: false, error: "Could not read the Vagaro service catalog. No durations were verified."
+    });
+  }
+});
+
 // Reads only appointments associated with a Stripe-paid checkout session.
 app.get("/lltouch/bookings/:sessionId", checkoutLimiter, async (req, res) => {
   try {
