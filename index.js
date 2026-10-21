@@ -1190,22 +1190,64 @@ const VAGARO_SERVICE_MAP = {
   }
 };
 
-function resolveVagaroAddOns(siteItem = {}) {
-  const addon = normalizeKey(siteItem.addon || siteItem.addonKey || "");
+// Confirmed manually in Ludimilla's Vagaro catalog on 2026-10-21:
+// each individual add-on contributes 10 minutes to the appointment.
+// This is NOT a cleanup/buffer setting; any cleanup time needs separate review.
+const LLTOUCH_ADDON_DURATION_MINUTES = 10;
 
-  if (!addon || addon === "none") return [];
+// Only map real, already-known Vagaro add-on IDs. A null value means the
+// add-on is sold by LL Touch but its Vagaro add-on ID has NOT been verified.
+// Never silently drop that add-on from an automatically booked appointment.
+const LLTOUCH_VAGARO_ADDON_COMBINATIONS = Object.freeze({
+  none: [],
+  led10: ["led10"],
+  led20: ["led20"],
+  peel: null,
+  dermaplaning: null,
+  exosomes: ["exosomes"],
+  neck: ["neck"],
+  decollete: ["decollete"],
+  "led10-neck": ["led10", "neck"],
+  "exosomes-neck": ["exosomes", "neck"]
+});
 
-  const addOns = [];
+function resolveLlTouchVagaroAddOns(siteItem = {}) {
+  const addonKey = normalizeKey(siteItem.addon || siteItem.addonKey || "none") || "none";
+  const hasKey = Object.prototype.hasOwnProperty.call(LLTOUCH_VAGARO_ADDON_COMBINATIONS, addonKey);
+  const keys = hasKey ? LLTOUCH_VAGARO_ADDON_COMBINATIONS[addonKey] : undefined;
 
-  if (addon.includes("led10")) addOns.push(VAGARO_ADD_ON_IDS.led10);
-  if (addon.includes("led20")) addOns.push(VAGARO_ADD_ON_IDS.led20);
-  if (addon.includes("exosomes") || addon.includes("exo")) {
-    addOns.push(VAGARO_ADD_ON_IDS.exosomes);
+  // Peel and in-facial Dermaplaning have no confirmed Vagaro add-on IDs yet.
+  // They need staff-assisted scheduling until their actual IDs are supplied.
+  if (keys === null) {
+    return { addOnIds: [], addOnDurationMinutes: LLTOUCH_ADDON_DURATION_MINUTES, unsupportedAddOn: addonKey };
   }
-  if (addon.includes("neck")) addOns.push(VAGARO_ADD_ON_IDS.neck);
-  if (addon.includes("decollete")) addOns.push(VAGARO_ADD_ON_IDS.decollete);
+  if (!Array.isArray(keys)) {
+    return { addOnIds: [], addOnDurationMinutes: 0, unsupportedAddOn: addonKey };
+  }
 
-  return [...new Set(addOns.filter(Boolean))];
+  const ids = keys.map((key) => VAGARO_ADD_ON_IDS[key]);
+  if (ids.some((id) => !id) || new Set(ids).size !== ids.length) {
+    return { addOnIds: [], addOnDurationMinutes: keys.length * LLTOUCH_ADDON_DURATION_MINUTES, unsupportedAddOn: addonKey };
+  }
+
+  return {
+    addOnIds: ids,
+    addOnDurationMinutes: ids.length * LLTOUCH_ADDON_DURATION_MINUTES,
+    unsupportedAddOn: null
+  };
+}
+
+function llTouchWithAddOnDuration(service, siteItem) {
+  const addOns = resolveLlTouchVagaroAddOns(siteItem);
+  return {
+    ...service,
+    ...addOns,
+    bookingDurationMinutes: Number(service.durationMinutes) + addOns.addOnDurationMinutes
+  };
+}
+
+function llTouchBookingNeedsManualScheduling(service) {
+  return Boolean(service.unsupportedAddOn);
 }
 
 function resolveVagaroServiceFromSiteItem(siteItem = {}) {
@@ -1214,7 +1256,10 @@ function resolveVagaroServiceFromSiteItem(siteItem = {}) {
   if (type === "morpheus") {
     return {
       ...VAGARO_SERVICE_MAP.morpheus,
-      addOnIds: []
+      addOnIds: [],
+      addOnDurationMinutes: 0,
+      bookingDurationMinutes: VAGARO_SERVICE_MAP.morpheus.durationMinutes,
+      unsupportedAddOn: null
     };
   }
 
@@ -1224,10 +1269,7 @@ function resolveVagaroServiceFromSiteItem(siteItem = {}) {
 
     if (!service) return null;
 
-    return {
-      ...service,
-      addOnIds: resolveVagaroAddOns(siteItem)
-    };
+    return llTouchWithAddOnDuration(service, siteItem);
   }
 
   if (type === "med-spa") {
@@ -1236,10 +1278,7 @@ function resolveVagaroServiceFromSiteItem(siteItem = {}) {
 
     if (!service) return null;
 
-    return {
-      ...service,
-      addOnIds: resolveVagaroAddOns(siteItem)
-    };
+    return llTouchWithAddOnDuration(service, siteItem);
   }
 
   if (type === "laser") {
@@ -1258,7 +1297,8 @@ function resolveVagaroServiceFromSiteItem(siteItem = {}) {
     if (!exact || !area || normalizeKey(exact.category) !== `lhr-${area}-area`) {
       return null;
     }
-    return { ...exact, addOnIds: [] };
+    return { ...exact, addOnIds: [], addOnDurationMinutes: 0,
+      bookingDurationMinutes: exact.durationMinutes, unsupportedAddOn: null };
   }
 
   if (type === "full-body") {
@@ -3896,7 +3936,10 @@ app.get("/checkout-session/:id", async (req, res) => {
               serviceId: vagaroService.serviceId,
               title: vagaroService.title,
               category: vagaroService.category,
-              durationMinutes: vagaroService.durationMinutes
+              durationMinutes: vagaroService.bookingDurationMinutes,
+              baseDurationMinutes: vagaroService.durationMinutes,
+              addOnDurationMinutes: vagaroService.addOnDurationMinutes,
+              canBookOnline: !llTouchBookingNeedsManualScheduling(vagaroService)
             }
           : null
       };
@@ -3909,7 +3952,13 @@ app.get("/checkout-session/:id", async (req, res) => {
       serviceId: option.vagaroService.serviceId,
       serviceTitle: option.vagaroService.title,
       category: option.vagaroService.category,
-      durationMinutes: option.vagaroService.durationMinutes,
+      durationMinutes: option.vagaroService.bookingDurationMinutes,
+      baseDurationMinutes: option.vagaroService.durationMinutes,
+      addOnDurationMinutes: option.vagaroService.addOnDurationMinutes,
+      canBookOnline: !llTouchBookingNeedsManualScheduling(option.vagaroService),
+      ...(option.vagaroService.unsupportedAddOn
+        ? { unsupportedAddOn: option.vagaroService.unsupportedAddOn }
+        : {}),
       professional: option.professional,
       fallbackUrl: VAGARO_LISTING_URL
     }));
@@ -5386,7 +5435,15 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
   }
 
   const service = selected.vagaroService;
-  const window = llTouchAppointmentWindow(date, selectedTime, service.durationMinutes);
+  if (llTouchBookingNeedsManualScheduling(service)) {
+    return res.status(422).json({
+      ok: false,
+      code: "ADDON_REQUIRES_MANUAL_BOOKING",
+      error: "This add-on needs staff-assisted scheduling. Please contact LL Touch to book the complete treatment.",
+      fallbackUrl: VAGARO_LISTING_URL
+    });
+  }
+  const window = llTouchAppointmentWindow(date, selectedTime, service.bookingDurationMinutes);
   if (!window || window.start.getTime() < Date.now() + 10 * 60 * 1000) {
     return res.status(400).json({
       ok: false, code: "INVALID_APPOINTMENT_TIME",
@@ -5483,7 +5540,7 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
     provider_id: VAGARO_LUDIMILLA_PROVIDER_ID,
     appointment_date: date,
     appointment_time: selectedTime,
-    duration_minutes: Number(service.durationMinutes),
+    duration_minutes: Number(service.bookingDurationMinutes),
     starts_at: window.start.toISOString(),
     ends_at: window.end.toISOString(),
     google_event_id: eventId,
@@ -5632,6 +5689,14 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
     }
 
     const selected = bookingOptions[selectedIndex] || bookingOptions[0];
+    if (llTouchBookingNeedsManualScheduling(selected.vagaroService)) {
+      return res.status(422).json({
+        ok: false,
+        code: "ADDON_REQUIRES_MANUAL_BOOKING",
+        error: "This add-on needs staff-assisted scheduling. Please contact LL Touch to book the complete treatment.",
+        fallbackUrl: VAGARO_LISTING_URL
+      });
+    }
 
     const availability = await searchVagaroAvailability({
       date,
@@ -5664,7 +5729,7 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
       const window = llTouchAppointmentWindow(
         slot.date,
         slot.time,
-        selected.vagaroService.durationMinutes
+        selected.vagaroService.bookingDurationMinutes
       );
       return Boolean(
         window &&
@@ -5682,7 +5747,9 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
         serviceId: selected.vagaroService.serviceId,
         title: selected.vagaroService.title,
         category: selected.vagaroService.category,
-        durationMinutes: selected.vagaroService.durationMinutes,
+        durationMinutes: selected.vagaroService.bookingDurationMinutes,
+        baseDurationMinutes: selected.vagaroService.durationMinutes,
+        addOnDurationMinutes: selected.vagaroService.addOnDurationMinutes,
         addOnIds: selected.vagaroService.addOnIds || []
       },
       professional: {
@@ -5717,7 +5784,13 @@ app.get("/vagaro/booking-options/:sessionId", async (req, res) => {
       serviceId: option.vagaroService.serviceId,
       serviceTitle: option.vagaroService.title,
       category: option.vagaroService.category,
-      durationMinutes: option.vagaroService.durationMinutes,
+      durationMinutes: option.vagaroService.bookingDurationMinutes,
+      baseDurationMinutes: option.vagaroService.durationMinutes,
+      addOnDurationMinutes: option.vagaroService.addOnDurationMinutes,
+      canBookOnline: !llTouchBookingNeedsManualScheduling(option.vagaroService),
+      ...(option.vagaroService.unsupportedAddOn
+        ? { unsupportedAddOn: option.vagaroService.unsupportedAddOn }
+        : {}),
       professional: option.professional,
       fallbackUrl: VAGARO_LISTING_URL
     }));
