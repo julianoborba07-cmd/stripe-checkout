@@ -1225,7 +1225,17 @@ function resolveLlTouchVagaroAddOns(siteItem = {}) {
     return { addOnIds: [], addOnDurationMinutes: 0, unsupportedAddOn: addonKey };
   }
 
-  const ids = keys.map((key) => VAGARO_ADD_ON_IDS[key]);
+  // Verified in Vagaro on 2026-10-23: Microneedling + Neck ($50 / 10min)
+  // corresponds to the "Add Face & Neck" add-on, not "Morpheus8 - Neck".
+  // Apply this substitution ONLY to Microneedling; the other services'
+  // neck mappings have not been validated and must not be silently changed.
+  const isMicroneedling = siteItem.type === "med-spa" &&
+    normalizeKey(siteItem.service || siteItem.serviceKey) === "microneedling";
+  const vagaroKeys = isMicroneedling
+    ? keys.map((key) => key === "neck" ? "face-neck" : key)
+    : keys;
+
+  const ids = vagaroKeys.map((key) => VAGARO_ADD_ON_IDS[key]);
   if (ids.some((id) => !id) || new Set(ids).size !== ids.length) {
     return { addOnIds: [], addOnDurationMinutes: keys.length * LLTOUCH_ADDON_DURATION_MINUTES, unsupportedAddOn: addonKey };
   }
@@ -1711,7 +1721,18 @@ async function searchVagaroAvailability({ date, serviceId, addOnIds = [] }) {
     body
   });
 
-  const availability = Array.isArray(data?.data) ? data.data : [];
+  // Vagaro can return HTTP 200 / status 200 with a business-level error
+  // inside data.error (e.g. "Addon is not associated with particular service").
+  // Never misrepresent this as "no times available" to the client.
+  if (!Array.isArray(data?.data)) {
+    const vagaroError = data?.data?.error;
+    if (vagaroError) {
+      console.error("Vagaro rejected availability request:", String(vagaroError).slice(0, 300));
+      throw new Error("Vagaro rejected the requested service/add-on combination.");
+    }
+    throw new Error("Unexpected Vagaro availability response format.");
+  }
+  const availability = data.data;
 
   const normalized = availability.map((day) => ({
     vagaroUrl: day.vagaroUrl || "llbrows",
