@@ -440,7 +440,7 @@ function getFacialPrice(item) {
 // "oxi-laser-facial" to match the printed list; "hydrafacial" is new.
 // ==============================
 const MEDSPA_BASE_PRICES = {
-  microneedling: { label: "Microneedling", durationMinutes: 75, single: 200, 3: 450 },
+  microneedling: { label: "Microneedling", durationMinutes: 60, single: 200, 3: 450 },
   llumigold: { label: "LLumiGold", durationMinutes: 105, single: 250, 3: 600 },
   "oxi-laser-facial": { label: "Oxi Laser Facial", durationMinutes: 15, single: 180, 3: 450 },
   "glow-up-laser-facial": { label: "Glow Up Laser Facial", durationMinutes: 30, single: 250, 3: 600 },
@@ -960,7 +960,7 @@ const VAGARO_SERVICE_MAP = {
       serviceId: "7qDQIfdCmFEk~7nIlCDP5A==",
       title: "Microneedling",
       category: "Med Spa Treatments",
-      durationMinutes: 75
+      durationMinutes: 60
     },
     llumigold: {
       serviceId: "glQz6wa2UA1twxLJuhudOA==",
@@ -1006,13 +1006,13 @@ const VAGARO_SERVICE_MAP = {
         serviceId: "aeHet9LRV-14nm5GaUWsdg==",
         title: "Under Arms",
         category: "LHR-Medium Area",
-        durationMinutes: 15
+        durationMinutes: 20
       },
       large: {
         serviceId: "38t6KJORzDvPC-c1Ph75ug==",
         title: "Full Brazilian",
         category: "LHR-Large Area",
-        durationMinutes: 15
+        durationMinutes: 20
       },
       xlarge: {
         serviceId: "jVv9Y2entpIc6r9pP8MuTQ==",
@@ -1081,7 +1081,7 @@ const VAGARO_SERVICE_MAP = {
         serviceId: "aeHet9LRV-14nm5GaUWsdg==",
         title: "Under Arms",
         category: "LHR-Medium Area",
-        durationMinutes: 15
+        durationMinutes: 20
       },
       shoulders: {
         serviceId: "fzFWc-OKl5tWCNL7KAoniw==",
@@ -1117,13 +1117,13 @@ const VAGARO_SERVICE_MAP = {
         serviceId: "38t6KJORzDvPC-c1Ph75ug==",
         title: "Full Brazilian",
         category: "LHR-Large Area",
-        durationMinutes: 15
+        durationMinutes: 20
       },
       "full-face": {
         serviceId: "10bcP6KOfgrIFq3b6DjwIQ==",
         title: "Full Face",
         category: "LHR-Large Area",
-        durationMinutes: 15
+        durationMinutes: 20
       },
       buttocks: {
         serviceId: "s6HaxBtKSDBtFf7cKZfThg==",
@@ -1159,13 +1159,13 @@ const VAGARO_SERVICE_MAP = {
         serviceId: "mkq2R6sLFGZLt4mmkibvBg==",
         title: "Legs-Lower",
         category: "LHR-Large Area",
-        durationMinutes: 15
+        durationMinutes: 20
       },
       "legs-upper": {
         serviceId: "W8kD7lwRwUwJ65DbU~mSzg==",
         title: "Legs-Upper",
         category: "LHR-Large Area",
-        durationMinutes: 15
+        durationMinutes: 20
       },
       "full-back": {
         serviceId: "jVv9Y2entpIc6r9pP8MuTQ==",
