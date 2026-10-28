@@ -918,7 +918,8 @@ const VAGARO_ADD_ON_IDS = {
   neck: "l6lQaQqf112TOf217gvVPg==",
   decollete: "8NpulR54BaxrMhXSwGnmTg==",
   "face-neck": "rQN1Iw400eiBYengNo9ovQ==",
-  dermaplaning: "2ifqcCVCys8uxvA4m2iEiw==" // Dermaplaning Add-On, $30, 10 min (verify catalog ID before deploy)
+  dermaplaning: "2ifqcCVCys8uxvA4m2iEiw==", // Dermaplaning Add-On, $30, 10 min
+  peel: "b8Cw92YTfGH35wxJudLoEw==" // Peel Add-On, $65, 10 min; validated for LL Signature/LL Deluxe
 };
 
 const VAGARO_SERVICE_MAP = {
@@ -1215,7 +1216,7 @@ const LLTOUCH_VAGARO_ADDON_COMBINATIONS = Object.freeze({
   none: [],
   led10: ["led10"],
   led20: ["led20"],
-  peel: null,
+  peel: ["peel"],
   dermaplaning: ["dermaplaning"],
   exosomes: ["exosomes"],
   neck: ["neck"],
@@ -1229,8 +1230,7 @@ function resolveLlTouchVagaroAddOns(siteItem = {}) {
   const hasKey = Object.prototype.hasOwnProperty.call(LLTOUCH_VAGARO_ADDON_COMBINATIONS, addonKey);
   const keys = hasKey ? LLTOUCH_VAGARO_ADDON_COMBINATIONS[addonKey] : undefined;
 
-  // Peel has no verified Vagaro add-on ID and requires staff-assisted booking.
-  // Dermaplaning Add-On is verified only for LL Signature and LL Deluxe.
+  // Peel and Dermaplaning Add-Ons are verified only for LL Signature and LL Deluxe.
   if (keys === null) {
     return { addOnIds: [], addOnDurationMinutes: LLTOUCH_ADDON_DURATION_MINUTES, unsupportedAddOn: addonKey };
   }
@@ -1239,9 +1239,9 @@ function resolveLlTouchVagaroAddOns(siteItem = {}) {
   }
 
   // 2026-10-28: Only these two facial services were validated by the Vagaro
-  // availability API with Dermaplaning Add-On. Other combinations must remain
+  // availability API with Peel and Dermaplaning Add-Ons. Other combinations remain
   // staff-assisted until the service/add-on association is verified.
-  if (addonKey === "dermaplaning") {
+  if (addonKey === "dermaplaning" || addonKey === "peel") {
     const facialKey = normalizeKey(siteItem.service || siteItem.serviceKey);
     const tested = siteItem.type === "facial" &&
       (facialKey === "ll-signature" || facialKey === "classic-deluxe");
