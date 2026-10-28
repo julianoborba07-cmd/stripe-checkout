@@ -917,7 +917,8 @@ const VAGARO_ADD_ON_IDS = {
   exosomes: "aqCIVAQTOBHy~JUD~dJUnA==",
   neck: "l6lQaQqf112TOf217gvVPg==",
   decollete: "8NpulR54BaxrMhXSwGnmTg==",
-  "face-neck": "rQN1Iw400eiBYengNo9ovQ=="
+  "face-neck": "rQN1Iw400eiBYengNo9ovQ==",
+  dermaplaning: "2ifqcCVCys8uxvA4m2iEiw==" // Dermaplaning Add-On, $30, 10 min (verify catalog ID before deploy)
 };
 
 const VAGARO_SERVICE_MAP = {
@@ -1215,7 +1216,7 @@ const LLTOUCH_VAGARO_ADDON_COMBINATIONS = Object.freeze({
   led10: ["led10"],
   led20: ["led20"],
   peel: null,
-  dermaplaning: null,
+  dermaplaning: ["dermaplaning"],
   exosomes: ["exosomes"],
   neck: ["neck"],
   decollete: ["decollete"],
@@ -1228,13 +1229,25 @@ function resolveLlTouchVagaroAddOns(siteItem = {}) {
   const hasKey = Object.prototype.hasOwnProperty.call(LLTOUCH_VAGARO_ADDON_COMBINATIONS, addonKey);
   const keys = hasKey ? LLTOUCH_VAGARO_ADDON_COMBINATIONS[addonKey] : undefined;
 
-  // Peel and in-facial Dermaplaning have no confirmed Vagaro add-on IDs yet.
-  // They need staff-assisted scheduling until their actual IDs are supplied.
+  // Peel has no verified Vagaro add-on ID and requires staff-assisted booking.
+  // Dermaplaning Add-On is verified only for LL Signature and LL Deluxe.
   if (keys === null) {
     return { addOnIds: [], addOnDurationMinutes: LLTOUCH_ADDON_DURATION_MINUTES, unsupportedAddOn: addonKey };
   }
   if (!Array.isArray(keys)) {
     return { addOnIds: [], addOnDurationMinutes: 0, unsupportedAddOn: addonKey };
+  }
+
+  // 2026-10-28: Only these two facial services were validated by the Vagaro
+  // availability API with Dermaplaning Add-On. Other combinations must remain
+  // staff-assisted until the service/add-on association is verified.
+  if (addonKey === "dermaplaning") {
+    const facialKey = normalizeKey(siteItem.service || siteItem.serviceKey);
+    const tested = siteItem.type === "facial" &&
+      (facialKey === "ll-signature" || facialKey === "classic-deluxe");
+    if (!tested) {
+      return { addOnIds: [], addOnDurationMinutes: LLTOUCH_ADDON_DURATION_MINUTES, unsupportedAddOn: addonKey };
+    }
   }
 
   // Verified in Vagaro on 2026-10-23: Microneedling + Neck ($50 / 10min)
