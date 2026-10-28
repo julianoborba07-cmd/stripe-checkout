@@ -390,7 +390,7 @@ const FACIAL_BASE_PRICES = {
   "ll-signature": { label: "LL Signature Facial", durationMinutes: 75, single: 165, 3: 465 },
   "classic-deluxe": { label: "Classic Deluxe Facial", durationMinutes: 60, single: 150, 3: 420 },
   "diamond-glow": { label: "Diamond Glow", durationMinutes: 60, single: 165, 3: 450 },
-  dermaplaning: { label: "Dermaplaning", durationMinutes: 30, single: 150, 3: 350 }
+  dermaplaning: { label: "Dermaplaning", durationMinutes: 60, single: 150, 3: 350 }
 };
 
 // Single-session add-on prices come straight from the printed list. 3-session
@@ -940,11 +940,19 @@ const VAGARO_SERVICE_MAP = {
       title: "LL Deluxe",
       category: "Facial Treatments",
       durationMinutes: 60
+    },
+    "diamond-glow": {
+      serviceId: "9zTHcwvHqBo6VhAYjpVdRg==",
+      title: "Diamond Glow",
+      category: "Facial Treatments",
+      durationMinutes: 60
+    },
+    dermaplaning: {
+      serviceId: "8XANbRGtkjYnxprxaNUSUw==",
+      title: "Dermaplaning",
+      category: "Facial Treatments",
+      durationMinutes: 60
     }
-    // "diamond-glow" and "dermaplaning" are new services with no Vagaro
-    // serviceId yet. resolveVagaroServiceFromSiteItem() returns null for them
-    // (safe no-op) until real Vagaro serviceIds are provided; the booking
-    // flow falls back to VAGARO_LISTING_URL for those two.
   },
 
   "med-spa": {
@@ -977,9 +985,13 @@ const VAGARO_SERVICE_MAP = {
       title: "Brightening Glycolic Peel",
       category: "Peel",
       durationMinutes: 15
+    },
+    hydrafacial: {
+      serviceId: "RCAVN7dx4ToC1Rz0jWS0tA==",
+      title: "Hydra Facial",
+      category: "Facial Treatments",
+      durationMinutes: 60
     }
-    // "hydrafacial" is new, no Vagaro serviceId yet — same fallback behavior
-    // as diamond-glow/dermaplaning above.
   },
 
   laser: {
