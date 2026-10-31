@@ -191,6 +191,20 @@ app.post(
         // Campaign contributions are intentionally isolated from regular LL Touch
         // laser loyalty/cashback calculations; campaign pricing is self-selected.
         if (checkoutBrand === "lltouch" && session.metadata?.campaign === "pwyc-2026-11-09") {
+          // Keep Stripe Customer contact details aligned with the identity
+          // collected BEFORE checkout. The session and PaymentIntent metadata
+          // also retain these details independently of webhook delivery.
+          if (typeof session.customer === "string") {
+            try {
+              await stripe.customers.update(session.customer, {
+                name: cleanLeadField(session.metadata?.full_name, 120),
+                phone: cleanLeadField(session.metadata?.customer_phone, 32),
+                metadata: { brand: "lltouch", campaign: "pwyc-2026-11-09" }
+              });
+            } catch (error) {
+              console.error("LL Touch PWYC customer contact sync failed:", error);
+            }
+          }
           console.log(`LL Touch PWYC campaign payment confirmed: ${session.id}`);
           return res.json({ received: true });
         }
@@ -4269,20 +4283,29 @@ app.post("/lltouch/campaign/nov09/checkout",checkoutLimiter,async(req,res)=>{
     if(!Object.values(LLTOUCH_PROFESSIONALS).every(p=>Boolean(p.providerId&&p.calendarId)))
       return res.status(503).json({error:"Campaign calendars are not fully configured."});
     const email=cleanLeadField(req.body?.email,254).toLowerCase();
+    const fullName=cleanLeadField(req.body?.fullName ?? req.body?.full_name,120);
+    const phone=cleanLeadField(req.body?.phone,32);
+    const phoneDigits=phone.replace(/\D/g,"");
     const items=llTouchParseCampaignItems(req.body?.items);
-    if(!isValidEmail(email)||!items)return res.status(400).json({error:"Please choose up to one facial and one laser, with a valid contribution for each."});
+    if(!isValidEmail(email)||!items||fullName.length<4||!fullName.includes(" ")||
+       !/^\+?[0-9().\s-]{10,32}$/.test(phone)||phoneDigits.length<10||phoneDigits.length>15)
+      return res.status(400).json({error:"Provide your full name, a valid phone number, email, and up to one facial and one laser with valid contributions."});
     // Preflight avoids taking payment for an obviously sold-out service; race remains possible.
     for(const item of items){
       if(!(await llTouchCampaignHasCapacity(item)))return res.status(409).json({error:`No available campaign slots remain for ${item.title}. No payment was taken.`});
     }
-    const metadata={brand:"lltouch",campaign:"pwyc-2026-11-09",customer_email:email,cart_items_count:String(items.length)};
+    const metadata={brand:"lltouch",campaign:"pwyc-2026-11-09",customer_email:email,
+      full_name:fullName,customer_phone:phone,cart_items_count:String(items.length)};
     const lines=items.map((item,i)=>{
       metadata[`lltouch_item_${i}`]=JSON.stringify(item.siteItem);
       return {quantity:1,price_data:{currency:"usd",unit_amount:item.amount,
         product_data:{name:`Pay What You Can — ${item.title}`,description:"One session, November 9, 2026 only. Appointment must be selected after payment.",
           metadata:{source:"lltouch-site",mode:item.siteItem.type,service:item.siteItem.service,area:item.siteItem.area||"",package:"single",campaign:"pwyc-2026-11-09"}}}};
     });
-    const session=await stripe.checkout.sessions.create({mode:"payment",customer_email:email,line_items:lines,metadata,
+    const session=await stripe.checkout.sessions.create({mode:"payment",customer_email:email,
+      customer_creation:"always",line_items:lines,metadata,
+      payment_intent_data:{metadata:{brand:"lltouch",campaign:"pwyc-2026-11-09",customer_email:email,
+        full_name:fullName,customer_phone:phone}},
       success_url:"https://lltouch.com/pay-what-you-can-success?session_id={CHECKOUT_SESSION_ID}&campaign=pwyc-2026-11-09",
       cancel_url:"https://lltouch.com/pay-what-you-can"});
     return res.json({url:session.url});
@@ -5810,6 +5833,7 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
   const eventId = llTouchAppointmentEventId(session.id, service.serviceId, date, selectedTime, professional.providerId);
   const customerEmail = cleanLeadField(session.customer_details?.email || session.customer_email || session.metadata?.customer_email, 254).toLowerCase();
   const customerName = cleanLeadField(session.metadata?.full_name || session.customer_details?.name || "LL Touch Client", 120);
+  const customerPhone = cleanLeadField(session.metadata?.customer_phone || session.customer_details?.phone || "", 32);
   const siteItem = selected.siteItem || {};
   const itemSummary = [
     siteItem.service || siteItem.serviceKey || service.title,
@@ -5866,6 +5890,7 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
       "LL Touch paid appointment — Google Calendar -> Vagaro BUSY Personal Task",
       `Customer: ${customerName}`,
       `Email: ${customerEmail}`,
+      ...(customerPhone ? [`Phone: ${customerPhone}`] : []),
       `Service: ${service.title}`,
       `Professional: ${professional.name}`,
       `Purchase details: ${itemSummary || service.title}`,
