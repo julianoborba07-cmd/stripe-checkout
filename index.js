@@ -1411,12 +1411,22 @@ function llTouchGetProfessional(session, option, requestedKey) {
   const professional = LLTOUCH_PROFESSIONALS[key];
   return professional?.providerId && professional?.calendarId ? { key, ...professional } : null;
 }
+// Align campaign starts on a true clock grid; never invent Vagaro slots.
+// Facial: 10:00, 11:00, ... 16:00. Jenn: 10:00, 10:20, ... 13:40.
+function llTouchCampaignStartAligned(window, professionalKey) {
+  if (!window) return false;
+  const [hour, minute] = window.time.split(":").map(Number);
+  const interval = professionalKey === "jenn" ? 20 : 60;
+  return Number.isInteger(hour) && Number.isInteger(minute) &&
+    (hour * 60 + minute) % interval === 0;
+}
 function llTouchCampaignTimeAllowed(window, professionalKey) {
   if (!window || window.date !== LLTOUCH_CAMPAIGN_DATE) return false;
   const start = Number(window.time.slice(0,2))*60 + Number(window.time.slice(3,5));
   const end = Number(window.endWallClock.time.slice(0,2))*60 + Number(window.endWallClock.time.slice(3,5));
   return window.endWallClock.date === LLTOUCH_CAMPAIGN_DATE && start >= 600 &&
-    end <= (professionalKey === "jenn" ? 840 : 1020);
+    end <= (professionalKey === "jenn" ? 840 : 1020) &&
+    llTouchCampaignStartAligned(window, professionalKey);
 }
 // Exact Vagaro IDs for Studio have NOT yet been fully mapped. No guessed IDs.
 // Set both ID and correct duration per service in Render after the catalog verification.
@@ -4318,7 +4328,11 @@ app.get("/lltouch/campaign/nov09/session/:id",checkoutLimiter,async(req,res)=>{
     if(!llTouchPaidSession(session))return res.status(403).json({error:"Payment is not confirmed."});
     const bookingOptions=buildBookingOptionsFromSession(session);
     const bookings=await llTouchReadBookings(session.id);
-    return res.json({payment_status:session.payment_status,items:bookingOptions.map(o=>({
+    const confirmedCount = bookingOptions.filter(o => bookings.some(b =>
+      b.service_id === o.vagaroService.serviceId && b.status === "confirmed")).length;
+    const requiresManualReview = bookings.some(b => b.status !== "confirmed") ||
+      (confirmedCount > 0 && confirmedCount < bookingOptions.length);
+    return res.json({payment_status:session.payment_status,requiresManualReview,items:bookingOptions.map(o=>({
       index:o.index,title:o.vagaroService.title,category:o.siteItem.type,durationMinutes:o.vagaroService.bookingDurationMinutes,
       providers:llTouchAllowedProfessionals(session,o).map(key=>({id:key,name:LLTOUCH_PROFESSIONALS[key].name})),
       confirmed:bookings.some(b=>b.service_id===o.vagaroService.serviceId&&b.status==="confirmed")
@@ -5970,11 +5984,177 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
   return res.status(201).json(llTouchBookedResponse(confirmed));
 }
 app.post("/lltouch/confirm-appointment", checkoutLimiter, llTouchHandleAppointmentConfirmation);
-app.post("/lltouch/campaign/nov09/confirm", checkoutLimiter, (req,res) => {
-  req.llTouchBookingRoute = "campaign";req.body.date = LLTOUCH_CAMPAIGN_DATE;
-  req.body.professional_key = req.body.professional_key || req.body.provider_id;
-  return llTouchHandleAppointmentConfirmation(req,res);
+app.post("/lltouch/campaign/nov09/confirm", checkoutLimiter, (_req,res) => {
+  return res.status(410).json({ok:false,code:"USE_BATCH_CONFIRMATION",
+    error:"Please refresh the campaign success page to confirm all treatments together."});
 });
+
+// PWYC NOV09: unified confirmation. Requires SQL function lltouch_pwyc_hold_batch.
+// No direct Vagaro write: the Google BUSY events sync to Vagaro Personal Tasks.
+app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, async (req, res) => {
+  if (!LLTOUCH_PWYC_ENABLED || !LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY)
+    return res.status(503).json({ok:false,code:"CAMPAIGN_DISABLED",error:"Campaign scheduling is currently unavailable."});
+  if (!llTouchAppointmentsReadiness())
+    return res.status(503).json({ok:false,code:"BOOKING_UNAVAILABLE",error:"Booking service is not ready."});
+  const sessionId = cleanLeadField(req.body?.session_id, 160);
+  const selections = req.body?.appointments;
+  if (!sessionId || !Array.isArray(selections) || selections.length < 1 || selections.length > 2)
+    return res.status(400).json({ok:false,code:"INVALID_SELECTION",error:"Please select an appointment for each purchased treatment."});
+  let session, options, current;
+  try {
+    session = await getStripeSessionExpanded(sessionId);
+    if (!llTouchPaidSession(session) || !llTouchIsCampaign(session))
+      return res.status(403).json({ok:false,code:"INVALID_ORDER",error:"A paid campaign order is required."});
+    options = buildBookingOptionsFromSession(session);
+    if (!options.length || options.length !== selections.length)
+      return res.status(422).json({ok:false,code:"INCOMPLETE_SELECTION",error:"Select a professional and time for every treatment in this order."});
+    current = await llTouchReadBookings(sessionId);
+  } catch (e) {
+    console.error("PWYC batch order load failed:", String(e?.message || e));
+    return res.status(503).json({ok:false,code:"ORDER_UNAVAILABLE",error:"We could not verify the paid order."});
+  }
+  if (current.length) {
+    const allConfirmed = options.every(o => current.some(r =>
+      r.service_id === o.vagaroService.serviceId && r.status === "confirmed"));
+    if (allConfirmed) return res.json({ok:true,alreadyConfirmed:true,appointments:
+      current.filter(r=>r.status==="confirmed").map(llTouchPublicAppointment)});
+    return res.status(409).json({ok:false,code:"BOOKING_REVIEW_REQUIRED",
+      error:"This order has a previous booking attempt. Contact LL Touch to reconcile it safely; do not purchase again."});
+  }
+  const selected = new Map();
+  for (const choice of selections) {
+    if (!Number.isInteger(choice?.item_index) || selected.has(choice.item_index))
+      return res.status(422).json({ok:false,code:"INVALID_ITEMS",error:"Choose each purchased treatment exactly once."});
+    const option = options.find(o=>o.index===choice.item_index);
+    if (!option || llTouchBookingNeedsManualScheduling(option.vagaroService))
+      return res.status(422).json({ok:false,code:"UNAVAILABLE_SERVICE",error:"A selected treatment requires staff assistance."});
+    const professional = llTouchGetProfessional(session,option,choice.professional_key);
+    const time = normalizeAcademyTime(choice.time);
+    const window = llTouchAppointmentWindow(LLTOUCH_CAMPAIGN_DATE,time,option.vagaroService.bookingDurationMinutes);
+    if (!professional || !window || window.start.getTime() < Date.now()+600000 ||
+        !llTouchCampaignTimeAllowed(window,professional.key))
+      return res.status(422).json({ok:false,code:"INVALID_TIME",error:"Choose an offered time within the campaign hours."});
+    selected.set(option.index,{option,professional,window});
+  }
+  if (selected.size!==options.length || !options.every(o=>selected.has(o.index)))
+    return res.status(422).json({ok:false,code:"INCOMPLETE_SELECTION",error:"All purchased treatments need a time."});
+  const planned=Array.from(selected.values()).sort((a,b)=>a.option.index-b.option.index);
+  for (let i=0;i<planned.length;i++)for(let j=i+1;j<planned.length;j++){
+    if (llTouchCalendarIntervalOverlaps(planned[i].window,planned[j].window))
+      return res.status(409).json({ok:false,code:"CUSTOMER_TIME_CONFLICT",error:"Your treatments cannot overlap. Choose different times."});
+  }
+  // Recheck both external sources immediately before any pending row or event.
+  try {
+    const statuses=await Promise.all(planned.map(async p=>{
+      const [v,busy]=await Promise.all([
+        searchVagaroAvailability({date:LLTOUCH_CAMPAIGN_DATE,serviceId:p.option.vagaroService.serviceId,
+          addOnIds:p.option.vagaroService.addOnIds||[],serviceProviderId:p.professional.providerId}),
+        llTouchBusyEventsForCalendar(LLTOUCH_CAMPAIGN_DATE,p.professional.calendarId)
+      ]);
+      const offered=v.data.some(day=>normalizeAcademyDateValue(day.appointmentDate,LLTOUCH_CAMPAIGN_DATE)===LLTOUCH_CAMPAIGN_DATE &&
+        (day.timeSlot||[]).some(t=>normalizeAcademyTime(t)===p.window.time));
+      return offered && !busy.some(ev=>llTouchCalendarIntervalOverlaps(p.window,ev));
+    }));
+    if (statuses.some(ok=>!ok))return res.status(409).json({ok:false,code:"SLOT_CHANGED",
+      error:"One of the times is no longer available. Nothing was booked. Please refresh both schedules."});
+  } catch(e) {
+    console.error("PWYC batch availability check failed:",String(e?.message||e));
+    return res.status(503).json({ok:false,code:"AVAILABILITY_UNVERIFIED",
+      error:"We could not verify both schedules. No booking was attempted."});
+  }
+  const customerEmail=cleanLeadField(session.customer_details?.email||session.customer_email||session.metadata?.customer_email,254).toLowerCase();
+  const customerName=cleanLeadField(session.metadata?.full_name||session.customer_details?.name||"LL Touch Client",120);
+  const customerPhone=cleanLeadField(session.metadata?.customer_phone||session.customer_details?.phone||"",32);
+  const records=planned.map(p=>({
+    stripe_session_id:session.id,customer_name:customerName,customer_email:customerEmail,
+    service_id:p.option.vagaroService.serviceId,service_title:p.option.vagaroService.title,
+    service_details:[p.option.siteItem?.service||"",p.option.siteItem?.area||""].filter(Boolean).join(" | "),
+    item_index:p.option.index,provider_id:p.professional.providerId,
+    appointment_date:LLTOUCH_CAMPAIGN_DATE,appointment_time:p.window.time,
+    duration_minutes:p.option.vagaroService.bookingDurationMinutes,
+    starts_at:p.window.start.toISOString(),ends_at:p.window.end.toISOString(),
+    google_event_id:llTouchAppointmentEventId(session.id,p.option.vagaroService.serviceId,LLTOUCH_CAMPAIGN_DATE,p.window.time,p.professional.providerId),
+    paid_total_cents:session.amount_total
+  }));
+  let held=[];
+  try {
+    const {data,error}=await academySupabase.rpc("lltouch_pwyc_hold_batch",{p_records:records});
+    if(error)throw error;
+    if(!Array.isArray(data)||data.length!==planned.length)throw new Error("Unexpected batch hold count");
+    held=data;
+  } catch(e) {
+    console.error("PWYC atomic holds failed:",String(e?.message||e));
+    return res.status(409).json({ok:false,code:"BATCH_HOLD_FAILED",
+      error:"We could not reserve both times safely. Please refresh the schedules; do not purchase again."});
+  }
+  const created=[];
+  let uncertainty=false;
+  let createFailed=false;
+  for(const p of planned){
+    const record=held.find(r=>Number(r.item_index)===p.option.index);
+    if(!record){uncertainty=true;createFailed=true;break;}
+    const eventBody={
+      id:record.google_event_id,
+      summary:`LL Touch | ${p.option.vagaroService.title} | ${customerName} | ${p.professional.name} | PAID`,
+      description:["LL Touch paid appointment — Google Calendar -> Vagaro Personal Task",
+        `Customer: ${customerName}`,`Email: ${customerEmail}`,
+        ...(customerPhone?[`Phone: ${customerPhone}`]:[]),
+        `Service: ${p.option.vagaroService.title}`,`Professional: ${p.professional.name}`,
+        `Stripe checkout session: ${session.id}`,`LL Touch booking reference: ${record.id}`,
+        "If service history is required, convert this Personal Task into a Vagaro appointment."].join("\n"),
+      status:"confirmed",visibility:"private",transparency:"opaque",
+      start:{dateTime:`${LLTOUCH_CAMPAIGN_DATE}T${p.window.time}:00`,timeZone:LLTOUCH_SERVICE_CALENDAR_TIMEZONE},
+      end:{dateTime:`${p.window.endWallClock.date}T${p.window.endWallClock.time}:00`,timeZone:LLTOUCH_SERVICE_CALENDAR_TIMEZONE},
+      extendedProperties:{private:{llTouchBooking:"1",stripeSessionId:session.id,llTouchBookingId:record.id,
+        serviceId:p.option.vagaroService.serviceId}}
+    };
+    const path=`/calendars/${encodeURIComponent(p.professional.calendarId)}/events`;
+    try {
+      await googleCalendarRequest(`${path}?sendUpdates=none`,{method:"POST",body:eventBody});
+      created.push({calendarId:p.professional.calendarId,eventId:record.google_event_id});
+    } catch(e) {
+      console.error("PWYC batch Google insert failed:",String(e?.message||e));
+      createFailed=true;
+      // A timeout or 409 may mean insertion succeeded: verify deterministic ID.
+      try {
+        const remote=await googleCalendarRequest(`${path}/${encodeURIComponent(record.google_event_id)}`);
+        if(remote?.extendedProperties?.private?.llTouchBookingId===record.id)
+          created.push({calendarId:p.professional.calendarId,eventId:record.google_event_id});
+        else uncertainty=true;
+      }catch(checkError){if(checkError?.status!==404)uncertainty=true;}
+      break;
+    }
+  }
+  if(createFailed){
+    let rollbackClean=!uncertainty;
+    for(const entry of created){
+      try { await googleCalendarRequest(`/calendars/${encodeURIComponent(entry.calendarId)}/events/${encodeURIComponent(entry.eventId)}`,{method:"DELETE"}); }
+      catch(e){if(e?.status!==404){rollbackClean=false;console.error("PWYC rollback failed:",String(e?.message||e));}}
+    }
+    if(rollbackClean){
+      const {data,error}=await academySupabase.from("lltouch_appointments")
+        .update({status:"failed",updated_at:new Date().toISOString()}).in("id",held.map(x=>x.id))
+        .eq("status","pending").select("id");
+      if(error||data?.length!==held.length)rollbackClean=false;
+    }
+    return res.status(503).json({ok:false,code:rollbackClean?"BATCH_REVIEW_REQUIRED":"BATCH_MANUAL_REVIEW",
+      error:rollbackClean?
+        "Neither appointment was confirmed. Please contact LL Touch so the paid order can be safely retried.":
+        "We need to verify your paid order and calendar records manually. Please do not submit another booking."});
+  }
+  const {data:confirmed,error:finishError}=await academySupabase.from("lltouch_appointments")
+    .update({status:"confirmed",updated_at:new Date().toISOString()}).in("id",held.map(x=>x.id))
+    .eq("status","pending").select("*");
+  if(finishError||confirmed?.length!==held.length){
+    console.error("PWYC batch finalization failed:",finishError);
+    return res.status(503).json({ok:false,code:"BATCH_MANUAL_REVIEW",
+      error:"Your calendar reservations may exist, but confirmation needs staff review. Do not try again."});
+  }
+  clearAcademyAvailableDatesCache();
+  return res.status(201).json({ok:true,message:"All purchased treatments confirmed.",
+    appointments:confirmed.sort((a,b)=>a.item_index-b.item_index).map(llTouchPublicAppointment)});
+});
+
 app.post("/llb/studio/confirm", checkoutLimiter, (req,res) => {
   req.llTouchBookingRoute = "studio";return llTouchHandleAppointmentConfirmation(req,res);
 });
