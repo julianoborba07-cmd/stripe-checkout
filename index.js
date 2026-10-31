@@ -188,6 +188,12 @@ app.post(
           );
           return res.json({ received: true });
         }
+        // Campaign contributions are intentionally isolated from regular LL Touch
+        // laser loyalty/cashback calculations; campaign pricing is self-selected.
+        if (checkoutBrand === "lltouch" && session.metadata?.campaign === "pwyc-2026-11-09") {
+          console.log(`LL Touch PWYC campaign payment confirmed: ${session.id}`);
+          return res.json({ received: true });
+        }
 
         const email = session.customer_details?.email;
         if (!email) return res.json({ received: true });
@@ -725,6 +731,16 @@ const VAGARO_BUSINESS_ID =
   process.env.VAGARO_BUSINESS_ID || "u70rCIZg8Li86bNB7KxwcA==";
 const VAGARO_LUDIMILLA_PROVIDER_ID =
   process.env.VAGARO_LUDIMILLA_PROVIDER_ID || "b777Fo236wdourBe-n4dMw==";
+// Verified provider IDs must be set in Render after the read-only Vagaro catalog audit.
+// Never derive them from a public browser request.
+const VAGARO_CAROL_PROVIDER_ID = String(process.env.VAGARO_CAROL_PROVIDER_ID || "").trim();
+const VAGARO_JENN_PROVIDER_ID = String(process.env.VAGARO_JENN_PROVIDER_ID || "").trim();
+const LLTOUCH_MULTI_PROVIDER_ENABLED = process.env.LLTOUCH_MULTI_PROVIDER_ENABLED === "true";
+const LLTOUCH_PWYC_ENABLED = process.env.LLTOUCH_PWYC_ENABLED === "true";
+const LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY = process.env.LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY === "true";
+const LLB_STUDIO_BOOKING_ENABLED = process.env.LLB_STUDIO_BOOKING_ENABLED === "true";
+const LLTOUCH_SUCCESS_V2_ENABLED = process.env.LLTOUCH_SUCCESS_V2_ENABLED === "true";
+const LLTOUCH_CAMPAIGN_DATE = "2026-11-09";
 const VAGARO_LISTING_URL =
   process.env.VAGARO_LISTING_URL || "https://www.vagaro.com/llbrows/book-now";
 
@@ -754,6 +770,8 @@ const GOOGLE_PRIVATE_KEY =
 
 const GOOGLE_CALENDAR_ID =
   String(process.env.GOOGLE_CALENDAR_ID || "").trim();
+const GOOGLE_CALENDAR_CAROL_ID = String(process.env.GOOGLE_CALENDAR_CAROL_ID || "").trim();
+const GOOGLE_CALENDAR_JENN_ID = String(process.env.GOOGLE_CALENDAR_JENN_ID || "").trim();
 
 const GOOGLE_CALENDAR_TIMEZONE =
   String(process.env.GOOGLE_CALENDAR_TIMEZONE || "America/New_York").trim();
@@ -1344,6 +1362,71 @@ function resolveVagaroServiceFromSiteItem(siteItem = {}) {
   return null;
 }
 
+
+// LL Touch booking contexts: Academy is unchanged, Studio is Ludimilla-only.
+const LLTOUCH_PROFESSIONALS = {
+  ludimilla: { name: "Ludimilla Leite", providerId: VAGARO_LUDIMILLA_PROVIDER_ID, calendarId: GOOGLE_CALENDAR_ID },
+  carol: { name: "Carol", providerId: VAGARO_CAROL_PROVIDER_ID, calendarId: GOOGLE_CALENDAR_CAROL_ID },
+  jenn: { name: "Jenn Fortes", providerId: VAGARO_JENN_PROVIDER_ID, calendarId: GOOGLE_CALENDAR_JENN_ID }
+};
+const PWYC_FACIAL_SERVICES = Object.freeze({
+  hydrafacial: { type: "med-spa", service: "hydrafacial", title: "Hydra Facial" },
+  deluxe: { type: "facial", service: "classic-deluxe", title: "Deluxe Facial" },
+  microneedling: { type: "med-spa", service: "microneedling", title: "Microneedling" },
+  dermaplaning: { type: "facial", service: "dermaplaning", title: "Dermaplaning" },
+  "diamond-glow": { type: "facial", service: "diamond-glow", title: "Diamond Glow" }
+});
+const PWYC_LASER_SERVICES = Object.freeze({
+  "under-arms": "Under Arms", "full-face": "Full Face", "legs-lower": "Half Leg — Lower",
+  "legs-upper": "Half Leg — Upper", "full-brazilian": "Full Brazilian"
+});
+function llTouchIsCampaign(session) {
+  return session?.metadata?.campaign === "pwyc-2026-11-09" &&
+    session?.metadata?.brand === "lltouch";
+}
+function llTouchAllowedProfessionals(session, option) {
+  if (session?.metadata?.brand === "ll_brows") return ["ludimilla"];
+  if (llTouchIsCampaign(session)) return option?.siteItem?.type === "laser"
+    ? ["jenn"] : ["ludimilla", "carol"];
+  return LLTOUCH_MULTI_PROVIDER_ENABLED ? ["ludimilla", "carol"] : ["ludimilla"];
+}
+function llTouchGetProfessional(session, option, requestedKey) {
+  const allowed = llTouchAllowedProfessionals(session, option);
+  const key = normalizeKey(requestedKey || (allowed.length === 1 ? allowed[0] : "ludimilla"));
+  if (!allowed.includes(key)) return null;
+  const professional = LLTOUCH_PROFESSIONALS[key];
+  return professional?.providerId && professional?.calendarId ? { key, ...professional } : null;
+}
+function llTouchCampaignTimeAllowed(window, professionalKey) {
+  if (!window || window.date !== LLTOUCH_CAMPAIGN_DATE) return false;
+  const start = Number(window.time.slice(0,2))*60 + Number(window.time.slice(3,5));
+  const end = Number(window.endWallClock.time.slice(0,2))*60 + Number(window.endWallClock.time.slice(3,5));
+  return window.endWallClock.date === LLTOUCH_CAMPAIGN_DATE && start >= 600 &&
+    end <= (professionalKey === "jenn" ? 840 : 1020);
+}
+// Exact Vagaro IDs for Studio have NOT yet been fully mapped. No guessed IDs.
+// Set both ID and correct duration per service in Render after the catalog verification.
+function llbStudioServiceOption(key) {
+  const suffix = key.replace(/^llb_/, "").toUpperCase();
+  const id = String(process.env[`VAGARO_STUDIO_${suffix}_ID`] || "").trim();
+  const duration = Number(process.env[`VAGARO_STUDIO_${suffix}_MINUTES`]);
+  if (!id || !Number.isInteger(duration) || duration < 10 || duration > 240) return null;
+  const service = LLB_SERVICES[key];
+  if (!service) return null;
+  return { serviceId:id, title:service.name, category:"LL Brows Studio", durationMinutes:duration,
+    bookingDurationMinutes:duration, addOnDurationMinutes:0, addOnIds:[], unsupportedAddOn:null };
+}
+function llbStudioSessionOptions(session) {
+  if (session?.metadata?.brand !== "ll_brows") return [];
+  const keys = String(session.metadata.service_keys || "").split(",").filter(Boolean);
+  return keys.flatMap((key) => {
+    const svc = llbStudioServiceOption(key);
+    if (!svc) return [];
+    return [{index: keys.indexOf(key), source:"llb_studio", siteItem:{type:"studio",service:key},
+      vagaroService:svc, professional:{name:"Ludimilla Leite",serviceProviderId:VAGARO_LUDIMILLA_PROVIDER_ID}}];
+  });
+}
+
 // ==============================
 // PRICE ID → SITE ITEM MAP
 // ==============================
@@ -1466,6 +1549,7 @@ function siteItemFromLineItem(lineItem) {
 }
 
 function buildBookingOptionsFromSession(session) {
+  if (session?.metadata?.brand === "ll_brows") return llbStudioSessionOptions(session);
   const options = [];
   const seen = new Set();
 
@@ -1728,7 +1812,7 @@ async function getStripeSessionExpanded(sessionId) {
   });
 }
 
-async function searchVagaroAvailability({ date, serviceId, addOnIds = [] }) {
+async function searchVagaroAvailability({ date, serviceId, addOnIds = [], serviceProviderId = VAGARO_LUDIMILLA_PROVIDER_ID }) {
   const body = {
     businessId: VAGARO_BUSINESS_ID,
     appointmentDate: date,
@@ -1736,7 +1820,7 @@ async function searchVagaroAvailability({ date, serviceId, addOnIds = [] }) {
       {
         serviceId,
         addOnIds: Array.isArray(addOnIds) ? addOnIds : [],
-        serviceProviderIds: [VAGARO_LUDIMILLA_PROVIDER_ID]
+        serviceProviderIds: [serviceProviderId]
       }
     ]
   };
@@ -4006,6 +4090,10 @@ app.get("/checkout-session/:id", async (req, res) => {
         ? { unsupportedAddOn: option.vagaroService.unsupportedAddOn }
         : {}),
       professional: option.professional,
+      availableProfessionals: llTouchAllowedProfessionals(session, option).map(key=>({
+        key, name:LLTOUCH_PROFESSIONALS[key].name,
+        enabled:Boolean(LLTOUCH_PROFESSIONALS[key].providerId&&LLTOUCH_PROFESSIONALS[key].calendarId)
+      })).filter(p=>p.enabled),
       fallbackUrl: VAGARO_LISTING_URL
     }));
 
@@ -4079,7 +4167,11 @@ app.post("/llb/create-checkout-session", checkoutLimiter, async (req, res) => {
       normalizedItems.push({ serviceKey, service, quantity });
     }
 
-    const successUrl = getLLBrowsCheckoutUrl("LLB_CHECKOUT_SUCCESS_URL");
+    const successUrlBase = getLLBrowsCheckoutUrl("LLB_CHECKOUT_SUCCESS_URL");
+    const successUrlObject = new URL(successUrlBase);
+    successUrlObject.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
+    // URLSearchParams encodes braces, but Stripe requires the literal placeholder.
+    const successUrl = successUrlObject.toString().replace(/%7BCHECKOUT_SESSION_ID%7D/gi,"{CHECKOUT_SESSION_ID}");
     const cancelUrl = getLLBrowsCheckoutUrl("LLB_CHECKOUT_CANCEL_URL");
     const serviceKeys = normalizedItems.map((item) => item.serviceKey).join(",");
 
@@ -4117,6 +4209,115 @@ app.post("/llb/create-checkout-session", checkoutLimiter, async (req, res) => {
 
     res.status(500).json({ error: publicMessage });
   }
+});
+
+
+// Campaign checkout: isolated from regular Stripe pricing / discounts.
+// Fail closed until all provider IDs, Google sync and DB overlap migration are confirmed.
+function llTouchParseCampaignItems(items) {
+  if(!Array.isArray(items) || !items.length || items.length > 2)return null;
+  const found = new Set(), result=[];
+  for(const item of items) {
+    const group = String(item?.category || "");
+    const key = String(item?.key || "");
+    const amount = item?.amountCents;
+    if(!["facial","laser"].includes(group)||found.has(group)||
+      !Number.isInteger(amount)||amount < 50 || amount > 1000000)return null;
+    let siteItem, title;
+    if(group === "facial"){
+      const source = PWYC_FACIAL_SERVICES[key];
+      if(!source)return null;
+      siteItem = {type:source.type,service:source.service,package:"single",addon:"none",quantity:1};
+      title = source.title;
+    }else{
+      title=PWYC_LASER_SERVICES[key];
+      const known=VAGARO_SERVICE_MAP.laser.byServiceName[key];
+      if(!title||!known)return null;
+      const areaMatch=known.category.match(/^LHR-(Small|Medium|Large|XLarge) Area$/i);
+      if(!areaMatch)return null;
+      siteItem={type:"laser",service:key,area:areaMatch[1].toLowerCase(),package:"single",quantity:1};
+    }
+    found.add(group);result.push({group,key,amount,title,siteItem});
+  }
+  return result;
+}
+async function llTouchCampaignHasCapacity(campaignItem){
+  const service = resolveVagaroServiceFromSiteItem(campaignItem.siteItem);
+  if(!service)return false;
+  const keys = campaignItem.group === "laser" ? ["jenn"] : ["ludimilla","carol"];
+  for(const key of keys){
+    const p=LLTOUCH_PROFESSIONALS[key];
+    if(!p.providerId||!p.calendarId)continue;
+    const [vagaro,busy]=await Promise.all([
+      searchVagaroAvailability({date:LLTOUCH_CAMPAIGN_DATE,serviceId:service.serviceId,serviceProviderId:p.providerId}),
+      llTouchBusyEventsForCalendar(LLTOUCH_CAMPAIGN_DATE,p.calendarId)
+    ]);
+    for(const day of vagaro.data){
+      if(normalizeAcademyDateValue(day.appointmentDate,LLTOUCH_CAMPAIGN_DATE)!==LLTOUCH_CAMPAIGN_DATE)continue;
+      if((day.timeSlot||[]).some(time=>{
+        const w=llTouchAppointmentWindow(LLTOUCH_CAMPAIGN_DATE,time,service.bookingDurationMinutes);
+        return w && w.start.getTime() > Date.now()+10*60*1000 && llTouchCampaignTimeAllowed(w,key) &&
+          !busy.some(ev=>llTouchCalendarIntervalOverlaps(w,ev));
+      }))return true;
+    }
+  }
+  return false;
+}
+app.post("/lltouch/campaign/nov09/checkout",checkoutLimiter,async(req,res)=>{
+  try{
+    if(!LLTOUCH_PWYC_ENABLED || !LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY)return res.status(503).json({error:"Campaign checkout is not active yet."});
+    if(!Object.values(LLTOUCH_PROFESSIONALS).every(p=>Boolean(p.providerId&&p.calendarId)))
+      return res.status(503).json({error:"Campaign calendars are not fully configured."});
+    const email=cleanLeadField(req.body?.email,254).toLowerCase();
+    const items=llTouchParseCampaignItems(req.body?.items);
+    if(!isValidEmail(email)||!items)return res.status(400).json({error:"Please choose up to one facial and one laser, with a valid contribution for each."});
+    // Preflight avoids taking payment for an obviously sold-out service; race remains possible.
+    for(const item of items){
+      if(!(await llTouchCampaignHasCapacity(item)))return res.status(409).json({error:`No available campaign slots remain for ${item.title}. No payment was taken.`});
+    }
+    const metadata={brand:"lltouch",campaign:"pwyc-2026-11-09",customer_email:email,cart_items_count:String(items.length)};
+    const lines=items.map((item,i)=>{
+      metadata[`lltouch_item_${i}`]=JSON.stringify(item.siteItem);
+      return {quantity:1,price_data:{currency:"usd",unit_amount:item.amount,
+        product_data:{name:`Pay What You Can — ${item.title}`,description:"One session, November 9, 2026 only. Appointment must be selected after payment.",
+          metadata:{source:"lltouch-site",mode:item.siteItem.type,service:item.siteItem.service,area:item.siteItem.area||"",package:"single",campaign:"pwyc-2026-11-09"}}}};
+    });
+    const session=await stripe.checkout.sessions.create({mode:"payment",customer_email:email,line_items:lines,metadata,
+      success_url:"https://lltouch.com/pay-what-you-can-success?session_id={CHECKOUT_SESSION_ID}&campaign=pwyc-2026-11-09",
+      cancel_url:"https://lltouch.com/pay-what-you-can"});
+    return res.json({url:session.url});
+  }catch(err){console.error("PWYC checkout:",err);return res.status(503).json({error:"Unable to start campaign checkout. Please contact LL Touch."});}
+});
+app.get("/lltouch/campaign/nov09/session/:id",checkoutLimiter,async(req,res)=>{
+  try{
+    const session=await getStripeSessionExpanded(cleanLeadField(req.params.id,160));
+    if(!llTouchIsCampaign(session))return res.status(404).json({error:"Campaign session not found."});
+    if(!llTouchPaidSession(session))return res.status(403).json({error:"Payment is not confirmed."});
+    const bookingOptions=buildBookingOptionsFromSession(session);
+    const bookings=await llTouchReadBookings(session.id);
+    return res.json({payment_status:session.payment_status,items:bookingOptions.map(o=>({
+      index:o.index,title:o.vagaroService.title,category:o.siteItem.type,durationMinutes:o.vagaroService.bookingDurationMinutes,
+      providers:llTouchAllowedProfessionals(session,o).map(key=>({id:key,name:LLTOUCH_PROFESSIONALS[key].name})),
+      confirmed:bookings.some(b=>b.service_id===o.vagaroService.serviceId&&b.status==="confirmed")
+    }))});
+  }catch(err){console.error("PWYC session:",err);return res.status(503).json({error:"Unable to retrieve campaign order."});}
+});
+// Studio paid-order status remains usable even before service-by-service Vagaro mapping is complete.
+app.get("/llb/studio/session/:id",checkoutLimiter,async(req,res)=>{
+  try{
+    const session=await getStripeSessionExpanded(cleanLeadField(req.params.id,160));
+    if(session.metadata?.brand!=="ll_brows")return res.status(404).json({error:"Studio session not found."});
+    if(!llTouchPaidSession(session))return res.status(403).json({error:"Payment is not confirmed."});
+    const keys=String(session.metadata.service_keys||"").split(",").filter(Boolean);
+    const booked=await llTouchReadBookings(session.id);
+    const options=llbStudioSessionOptions(session);
+    return res.json({payment_status:"paid",items:keys.map((key,index)=>{
+      const item=options.find(o=>o.index===index);
+      return {index,key,title:LLB_SERVICES[key]?.name||key,canBookOnline:LLB_STUDIO_BOOKING_ENABLED&&Boolean(item),
+        confirmed:Boolean(item&&booked.some(b=>b.service_id===item.vagaroService.serviceId&&b.status==="confirmed")),
+        providers:[{id:"ludimilla",name:"Ludimilla Leite"}]};
+    })});
+  }catch(err){console.error("Studio session:",err);return res.status(503).json({error:"Unable to retrieve Studio order."});}
 });
 
 app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
@@ -4328,7 +4529,9 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
         ...metadata
       },
 
-      success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+      success_url: LLTOUCH_SUCCESS_V2_ENABLED
+        ? "https://lltouch.com/success-v2?session_id={CHECKOUT_SESSION_ID}"
+        : "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel"
     });
 
@@ -4412,7 +4615,9 @@ app.post("/create-morpheus-direct-checkout", checkoutLimiter, async (req, res) =
         goals,
         primary_site_item: JSON.stringify({ type: "morpheus" })
       },
-      success_url: "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
+      success_url: LLTOUCH_SUCCESS_V2_ENABLED
+        ? "https://lltouch.com/success-v2?session_id={CHECKOUT_SESSION_ID}"
+        : "https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}",
       cancel_url: "https://lltouch.com/cancel"
     });
 
@@ -5239,9 +5444,9 @@ function llTouchAppointmentWindow(date, rawTime, durationMinutes) {
   return { date: isoDate, time: normalizedTime, start, end, endWallClock };
 }
 
-function llTouchAppointmentEventId(sessionId, serviceId, date, time) {
+function llTouchAppointmentEventId(sessionId, serviceId, date, time, serviceProviderId = VAGARO_LUDIMILLA_PROVIDER_ID) {
   const digest = crypto.createHash("sha256")
-    .update(`lltouch|${VAGARO_LUDIMILLA_PROVIDER_ID}|${sessionId}|${serviceId}|${date}|${time}`)
+    .update(`lltouch|${serviceProviderId}|${sessionId}|${serviceId}|${date}|${time}`)
     .digest("hex").slice(0, 48);
   return `llto${digest}`;
 }
@@ -5269,14 +5474,15 @@ function llTouchPublicAppointment(record) {
     endsAt: record.ends_at,
     timeZone: LLTOUCH_SERVICE_CALENDAR_TIMEZONE,
     status: record.status,
-    bookingId: record.id
+    bookingId: record.id,
+    professional: Object.values(LLTOUCH_PROFESSIONALS).find(p => p.providerId === record.provider_id)?.name || "LL Touch Professional"
   };
 }
 
 async function llTouchReadBookings(sessionId) {
   const { data, error } = await academySupabase
     .from("lltouch_appointments")
-    .select("id,stripe_session_id,service_id,service_title,appointment_date,appointment_time,duration_minutes,starts_at,ends_at,google_event_id,status,created_at")
+    .select("id,stripe_session_id,service_id,service_title,provider_id,appointment_date,appointment_time,duration_minutes,starts_at,ends_at,google_event_id,status,created_at")
     .eq("stripe_session_id", sessionId)
     .order("created_at", { ascending: true });
 
@@ -5292,6 +5498,33 @@ function llTouchBookedResponse(record, alreadyConfirmed = false) {
     appointment: llTouchPublicAppointment(record),
     calendarSync: "Google Calendar → Vagaro Personal Task (busy)"
   };
+}
+
+// LL Touch-only calendar lookup. Does not change Academy calendar selection.
+async function llTouchBusyEventsForCalendar(date, calendarId) {
+  if (!calendarId || !isGoogleCalendarConfigured()) throw new Error("Calendar unavailable.");
+  const from = zonedAcademyDateToUtc(date, "00:00", GOOGLE_CALENDAR_TIMEZONE);
+  const untilDate = academyAddDaysISO(date, 2);
+  const until = zonedAcademyDateToUtc(untilDate, "00:00", GOOGLE_CALENDAR_TIMEZONE);
+  const events = [];
+  let page = "";
+  do {
+    const params = new URLSearchParams({timeMin:from.toISOString(),timeMax:until.toISOString(),
+      singleEvents:"true",showDeleted:"false",orderBy:"startTime",maxResults:"2500"});
+    if(page)params.set("pageToken",page);
+    const response = await googleCalendarRequest(`/calendars/${encodeURIComponent(calendarId)}/events?${params}`);
+    for(const item of Array.isArray(response.items)?response.items:[]) {
+      // Vagaro-origin mirror events are already represented by Vagaro availability.
+      if(isVagaroSyncedGoogleEvent(item))continue;
+      const interval = academyGoogleEventInterval(item);
+      if(interval)events.push(interval);
+    }
+    page = String(response.nextPageToken || "");
+  }while(page);
+  return events;
+}
+function llTouchProposedTimeAllowed(session, window, professional) {
+  return !llTouchIsCampaign(session) || llTouchCampaignTimeAllowed(window, professional.key);
 }
 
 // ==============================
@@ -5441,11 +5674,12 @@ app.get("/lltouch/bookings/:sessionId", checkoutLimiter, async (req, res) => {
 
 // Confirms the first appointment for a purchased treatment. A package does
 // not imply booking all future sessions in one transaction.
-app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
+async function llTouchHandleAppointmentConfirmation(req, res) {
   const sessionId = cleanLeadField(req.body?.session_id, 160);
   const date = formatDateOnly(req.body?.date);
   const selectedTime = normalizeAcademyTime(req.body?.time);
   const selectedIndex = Number(req.body?.item_index);
+  const professionalKey = req.body?.professional_key;
 
   if (!sessionId || !date || !selectedTime || !Number.isInteger(selectedIndex) || selectedIndex < 0) {
     return res.status(400).json({
@@ -5471,6 +5705,12 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
   if (!llTouchPaidSession(session)) {
     return res.status(403).json({ ok: false, code: "PAYMENT_NOT_PAID", error: "Payment is not confirmed." });
   }
+  if (req.llTouchBookingRoute === "campaign" && !llTouchIsCampaign(session)) return res.status(403).json({ok:false,error:"Invalid campaign order."});
+  if (req.llTouchBookingRoute === "studio" && session.metadata?.brand !== "ll_brows") return res.status(403).json({ok:false,error:"Invalid Studio order."});
+  if (session.metadata?.brand === "ll_brows" && !LLB_STUDIO_BOOKING_ENABLED)
+    return res.status(503).json({ok:false,error:"Studio booking is not enabled yet."});
+  if (llTouchIsCampaign(session) && !LLTOUCH_PWYC_ENABLED)
+    return res.status(503).json({ok:false,error:"Campaign booking is not enabled yet."});
 
   const options = buildBookingOptionsFromSession(session);
   const selected = options[selectedIndex];
@@ -5480,6 +5720,8 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
     });
   }
 
+  const professional = llTouchGetProfessional(session, selected, professionalKey);
+  if (!professional) return res.status(422).json({ok:false,code:"PROFESSIONAL_UNAVAILABLE",error:"Choose an available professional for this treatment."});
   const service = selected.vagaroService;
   if (llTouchBookingNeedsManualScheduling(service)) {
     return res.status(422).json({
@@ -5490,7 +5732,7 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
     });
   }
   const window = llTouchAppointmentWindow(date, selectedTime, service.bookingDurationMinutes);
-  if (!window || window.start.getTime() < Date.now() + 10 * 60 * 1000) {
+  if (!window || window.start.getTime() < Date.now() + 10 * 60 * 1000 || !llTouchProposedTimeAllowed(session, window, professional)) {
     return res.status(400).json({
       ok: false, code: "INVALID_APPOINTMENT_TIME",
       error: "Choose an available time at least 10 minutes from now."
@@ -5509,6 +5751,9 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
   }
 
   const existing = rows.find((row) => row.service_id === service.serviceId);
+  if (!existing && rows.some(r => r.service_id !== service.serviceId && ["pending","confirmed"].includes(r.status) &&
+       new Date(r.starts_at) < window.end && new Date(r.ends_at) > window.start))
+    return res.status(409).json({ok:false,code:"CUSTOMER_TIME_CONFLICT",error:"Your other treatment is already booked at this time. Please choose a non-overlapping slot."});
   if (existing?.status === "confirmed") {
     return res.json(llTouchBookedResponse(existing, true));
   }
@@ -5526,7 +5771,7 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
   let availability;
   try {
     availability = await searchVagaroAvailability({
-      date, serviceId: service.serviceId, addOnIds: service.addOnIds || []
+      date, serviceId: service.serviceId, addOnIds: service.addOnIds || [], serviceProviderId:professional.providerId
     });
   } catch (error) {
     console.error("LL Touch Vagaro revalidation failed:", error);
@@ -5549,7 +5794,7 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
   // Unlike Vagaro-synced mirror events, independently created Google BUSY
   // events (including Academy sessions and existing LL Touch bookings) block.
   try {
-    const busy = await getAcademyGoogleBusyEventsForRange(date, window.endWallClock.date);
+    const busy = await llTouchBusyEventsForCalendar(date, professional.calendarId);
     if (busy.some((event) => llTouchCalendarIntervalOverlaps(window, event))) {
       return res.status(409).json({
         ok: false, code: "GOOGLE_SLOT_TAKEN", error: "This time has just been reserved. Please choose another."
@@ -5562,7 +5807,7 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
     });
   }
 
-  const eventId = llTouchAppointmentEventId(session.id, service.serviceId, date, selectedTime);
+  const eventId = llTouchAppointmentEventId(session.id, service.serviceId, date, selectedTime, professional.providerId);
   const customerEmail = cleanLeadField(session.customer_details?.email || session.customer_email || session.metadata?.customer_email, 254).toLowerCase();
   const customerName = cleanLeadField(session.metadata?.full_name || session.customer_details?.name || "LL Touch Client", 120);
   const siteItem = selected.siteItem || {};
@@ -5583,7 +5828,7 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
     service_title: service.title,
     service_details: itemSummary,
     item_index: selectedIndex,
-    provider_id: VAGARO_LUDIMILLA_PROVIDER_ID,
+    provider_id: professional.providerId,
     appointment_date: date,
     appointment_time: selectedTime,
     duration_minutes: Number(service.bookingDurationMinutes),
@@ -5616,12 +5861,13 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
 
   const eventBody = {
     id: eventId,
-    summary: `LL Touch | ${service.title} | ${customerName} | PAID`,
+    summary: `LL Touch | ${service.title} | ${customerName} | ${professional.name} | PAID`,
     description: [
       "LL Touch paid appointment — Google Calendar -> Vagaro BUSY Personal Task",
       `Customer: ${customerName}`,
       `Email: ${customerEmail}`,
       `Service: ${service.title}`,
+      `Professional: ${professional.name}`,
       `Purchase details: ${itemSummary || service.title}`,
       `Paid order total: ${((session.amount_total || 0) / 100).toFixed(2)} ${String(session.currency || "usd").toUpperCase()}`,
       `Stripe checkout session: ${session.id}`,
@@ -5644,7 +5890,7 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
   };
 
   try {
-    const googleCalendarId = encodeURIComponent(GOOGLE_CALENDAR_ID);
+    const googleCalendarId = encodeURIComponent(professional.calendarId);
     await googleCalendarRequest(
       `/calendars/${googleCalendarId}/events?sendUpdates=none`,
       { method: "POST", body: eventBody }
@@ -5657,7 +5903,7 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
     let exists = false;
     try {
       const remote = await googleCalendarRequest(
-        `/calendars/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/events/${encodeURIComponent(eventId)}`
+        `/calendars/${encodeURIComponent(professional.calendarId)}/events/${encodeURIComponent(eventId)}`
       );
       exists = remote?.extendedProperties?.private?.llTouchBookingId === pending.id;
     } catch (checkError) {
@@ -5697,12 +5943,21 @@ app.post("/lltouch/confirm-appointment", checkoutLimiter, async (req, res) => {
   // immediately for candidates using the shared Google Calendar.
   clearAcademyAvailableDatesCache();
   return res.status(201).json(llTouchBookedResponse(confirmed));
+}
+app.post("/lltouch/confirm-appointment", checkoutLimiter, llTouchHandleAppointmentConfirmation);
+app.post("/lltouch/campaign/nov09/confirm", checkoutLimiter, (req,res) => {
+  req.llTouchBookingRoute = "campaign";req.body.date = LLTOUCH_CAMPAIGN_DATE;
+  req.body.professional_key = req.body.professional_key || req.body.provider_id;
+  return llTouchHandleAppointmentConfirmation(req,res);
+});
+app.post("/llb/studio/confirm", checkoutLimiter, (req,res) => {
+  req.llTouchBookingRoute = "studio";return llTouchHandleAppointmentConfirmation(req,res);
 });
 
-app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
+async function llTouchHandleAvailability(req, res) {
   try {
     const sessionId = cleanLeadField(req.body.session_id, 120);
-    const date = formatDateOnly(req.body.date);
+    const date = formatDateOnly(req.llTouchBookingRoute === "campaign" ? LLTOUCH_CAMPAIGN_DATE : req.body.date);
     const selectedIndex = Number.isInteger(Number(req.body.item_index))
       ? Number(req.body.item_index)
       : 0;
@@ -5718,6 +5973,10 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
     }
 
     const session = await getStripeSessionExpanded(sessionId);
+    if (req.llTouchBookingRoute === "campaign" && !llTouchIsCampaign(session))return res.status(403).json({error:"Invalid campaign session."});
+    if (req.llTouchBookingRoute === "studio" && session.metadata?.brand !== "ll_brows")return res.status(403).json({error:"Invalid Studio session."});
+    if (llTouchIsCampaign(session) && !LLTOUCH_PWYC_ENABLED)return res.status(503).json({error:"Campaign booking is not enabled yet."});
+    if (session.metadata?.brand === "ll_brows" && !LLB_STUDIO_BOOKING_ENABLED)return res.status(503).json({error:"Studio booking is not enabled yet."});
 
     if (session.payment_status !== "paid") {
       return res.status(403).json({
@@ -5734,7 +5993,10 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
       });
     }
 
-    const selected = bookingOptions[selectedIndex] || bookingOptions[0];
+    const selected = bookingOptions[selectedIndex];
+    if (!selected)return res.status(400).json({error:"Select a purchased treatment."});
+    const professional = llTouchGetProfessional(session, selected, req.body.professional_key);
+    if (!professional)return res.status(422).json({error:"This professional is not available for this purchased treatment."});
     if (llTouchBookingNeedsManualScheduling(selected.vagaroService)) {
       return res.status(422).json({
         ok: false,
@@ -5747,15 +6009,16 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
     const availability = await searchVagaroAvailability({
       date,
       serviceId: selected.vagaroService.serviceId,
-      addOnIds: selected.vagaroService.addOnIds || []
+      addOnIds: selected.vagaroService.addOnIds || [],
+      serviceProviderId: professional.providerId
     });
 
     const rawSlots = availability.data.flatMap((day) =>
       (day.timeSlot || []).map((time) => ({
         date: normalizeAcademyDateValue(day.appointmentDate, date),
         time,
-        professional: "Ludimilla Leite",
-        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID,
+        professional: professional.name,
+        serviceProviderId: professional.providerId,
         serviceId: selected.vagaroService.serviceId,
         serviceTitle: selected.vagaroService.title
       }))
@@ -5767,10 +6030,7 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
       });
     }
 
-    const busyEvents = await getAcademyGoogleBusyEventsForRange(
-      date,
-      academyAddDaysISO(date, 1)
-    );
+    const busyEvents = await llTouchBusyEventsForCalendar(date, professional.calendarId);
     const slots = rawSlots.filter((slot) => {
       const window = llTouchAppointmentWindow(
         slot.date,
@@ -5780,6 +6040,7 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
       return Boolean(
         window &&
         window.start.getTime() >= Date.now() + 10 * 60 * 1000 &&
+        llTouchProposedTimeAllowed(session, window, professional) &&
         !busyEvents.some((event) => llTouchCalendarIntervalOverlaps(window, event))
       );
     });
@@ -5799,11 +6060,12 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
         addOnIds: selected.vagaroService.addOnIds || []
       },
       professional: {
-        name: "Ludimilla Leite",
-        serviceProviderId: VAGARO_LUDIMILLA_PROVIDER_ID
+        name: professional.name,
+        serviceProviderId: professional.providerId,
+        key:professional.key
       },
       slots,
-      rawAvailability: availability.data,
+      ...(llTouchIsCampaign(session) ? {} : {rawAvailability:availability.data}),
       fallbackUrl: VAGARO_LISTING_URL,
       note:
         "Vagaro availability rechecked against shared Google Calendar. Final confirmation creates a Google BUSY event synced as a Vagaro Personal Task."
@@ -5817,6 +6079,24 @@ app.post("/vagaro/availability", checkoutLimiter, async (req, res) => {
       fallbackUrl: VAGARO_LISTING_URL
     });
   }
+}
+app.post("/vagaro/availability", checkoutLimiter, llTouchHandleAvailability);
+app.post("/lltouch/campaign/nov09/availability", checkoutLimiter, (req,res)=>{
+  req.llTouchBookingRoute="campaign";req.body.professional_key=req.body.professional_key||req.body.provider_id;return llTouchHandleAvailability(req,res);
+});
+app.post("/llb/studio/availability", checkoutLimiter, (req,res)=>{
+  req.llTouchBookingRoute="studio";return llTouchHandleAvailability(req,res);
+});
+
+app.get("/lltouch/integration-readiness",checkoutLimiter,(_,res)=>{
+  const base=Object.values(LLTOUCH_PROFESSIONALS).every(p=>Boolean(p.providerId&&p.calendarId));
+  return res.json({readyToEnableCampaign:base&&isGoogleCalendarConfigured()&&llTouchAppointmentsReadiness(),
+    professionalMapsConfigured:base,
+    campaignEnabled:LLTOUCH_PWYC_ENABLED,crossServiceConstraintReady:LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY,multiProviderEnabled:LLTOUCH_MULTI_PROVIDER_ENABLED,
+    studioEnabled:LLB_STUDIO_BOOKING_ENABLED,successV2Enabled:LLTOUCH_SUCCESS_V2_ENABLED,
+    studioServicesMapped:Object.keys(LLB_SERVICES).filter(k=>Boolean(llbStudioServiceOption(k))).length,
+    studioServicesTotal:Object.keys(LLB_SERVICES).length,
+    timezone:GOOGLE_CALENDAR_TIMEZONE,campaignDate:LLTOUCH_CAMPAIGN_DATE});
 });
 
 app.get("/vagaro/booking-options/:sessionId", async (req, res) => {
@@ -5838,6 +6118,10 @@ app.get("/vagaro/booking-options/:sessionId", async (req, res) => {
         ? { unsupportedAddOn: option.vagaroService.unsupportedAddOn }
         : {}),
       professional: option.professional,
+      availableProfessionals: llTouchAllowedProfessionals(session, option).map(key=>({
+        key, name:LLTOUCH_PROFESSIONALS[key].name,
+        enabled:Boolean(LLTOUCH_PROFESSIONALS[key].providerId&&LLTOUCH_PROFESSIONALS[key].calendarId)
+      })).filter(p=>p.enabled),
       fallbackUrl: VAGARO_LISTING_URL
     }));
 
