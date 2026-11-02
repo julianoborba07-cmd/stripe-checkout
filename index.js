@@ -1426,16 +1426,21 @@ function llTouchGetProfessional(session, option, requestedKey) {
   const professional = LLTOUCH_PROFESSIONALS[key];
   return professional?.providerId && professional?.calendarId ? { key, ...professional } : null;
 }
-// Vagaro is the source of valid start times: do not impose a second facial grid.
-// Every facial LASTS 75 minutes; Jenn laser LASTS 20 minutes and starts every 20.
-// Actual Vagaro slots, calendar conflicts, SQL holds and closing time are checked elsewhere.
+// Campaign-only fixed starts (local clinic time, 09-Nov-2026).
+// Facials: 10:00 / 11:15 / 12:30 / 13:45 / 15:00; duration 75 min.
+// Laser: every 20 min from 10:00 through 13:40; duration 20 min.
+// Only start times ALSO offered by Vagaro and passing Google/Supabase/hold checks may be booked.
+// Never apply this rule to general LL Touch, LL Brows Studio or Academy bookings.
 function llTouchCampaignStartAligned(window, professionalKey) {
   if (!window) return false;
   const parts = String(window.time).split(':');
   if (parts.length !== 2 || !/^\d{2}$/.test(parts[0]) || !/^\d{2}$/.test(parts[1])) return false;
   const [hour, minute] = parts.map(Number);
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return false;
-  return professionalKey !== 'jenn' || (hour * 60 + minute) % 20 === 0;
+  const step = professionalKey === 'jenn' ? 20 :
+    ['ludimilla', 'carol'].includes(professionalKey) ? 75 : 0;
+  const start = hour * 60 + minute;
+  return step > 0 && start >= 600 && (start - 600) % step === 0;
 }
 function llTouchCampaignTimeAllowed(window, professionalKey) {
   if (!window || window.date !== LLTOUCH_CAMPAIGN_DATE) return false;
