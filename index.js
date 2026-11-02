@@ -1426,12 +1426,13 @@ function llTouchGetProfessional(session, option, requestedKey) {
   const professional = LLTOUCH_PROFESSIONALS[key];
   return professional?.providerId && professional?.calendarId ? { key, ...professional } : null;
 }
-// Align campaign starts on a true clock grid; never invent Vagaro slots.
-// Facial (75 minutes): 10:00, 11:15, 12:30, 13:45, 15:00. Jenn (20 minutes): 10:00, 10:20, ... 13:40.
+// Align campaign starts on a clock grid; never invent Vagaro slots.
+// Facials LAST 75 minutes but starts may fall on a 15-minute grid when Vagaro offers them.
+// Jenn laser LASTS 20 minutes and uses a 20-minute start grid.
 function llTouchCampaignStartAligned(window, professionalKey) {
   if (!window) return false;
   const [hour, minute] = window.time.split(":").map(Number);
-  const interval = professionalKey === "jenn" ? 20 : 75;
+  const interval = professionalKey === "jenn" ? 20 : 15;
   return Number.isInteger(hour) && Number.isInteger(minute) &&
     (hour * 60 + minute) % interval === 0;
 }
