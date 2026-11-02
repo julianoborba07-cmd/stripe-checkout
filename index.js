@@ -175,10 +175,14 @@ app.post(
       event.data.object?.metadata?.campaign==='pwyc-2026-11-09' &&
       event.data.object?.metadata?.pwyc_hold_key) {
       try {await llTouchReleasePrepayHold(event.data.object.metadata.pwyc_hold_key,event.data.object.id);}
-      catch(e){console.error('PWYC expired hold release failed:',String(e?.message||e));}
+      catch(e){console.error('PWYC expired hold release failed:',String(e?.message||e));return res.status(503).json({received:false});}
       return res.json({received:true});
     }
-    if (event.type === "checkout.session.completed") {
+    if (event.type === 'checkout.session.async_payment_succeeded' &&
+      event.data.object?.metadata?.campaign !== 'pwyc-2026-11-09') {
+      return res.json({received:true});
+    }
+    if (event.type === "checkout.session.completed" || event.type === 'checkout.session.async_payment_succeeded') {
       try {
         const session = await stripe.checkout.sessions.retrieve(
           event.data.object.id,
@@ -210,6 +214,23 @@ app.post(
               });
             } catch (error) {
               console.error("LL Touch PWYC customer contact sync failed:", error);
+            }
+          }
+          // Queue only paid, new preselected campaigns. Legacy paid orders without a
+          // pwyc_hold_key continue their existing manual Success workflow.
+          if (LLTOUCH_PWYC_AUTO_CONFIRM_ENABLED &&
+              session.payment_status === 'paid' &&
+              /^[a-f0-9-]{36}$/i.test(String(session.metadata?.pwyc_hold_key || ''))) {
+            try {
+              const {error: queueError} = await academySupabase.rpc('lltouch_pwyc_queue_paid_checkout',{
+                p_session_id:session.id
+              });
+              if (queueError) throw queueError;
+              console.log('PWYC auto-confirm queued', session.id.slice(0,16));
+            } catch(queueError) {
+              // Acknowledge ONLY after durable persistence; Stripe should retry.
+              console.error('PWYC auto-confirm queue failed:',String(queueError?.message||queueError));
+              return res.status(503).json({received:false,error:'Queue unavailable'});
             }
           }
           console.log(`LL Touch PWYC campaign payment confirmed: ${session.id}`);
@@ -759,6 +780,8 @@ const VAGARO_JENN_PROVIDER_ID = String(process.env.VAGARO_JENN_PROVIDER_ID || ""
 const LLTOUCH_MULTI_PROVIDER_ENABLED = process.env.LLTOUCH_MULTI_PROVIDER_ENABLED === "true";
 const LLTOUCH_PWYC_ENABLED = process.env.LLTOUCH_PWYC_ENABLED === "true";
 const LLTOUCH_PWYC_PREPAY_HOLD_ENABLED = process.env.LLTOUCH_PWYC_PREPAY_HOLD_ENABLED === "true";
+// V7: opt-in only after queue migration, validation and controlled test.
+const LLTOUCH_PWYC_AUTO_CONFIRM_ENABLED = process.env.LLTOUCH_PWYC_AUTO_CONFIRM_ENABLED === "true";
 // Explicit, one-paid-order recovery: does not reopen the public checkout.
 const LLTOUCH_PWYC_RECOVERY_ENABLED = process.env.LLTOUCH_PWYC_RECOVERY_ENABLED === "true";
 const LLTOUCH_PWYC_RECOVERY_SESSION_ID = String(process.env.LLTOUCH_PWYC_RECOVERY_SESSION_ID || "").trim();
@@ -4493,7 +4516,15 @@ app.get("/lltouch/campaign/nov09/session/:id",checkoutLimiter,async(req,res)=>{
         h.status==='released' || (h.status==='held' && new Date(h.expires_at).getTime()<=Date.now())));
     const requiresManualReview = !recoveryAvailable && (bookings.some(b => b.status !== "confirmed") ||
       (confirmedCount > 0 && confirmedCount < bookingOptions.length));
-    return res.json({payment_status:session.payment_status,requiresManualReview,recoveryAvailable,
+    let autoConfirmation = null;
+    if(LLTOUCH_PWYC_AUTO_CONFIRM_ENABLED && session.metadata?.pwyc_hold_key){
+      const {data:job,error:jobError}=await academySupabase.from('lltouch_pwyc_auto_jobs')
+        .select('status,last_code').eq('stripe_session_id',session.id).maybeSingle();
+      if(jobError) throw jobError;
+      autoConfirmation={enabled:true,state:job?.status||'awaiting_webhook',
+        needsReview:job?.status==='manual_review'};
+    }
+    return res.json({payment_status:session.payment_status,requiresManualReview,recoveryAvailable,autoConfirmation,
       prepaymentExpired,prepaymentReserved:Boolean(session.metadata?.pwyc_hold_key),
       preselected:prepaymentHold.map(h=>({item_index:h.item_index,time:h.appointment_time,
         professional_key:Object.keys(LLTOUCH_PROFESSIONALS).find(k=>LLTOUCH_PROFESSIONALS[k].providerId===h.provider_id)||'',
@@ -4503,7 +4534,12 @@ app.get("/lltouch/campaign/nov09/session/:id",checkoutLimiter,async(req,res)=>{
       durationMinutes:bookings.find(b=>b.service_id===o.vagaroService.serviceId && b.status==='confirmed')?.duration_minutes
         || o.vagaroService.bookingDurationMinutes,
       providers:llTouchAllowedProfessionals(session,o).map(key=>({id:key,name:LLTOUCH_PROFESSIONALS[key].name})),
-      confirmed:bookings.some(b=>b.service_id===o.vagaroService.serviceId&&b.status==="confirmed")
+      confirmed:bookings.some(b=>b.service_id===o.vagaroService.serviceId&&b.status==="confirmed"),
+      confirmedBooking:(()=>{const b=bookings.find(b=>b.service_id===o.vagaroService.serviceId&&
+        b.item_index===o.index&&b.status==='confirmed');return b?{
+          time:b.appointment_time,professional:Object.values(LLTOUCH_PROFESSIONALS)
+            .find(p=>p.providerId===b.provider_id)?.name||'LL Touch'
+        }:null;})()
     }))});
   }catch(err){console.error("PWYC session:",err);return res.status(503).json({error:"Unable to retrieve campaign order."});}
 });
@@ -6189,9 +6225,10 @@ async function llTouchPWYCOldEventsAbsent(rows) {
 
 // PWYC NOV09: unified confirmation. Requires SQL function lltouch_pwyc_hold_batch.
 // No direct Vagaro write: the Google BUSY events sync to Vagaro Personal Tasks.
-app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, async (req, res) => {
+async function llTouchConfirmBatchHandler(req, res) {
   const sessionId = cleanLeadField(req.body?.session_id, 160);
-  if ((!LLTOUCH_PWYC_ENABLED && !llTouchPWYCRecoveryGate(sessionId)) || !LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY)
+  // trustedAutoConfirm is set exclusively by the server-side paid-job worker.
+  if ((!LLTOUCH_PWYC_ENABLED && !llTouchPWYCRecoveryGate(sessionId) && req.trustedAutoConfirm !== true) || !LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY)
     return res.status(503).json({ok:false,code:"CAMPAIGN_DISABLED",error:"Campaign scheduling is currently unavailable."});
   if (!llTouchAppointmentsReadiness())
     return res.status(503).json({ok:false,code:"BOOKING_UNAVAILABLE",error:"Booking service is not ready."});
@@ -6380,7 +6417,92 @@ app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, async (req, r
   clearAcademyAvailableDatesCache();
   return res.status(201).json({ok:true,message:"All purchased treatments confirmed.",
     appointments:confirmed.sort((a,b)=>a.item_index-b.item_index).map(llTouchPublicAppointment)});
-});
+}
+app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, llTouchConfirmBatchHandler);
+
+// V7 autonomous confirmation runs exclusively from paid Stripe webhook jobs.
+// No browser session_id can enqueue a job; every job rechecks Stripe, SQL and calendars.
+let llTouchAutoWorkerRunning=false;
+async function llTouchAutoConfirmOneJob() {
+  if(!LLTOUCH_PWYC_AUTO_CONFIRM_ENABLED || llTouchAutoWorkerRunning) return;
+  llTouchAutoWorkerRunning=true;
+  try {
+    const {data:claims,error:claimError}=await academySupabase.rpc('lltouch_pwyc_claim_paid_checkout');
+    if(claimError)throw claimError;
+    for (const job of claims||[]) {
+      const sessionId=String(job.stripe_session_id||'');
+      let finalStatus='manual_review',code='UNEXPECTED',retrySeconds=30;
+      try {
+        const session=await getStripeSessionExpanded(sessionId);
+        if(!llTouchIsCampaign(session)||!llTouchPaidSession(session)||
+           !/^[a-f0-9-]{36}$/i.test(String(session.metadata?.pwyc_hold_key||''))) {
+          code='INVALID_PAID_CAMPAIGN';
+        } else {
+          const holds=await llTouchPrepayHoldsForSession(session);
+          const unique=new Set(holds.map(h=>h.item_index));
+          if(!holds.length || holds.length>2 || unique.size!==holds.length){
+            code='HOLD_MISSING_OR_INCONSISTENT';
+          } else {
+            const appointments=holds.map(h=>({
+              item_index:Number(h.item_index),
+              professional_key:Object.keys(LLTOUCH_PROFESSIONALS)
+                .find(k=>LLTOUCH_PROFESSIONALS[k].providerId===h.provider_id)||'',
+              time:h.appointment_time
+            }));
+            // Internal wrapper reuses all existing paid order / Vagaro / calendar /
+            // SQL atomic conflict checks; no duplicate implementation or HTTP bypass.
+            let statusCode=200,body=null;
+            const response={
+              status(code){statusCode=code;return this;},
+              json(payload){body=payload;return this;}
+            };
+            await llTouchConfirmBatchHandler({
+              body:{session_id:sessionId,appointments},trustedAutoConfirm:true
+            },response);
+            if(body?.ok && (statusCode===201 || body.alreadyConfirmed===true)){
+              finalStatus='confirmed';code='CONFIRMED';
+            } else {
+              code=String(body?.code||'CONFIRMATION_FAILED').slice(0,80);
+              if(['BOOKING_UNAVAILABLE','ORDER_UNAVAILABLE',
+                 'AVAILABILITY_UNVERIFIED','PREPAY_HOLD_UNVERIFIED'].includes(code)
+                 && Number(job.attempts)<4){
+                finalStatus='queued';
+                retrySeconds=30;
+              }
+            }
+          }
+        }
+        // If simultaneous browser confirmation won, reconcile before manual review.
+        if(finalStatus!=='confirmed' && session && llTouchPaidSession(session)){
+          const options=buildBookingOptionsFromSession(session);
+          const bookings=await llTouchReadBookings(session.id);
+          if(options.length && options.every(o=>bookings.some(b=>b.item_index===o.index &&
+             b.service_id===o.vagaroService.serviceId && b.status==='confirmed'))){
+            finalStatus='confirmed';code='ALREADY_CONFIRMED';
+          }
+        }
+      } catch(err) {
+        console.error('PWYC auto-confirm job error:',sessionId.slice(0,15),String(err?.message||err));
+        finalStatus=Number(job.attempts)<4?'queued':'manual_review';
+        code='UNEXPECTED_ERROR';retrySeconds=30;
+      }
+      const {error:completeError}=await academySupabase.rpc('lltouch_pwyc_complete_paid_checkout',{
+        p_session_id:sessionId,p_state:finalStatus,p_code:code,p_retry_seconds:retrySeconds
+      });
+      if(completeError)throw completeError;
+      console.log('PWYC auto-confirm result',sessionId.slice(0,15),finalStatus,code);
+    }
+  } catch(err) {
+    console.error('PWYC auto-confirm worker issue:',String(err?.message||err));
+  } finally {
+    llTouchAutoWorkerRunning=false;
+  }
+}
+// Opt-in polling is enabled ONLY after the V7 SQL migration and webhook tests.
+if (LLTOUCH_PWYC_AUTO_CONFIRM_ENABLED) {
+  setInterval(()=>{void llTouchAutoConfirmOneJob();},15000);
+  setTimeout(()=>{void llTouchAutoConfirmOneJob();},3000);
+}
 
 app.post("/llb/studio/confirm", checkoutLimiter, (req,res) => {
   req.llTouchBookingRoute = "studio";return llTouchHandleAppointmentConfirmation(req,res);
@@ -6527,6 +6649,7 @@ app.get("/lltouch/integration-readiness",checkoutLimiter,(_,res)=>{
     professionalMapsConfigured:base,
     campaignEnabled:LLTOUCH_PWYC_ENABLED,recoveryEnabled:LLTOUCH_PWYC_RECOVERY_ENABLED,
     prepayHoldEnabled:LLTOUCH_PWYC_PREPAY_HOLD_ENABLED,
+    autoConfirmationEnabled:LLTOUCH_PWYC_AUTO_CONFIRM_ENABLED,
     crossServiceConstraintReady:LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY,multiProviderEnabled:LLTOUCH_MULTI_PROVIDER_ENABLED,
     studioEnabled:LLB_STUDIO_BOOKING_ENABLED,successV2Enabled:LLTOUCH_SUCCESS_V2_ENABLED,
     studioServicesMapped:Object.keys(LLB_SERVICES).filter(k=>Boolean(llbStudioServiceOption(k))).length,
