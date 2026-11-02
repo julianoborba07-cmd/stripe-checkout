@@ -1426,15 +1426,16 @@ function llTouchGetProfessional(session, option, requestedKey) {
   const professional = LLTOUCH_PROFESSIONALS[key];
   return professional?.providerId && professional?.calendarId ? { key, ...professional } : null;
 }
-// Align campaign starts on a clock grid; never invent Vagaro slots.
-// Facials LAST 75 minutes but starts may fall on a 15-minute grid when Vagaro offers them.
-// Jenn laser LASTS 20 minutes and uses a 20-minute start grid.
+// Vagaro is the source of valid start times: do not impose a second facial grid.
+// Every facial LASTS 75 minutes; Jenn laser LASTS 20 minutes and starts every 20.
+// Actual Vagaro slots, calendar conflicts, SQL holds and closing time are checked elsewhere.
 function llTouchCampaignStartAligned(window, professionalKey) {
   if (!window) return false;
-  const [hour, minute] = window.time.split(":").map(Number);
-  const interval = professionalKey === "jenn" ? 20 : 15;
-  return Number.isInteger(hour) && Number.isInteger(minute) &&
-    (hour * 60 + minute) % interval === 0;
+  const parts = String(window.time).split(':');
+  if (parts.length !== 2 || !/^\d{2}$/.test(parts[0]) || !/^\d{2}$/.test(parts[1])) return false;
+  const [hour, minute] = parts.map(Number);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return false;
+  return professionalKey !== 'jenn' || (hour * 60 + minute) % 20 === 0;
 }
 function llTouchCampaignTimeAllowed(window, professionalKey) {
   if (!window || window.date !== LLTOUCH_CAMPAIGN_DATE) return false;
