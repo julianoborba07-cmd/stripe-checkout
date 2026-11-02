@@ -751,6 +751,13 @@ const VAGARO_CAROL_PROVIDER_ID = String(process.env.VAGARO_CAROL_PROVIDER_ID || 
 const VAGARO_JENN_PROVIDER_ID = String(process.env.VAGARO_JENN_PROVIDER_ID || "").trim();
 const LLTOUCH_MULTI_PROVIDER_ENABLED = process.env.LLTOUCH_MULTI_PROVIDER_ENABLED === "true";
 const LLTOUCH_PWYC_ENABLED = process.env.LLTOUCH_PWYC_ENABLED === "true";
+// Explicit, one-paid-order recovery: does not reopen the public checkout.
+const LLTOUCH_PWYC_RECOVERY_ENABLED = process.env.LLTOUCH_PWYC_RECOVERY_ENABLED === "true";
+const LLTOUCH_PWYC_RECOVERY_SESSION_ID = String(process.env.LLTOUCH_PWYC_RECOVERY_SESSION_ID || "").trim();
+function llTouchPWYCRecoveryGate(sessionId) {
+  return LLTOUCH_PWYC_RECOVERY_ENABLED && /^cs_live_[A-Za-z0-9_-]{20,}$/.test(LLTOUCH_PWYC_RECOVERY_SESSION_ID) &&
+    sessionId === LLTOUCH_PWYC_RECOVERY_SESSION_ID;
+}
 const LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY = process.env.LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY === "true";
 const LLB_STUDIO_BOOKING_ENABLED = process.env.LLB_STUDIO_BOOKING_ENABLED === "true";
 const LLTOUCH_SUCCESS_V2_ENABLED = process.env.LLTOUCH_SUCCESS_V2_ENABLED === "true";
@@ -4330,9 +4337,10 @@ app.get("/lltouch/campaign/nov09/session/:id",checkoutLimiter,async(req,res)=>{
     const bookings=await llTouchReadBookings(session.id);
     const confirmedCount = bookingOptions.filter(o => bookings.some(b =>
       b.service_id === o.vagaroService.serviceId && b.status === "confirmed")).length;
-    const requiresManualReview = bookings.some(b => b.status !== "confirmed") ||
-      (confirmedCount > 0 && confirmedCount < bookingOptions.length);
-    return res.json({payment_status:session.payment_status,requiresManualReview,items:bookingOptions.map(o=>({
+    const recoveryAvailable = llTouchPWYCRecoveryEligible(session, bookingOptions, bookings);
+    const requiresManualReview = !recoveryAvailable && (bookings.some(b => b.status !== "confirmed") ||
+      (confirmedCount > 0 && confirmedCount < bookingOptions.length));
+    return res.json({payment_status:session.payment_status,requiresManualReview,recoveryAvailable,items:bookingOptions.map(o=>({
       index:o.index,title:o.vagaroService.title,category:o.siteItem.type,durationMinutes:o.vagaroService.bookingDurationMinutes,
       providers:llTouchAllowedProfessionals(session,o).map(key=>({id:key,name:LLTOUCH_PROFESSIONALS[key].name})),
       confirmed:bookings.some(b=>b.service_id===o.vagaroService.serviceId&&b.status==="confirmed")
@@ -5481,9 +5489,9 @@ function llTouchAppointmentWindow(date, rawTime, durationMinutes) {
   return { date: isoDate, time: normalizedTime, start, end, endWallClock };
 }
 
-function llTouchAppointmentEventId(sessionId, serviceId, date, time, serviceProviderId = VAGARO_LUDIMILLA_PROVIDER_ID) {
+function llTouchAppointmentEventId(sessionId, serviceId, date, time, serviceProviderId = VAGARO_LUDIMILLA_PROVIDER_ID, retrySuffix = "") {
   const digest = crypto.createHash("sha256")
-    .update(`lltouch|${serviceProviderId}|${sessionId}|${serviceId}|${date}|${time}`)
+    .update(`lltouch|${serviceProviderId}|${sessionId}|${serviceId}|${date}|${time}${retrySuffix ? `|${retrySuffix}` : ""}`)
     .digest("hex").slice(0, 48);
   return `llto${digest}`;
 }
@@ -5519,7 +5527,7 @@ function llTouchPublicAppointment(record) {
 async function llTouchReadBookings(sessionId) {
   const { data, error } = await academySupabase
     .from("lltouch_appointments")
-    .select("id,stripe_session_id,service_id,service_title,provider_id,appointment_date,appointment_time,duration_minutes,starts_at,ends_at,google_event_id,status,created_at")
+    .select("id,stripe_session_id,service_id,service_title,item_index,provider_id,appointment_date,appointment_time,duration_minutes,starts_at,ends_at,google_event_id,status,created_at")
     .eq("stripe_session_id", sessionId)
     .order("created_at", { ascending: true });
 
@@ -5989,14 +5997,44 @@ app.post("/lltouch/campaign/nov09/confirm", checkoutLimiter, (_req,res) => {
     error:"Please refresh the campaign success page to confirm all treatments together."});
 });
 
+// A single safe recovery is offered only to the exact paid session configured by staff.
+// Matching the FIRST attempt's deterministic event IDs ensures any previously retried
+// order stays in manual-review mode. Failed rows are updated atomically by the SQL RPC.
+function llTouchPWYCRecoveryEligible(session, options, rows) {
+  if (!session || !llTouchIsCampaign(session) || !llTouchPaidSession(session) ||
+      !llTouchPWYCRecoveryGate(session.id) || !Array.isArray(rows) ||
+      !options?.length || rows.length !== options.length) return false;
+  return options.every(o => {
+    const row = rows.find(r => r.service_id === o.vagaroService.serviceId && r.item_index === o.index);
+    return Boolean(row && row.status === "failed" && row.provider_id &&
+      Object.values(LLTOUCH_PROFESSIONALS).some(p => p.providerId === row.provider_id && p.calendarId) &&
+      row.google_event_id === llTouchAppointmentEventId(session.id, row.service_id,
+        row.appointment_date, row.appointment_time, row.provider_id));
+  });
+}
+// Before reusing failed rows, prove the previous Google event is not active.
+async function llTouchPWYCOldEventsAbsent(rows) {
+  for (const row of rows) {
+    const professional = Object.values(LLTOUCH_PROFESSIONALS).find(p => p.providerId === row.provider_id);
+    if (!professional?.calendarId) return false;
+    try {
+      const event = await googleCalendarRequest(`/calendars/${encodeURIComponent(professional.calendarId)}/events/${encodeURIComponent(row.google_event_id)}`);
+      if (event?.status !== "cancelled") return false;
+    } catch (error) {
+      if (error?.status !== 404) throw error;
+    }
+  }
+  return true;
+}
+
 // PWYC NOV09: unified confirmation. Requires SQL function lltouch_pwyc_hold_batch.
 // No direct Vagaro write: the Google BUSY events sync to Vagaro Personal Tasks.
 app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, async (req, res) => {
-  if (!LLTOUCH_PWYC_ENABLED || !LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY)
+  const sessionId = cleanLeadField(req.body?.session_id, 160);
+  if ((!LLTOUCH_PWYC_ENABLED && !llTouchPWYCRecoveryGate(sessionId)) || !LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY)
     return res.status(503).json({ok:false,code:"CAMPAIGN_DISABLED",error:"Campaign scheduling is currently unavailable."});
   if (!llTouchAppointmentsReadiness())
     return res.status(503).json({ok:false,code:"BOOKING_UNAVAILABLE",error:"Booking service is not ready."});
-  const sessionId = cleanLeadField(req.body?.session_id, 160);
   const selections = req.body?.appointments;
   if (!sessionId || !Array.isArray(selections) || selections.length < 1 || selections.length > 2)
     return res.status(400).json({ok:false,code:"INVALID_SELECTION",error:"Please select an appointment for each purchased treatment."});
@@ -6013,13 +6051,23 @@ app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, async (req, r
     console.error("PWYC batch order load failed:", String(e?.message || e));
     return res.status(503).json({ok:false,code:"ORDER_UNAVAILABLE",error:"We could not verify the paid order."});
   }
+  let recovery = false;
   if (current.length) {
     const allConfirmed = options.every(o => current.some(r =>
       r.service_id === o.vagaroService.serviceId && r.status === "confirmed"));
     if (allConfirmed) return res.json({ok:true,alreadyConfirmed:true,appointments:
       current.filter(r=>r.status==="confirmed").map(llTouchPublicAppointment)});
-    return res.status(409).json({ok:false,code:"BOOKING_REVIEW_REQUIRED",
+    recovery = llTouchPWYCRecoveryEligible(session, options, current);
+    if (!recovery) return res.status(409).json({ok:false,code:"BOOKING_REVIEW_REQUIRED",
       error:"This order has a previous booking attempt. Contact LL Touch to reconcile it safely; do not purchase again."});
+    try {
+      if (!await llTouchPWYCOldEventsAbsent(current))return res.status(409).json({ok:false,code:"OLD_EVENT_STILL_ACTIVE",
+        error:"An earlier event is still active in Google Calendar. No retry was attempted."});
+    } catch(error) {
+      console.error("PWYC recovery Google preflight failed:",String(error?.message||error));
+      return res.status(503).json({ok:false,code:"OLD_EVENT_UNVERIFIED",
+        error:"We could not verify that earlier calendar events were removed. No retry was attempted."});
+    }
   }
   const selected = new Map();
   for (const choice of selections) {
@@ -6073,12 +6121,14 @@ app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, async (req, r
     appointment_date:LLTOUCH_CAMPAIGN_DATE,appointment_time:p.window.time,
     duration_minutes:p.option.vagaroService.bookingDurationMinutes,
     starts_at:p.window.start.toISOString(),ends_at:p.window.end.toISOString(),
-    google_event_id:llTouchAppointmentEventId(session.id,p.option.vagaroService.serviceId,LLTOUCH_CAMPAIGN_DATE,p.window.time,p.professional.providerId),
+    google_event_id:llTouchAppointmentEventId(session.id,p.option.vagaroService.serviceId,LLTOUCH_CAMPAIGN_DATE,p.window.time,p.professional.providerId,
+      recovery ? "pwyc-recovery-1" : ""),
     paid_total_cents:session.amount_total
   }));
   let held=[];
   try {
-    const {data,error}=await academySupabase.rpc("lltouch_pwyc_hold_batch",{p_records:records});
+    const rpcName = recovery ? "lltouch_pwyc_retry_failed_batch" : "lltouch_pwyc_hold_batch";
+    const {data,error}=await academySupabase.rpc(rpcName,{p_records:records});
     if(error)throw error;
     if(!Array.isArray(data)||data.length!==planned.length)throw new Error("Unexpected batch hold count");
     held=data;
@@ -6180,7 +6230,8 @@ async function llTouchHandleAvailability(req, res) {
     const session = await getStripeSessionExpanded(sessionId);
     if (req.llTouchBookingRoute === "campaign" && !llTouchIsCampaign(session))return res.status(403).json({error:"Invalid campaign session."});
     if (req.llTouchBookingRoute === "studio" && session.metadata?.brand !== "ll_brows")return res.status(403).json({error:"Invalid Studio session."});
-    if (llTouchIsCampaign(session) && !LLTOUCH_PWYC_ENABLED)return res.status(503).json({error:"Campaign booking is not enabled yet."});
+    if (llTouchIsCampaign(session) && !LLTOUCH_PWYC_ENABLED && !llTouchPWYCRecoveryGate(session.id))
+      return res.status(503).json({error:"Campaign booking is not enabled yet."});
     if (session.metadata?.brand === "ll_brows" && !LLB_STUDIO_BOOKING_ENABLED)return res.status(503).json({error:"Studio booking is not enabled yet."});
 
     if (session.payment_status !== "paid") {
@@ -6297,7 +6348,8 @@ app.get("/lltouch/integration-readiness",checkoutLimiter,(_,res)=>{
   const base=Object.values(LLTOUCH_PROFESSIONALS).every(p=>Boolean(p.providerId&&p.calendarId));
   return res.json({readyToEnableCampaign:base&&isGoogleCalendarConfigured()&&llTouchAppointmentsReadiness(),
     professionalMapsConfigured:base,
-    campaignEnabled:LLTOUCH_PWYC_ENABLED,crossServiceConstraintReady:LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY,multiProviderEnabled:LLTOUCH_MULTI_PROVIDER_ENABLED,
+    campaignEnabled:LLTOUCH_PWYC_ENABLED,recoveryEnabled:LLTOUCH_PWYC_RECOVERY_ENABLED,
+    crossServiceConstraintReady:LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY,multiProviderEnabled:LLTOUCH_MULTI_PROVIDER_ENABLED,
     studioEnabled:LLB_STUDIO_BOOKING_ENABLED,successV2Enabled:LLTOUCH_SUCCESS_V2_ENABLED,
     studioServicesMapped:Object.keys(LLB_SERVICES).filter(k=>Boolean(llbStudioServiceOption(k))).length,
     studioServicesTotal:Object.keys(LLB_SERVICES).length,
