@@ -171,6 +171,13 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    if (event.type === 'checkout.session.expired' &&
+      event.data.object?.metadata?.campaign==='pwyc-2026-11-09' &&
+      event.data.object?.metadata?.pwyc_hold_key) {
+      try {await llTouchReleasePrepayHold(event.data.object.metadata.pwyc_hold_key,event.data.object.id);}
+      catch(e){console.error('PWYC expired hold release failed:',String(e?.message||e));}
+      return res.json({received:true});
+    }
     if (event.type === "checkout.session.completed") {
       try {
         const session = await stripe.checkout.sessions.retrieve(
@@ -408,9 +415,9 @@ const FULL_BODY_DOLLAR_PRICES = {
 // ==============================
 const FACIAL_BASE_PRICES = {
   "ll-signature": { label: "LL Signature Facial", durationMinutes: 75, single: 165, 3: 465 },
-  "classic-deluxe": { label: "Classic Deluxe Facial", durationMinutes: 60, single: 150, 3: 420 },
-  "diamond-glow": { label: "Diamond Glow", durationMinutes: 60, single: 165, 3: 450 },
-  dermaplaning: { label: "Dermaplaning", durationMinutes: 60, single: 150, 3: 350 }
+  "classic-deluxe": { label: "Classic Deluxe Facial", durationMinutes: 75, single: 150, 3: 420 },
+  "diamond-glow": { label: "Diamond Glow", durationMinutes: 75, single: 165, 3: 450 },
+  dermaplaning: { label: "Dermaplaning", durationMinutes: 75, single: 150, 3: 350 }
 };
 
 // Single-session add-on prices come straight from the printed list. 3-session
@@ -460,11 +467,11 @@ function getFacialPrice(item) {
 // "oxi-laser-facial" to match the printed list; "hydrafacial" is new.
 // ==============================
 const MEDSPA_BASE_PRICES = {
-  microneedling: { label: "Microneedling", durationMinutes: 60, single: 200, 3: 450 },
+  microneedling: { label: "Microneedling", durationMinutes: 75, single: 200, 3: 450 },
   llumigold: { label: "LLumiGold", durationMinutes: 105, single: 250, 3: 600 },
   "oxi-laser-facial": { label: "Oxi Laser Facial", durationMinutes: 15, single: 180, 3: 450 },
   "glow-up-laser-facial": { label: "Glow Up Laser Facial", durationMinutes: 30, single: 250, 3: 600 },
-  hydrafacial: { label: "Hydrafacial", durationMinutes: 60, single: 150, 3: 350 },
+  hydrafacial: { label: "Hydrafacial", durationMinutes: 75, single: 150, 3: 350 },
   peel: { label: "Peel", durationMinutes: 15, single: 150, 3: 360 }
 };
 
@@ -751,6 +758,7 @@ const VAGARO_CAROL_PROVIDER_ID = String(process.env.VAGARO_CAROL_PROVIDER_ID || 
 const VAGARO_JENN_PROVIDER_ID = String(process.env.VAGARO_JENN_PROVIDER_ID || "").trim();
 const LLTOUCH_MULTI_PROVIDER_ENABLED = process.env.LLTOUCH_MULTI_PROVIDER_ENABLED === "true";
 const LLTOUCH_PWYC_ENABLED = process.env.LLTOUCH_PWYC_ENABLED === "true";
+const LLTOUCH_PWYC_PREPAY_HOLD_ENABLED = process.env.LLTOUCH_PWYC_PREPAY_HOLD_ENABLED === "true";
 // Explicit, one-paid-order recovery: does not reopen the public checkout.
 const LLTOUCH_PWYC_RECOVERY_ENABLED = process.env.LLTOUCH_PWYC_RECOVERY_ENABLED === "true";
 const LLTOUCH_PWYC_RECOVERY_SESSION_ID = String(process.env.LLTOUCH_PWYC_RECOVERY_SESSION_ID || "").trim();
@@ -980,19 +988,19 @@ const VAGARO_SERVICE_MAP = {
       serviceId: "RaQGIo6sI~kcqab7fPeozg==",
       title: "LL Deluxe",
       category: "Facial Treatments",
-      durationMinutes: 60
+      durationMinutes: 75
     },
     "diamond-glow": {
       serviceId: "9zTHcwvHqBo6VhAYjpVdRg==",
       title: "Diamond Glow",
       category: "Facial Treatments",
-      durationMinutes: 60
+      durationMinutes: 75
     },
     dermaplaning: {
       serviceId: "8XANbRGtkjYnxprxaNUSUw==",
       title: "Dermaplaning",
       category: "Facial Treatments",
-      durationMinutes: 60
+      durationMinutes: 75
     }
   },
 
@@ -1001,7 +1009,7 @@ const VAGARO_SERVICE_MAP = {
       serviceId: "7qDQIfdCmFEk~7nIlCDP5A==",
       title: "Microneedling",
       category: "Med Spa Treatments",
-      durationMinutes: 60
+      durationMinutes: 75
     },
     llumigold: {
       serviceId: "glQz6wa2UA1twxLJuhudOA==",
@@ -1031,7 +1039,7 @@ const VAGARO_SERVICE_MAP = {
       serviceId: "RCAVN7dx4ToC1Rz0jWS0tA==",
       title: "Hydra Facial",
       category: "Facial Treatments",
-      durationMinutes: 60
+      durationMinutes: 75
     }
   },
 
@@ -1419,11 +1427,11 @@ function llTouchGetProfessional(session, option, requestedKey) {
   return professional?.providerId && professional?.calendarId ? { key, ...professional } : null;
 }
 // Align campaign starts on a true clock grid; never invent Vagaro slots.
-// Facial: 10:00, 11:00, ... 16:00. Jenn: 10:00, 10:20, ... 13:40.
+// Facial (75 minutes): 10:00, 11:15, 12:30, 13:45, 15:00. Jenn (20 minutes): 10:00, 10:20, ... 13:40.
 function llTouchCampaignStartAligned(window, professionalKey) {
   if (!window) return false;
   const [hour, minute] = window.time.split(":").map(Number);
-  const interval = professionalKey === "jenn" ? 20 : 60;
+  const interval = professionalKey === "jenn" ? 20 : 75;
   return Number.isInteger(hour) && Number.isInteger(minute) &&
     (hour * 60 + minute) % interval === 0;
 }
@@ -4294,9 +4302,80 @@ async function llTouchCampaignHasCapacity(campaignItem){
   }
   return false;
 }
+// NEW: hold BEFORE Stripe. Availability is read-only and excludes other website holds.
+async function llTouchPrepayOffers(item, professionalKey) {
+  const permitted = item.group === 'laser' ? ['jenn'] : ['ludimilla','carol'];
+  if (!permitted.includes(professionalKey)) throw new Error('Invalid professional');
+  const professional = LLTOUCH_PROFESSIONALS[professionalKey];
+  const service = resolveVagaroServiceFromSiteItem(item.siteItem);
+  if (!professional?.providerId || !professional?.calendarId || !service) throw new Error('Service unavailable');
+  if (!academySupabase) throw new Error('Supabase not configured');
+  const [vagaro, googleBusy, holds, booked] = await Promise.all([
+    searchVagaroAvailability({date:LLTOUCH_CAMPAIGN_DATE,serviceId:service.serviceId,
+      addOnIds:service.addOnIds || [],serviceProviderId:professional.providerId}),
+    llTouchBusyEventsForCalendar(LLTOUCH_CAMPAIGN_DATE,professional.calendarId),
+    academySupabase.from('lltouch_pwyc_checkout_holds').select('starts_at,ends_at')
+      .eq('provider_id',professional.providerId).eq('status','held')
+      .gt('expires_at',new Date().toISOString()),
+    academySupabase.from('lltouch_appointments').select('starts_at,ends_at')
+      .eq('provider_id',professional.providerId).eq('appointment_date',LLTOUCH_CAMPAIGN_DATE)
+      .in('status',['pending','confirmed'])
+  ]);
+  if (holds.error || booked.error) throw new Error('Cannot verify existing holds');
+  const unavailable = [...(holds.data || []),...(booked.data || [])].map(r=>({
+    start:new Date(r.starts_at),end:new Date(r.ends_at)
+  }));
+  const seen = new Set(); const result=[];
+  for (const day of vagaro.data) {
+    if (normalizeAcademyDateValue(day.appointmentDate,LLTOUCH_CAMPAIGN_DATE)!==LLTOUCH_CAMPAIGN_DATE) continue;
+    for (const rawTime of day.timeSlot || []) {
+      const time = normalizeAcademyTime(rawTime);
+      const window = llTouchAppointmentWindow(LLTOUCH_CAMPAIGN_DATE,time,service.bookingDurationMinutes);
+      if (!window || seen.has(time) || window.start.getTime()<Date.now()+600000 ||
+          !llTouchCampaignTimeAllowed(window,professionalKey) ||
+          googleBusy.some(b=>llTouchCalendarIntervalOverlaps(window,b)) ||
+          unavailable.some(b=>llTouchCalendarIntervalOverlaps(window,b))) continue;
+      seen.add(time);result.push(time);
+    }
+  }
+  return {professional,service,times:result.sort()};
+}
+app.post('/lltouch/campaign/nov09/prepay-availability',checkoutLimiter,async(req,res)=>{
+  if(!LLTOUCH_PWYC_PREPAY_HOLD_ENABLED)return res.status(503).json({error:'Prepayment scheduling is not enabled.'});
+  const group = String(req.body?.category || '');
+  const key=String(req.body?.key || '');
+  const professionalKey=String(req.body?.professional_key || '');
+  if(!['facial','laser'].includes(group) || !/^[a-z0-9-]{2,32}$/.test(key) ||
+     !['ludimilla','carol','jenn'].includes(professionalKey))return res.status(422).json({error:'Invalid selection.'});
+  // Price here is a validation placeholder only; no payment is created.
+  const item = llTouchParseCampaignItems([{category:group,key,amountCents:50}])?.[0];
+  if(!item)return res.status(422).json({error:'Unknown treatment.'});
+  try{
+    const r=await llTouchPrepayOffers(item,professionalKey);
+    return res.json({date:LLTOUCH_CAMPAIGN_DATE,durationMinutes:r.service.bookingDurationMinutes,
+      professional:professionalKey,times:r.times});
+  }catch(e){console.error('PWYC prepay availability failed:',String(e?.message||e));
+    return res.status(503).json({error:'Could not verify available times. Please try again.'});}
+});
+async function llTouchReleasePrepayHold(holdKey,sessionId=null) {
+  if(!academySupabase)throw new Error('Booking storage unavailable');
+  const {error}=await academySupabase.rpc('lltouch_pwyc_release_checkout_hold',{
+    p_hold_key:holdKey,p_session_id:sessionId});
+  if(error)throw error;
+}
+async function llTouchPrepayHoldsForSession(session) {
+  const holdKey=String(session?.metadata?.pwyc_hold_key || '');
+  if(!/^[a-f0-9-]{36}$/.test(holdKey))return [];
+  const {data,error}=await academySupabase.from('lltouch_pwyc_checkout_holds')
+    .select('item_index,provider_id,service_id,appointment_time,starts_at,ends_at,expires_at,status')
+    .eq('hold_key',holdKey).eq('stripe_session_id',session.id).order('item_index');
+  if(error)throw error;
+  return data||[];
+}
 app.post("/lltouch/campaign/nov09/checkout",checkoutLimiter,async(req,res)=>{
   try{
     if(!LLTOUCH_PWYC_ENABLED || !LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY)return res.status(503).json({error:"Campaign checkout is not active yet."});
+    if(!LLTOUCH_PWYC_PREPAY_HOLD_ENABLED)return res.status(503).json({error:'Prepayment time selection must be enabled before campaign checkout.'});
     if(!Object.values(LLTOUCH_PROFESSIONALS).every(p=>Boolean(p.providerId&&p.calendarId)))
       return res.status(503).json({error:"Campaign calendars are not fully configured."});
     const email=cleanLeadField(req.body?.email,254).toLowerCase();
@@ -4307,24 +4386,87 @@ app.post("/lltouch/campaign/nov09/checkout",checkoutLimiter,async(req,res)=>{
     if(!isValidEmail(email)||!items||fullName.length<4||!fullName.includes(" ")||
        !/^\+?[0-9().\s-]{10,32}$/.test(phone)||phoneDigits.length<10||phoneDigits.length>15)
       return res.status(400).json({error:"Provide your full name, a valid phone number, email, and up to one facial and one laser with valid contributions."});
-    // Preflight avoids taking payment for an obviously sold-out service; race remains possible.
-    for(const item of items){
-      if(!(await llTouchCampaignHasCapacity(item)))return res.status(409).json({error:`No available campaign slots remain for ${item.title}. No payment was taken.`});
+    let prepayHoldKey = null;
+    let preselected=[];
+    if (LLTOUCH_PWYC_PREPAY_HOLD_ENABLED) {
+      const selections = req.body?.appointmentSelections;
+      if (!Array.isArray(selections) || selections.length!==items.length)
+        return res.status(422).json({error:'Choose a professional and a time for every treatment before paying.'});
+      const chosen = new Set();
+      for (let i=0;i<items.length;i++) {
+        const item=items[i];
+        const choice=selections.find(v=>v?.category===item.group && v?.key===item.key);
+        if (!choice || chosen.has(item.group))
+          return res.status(422).json({error:'Missing or duplicated appointment selection.'});
+        chosen.add(item.group);
+        const professionalKey = String(choice.professional_key||'');
+        const time=normalizeAcademyTime(choice.time);
+        const professional=LLTOUCH_PROFESSIONALS[professionalKey];
+        const service=resolveVagaroServiceFromSiteItem(item.siteItem);
+        const window=llTouchAppointmentWindow(LLTOUCH_CAMPAIGN_DATE,time,service?.bookingDurationMinutes);
+        if (!service || !window || window.start.getTime()<Date.now()+600000 ||
+            !llTouchCampaignTimeAllowed(window,professionalKey) ||
+            !(item.group==='laser'?professionalKey==='jenn':['carol','ludimilla'].includes(professionalKey)))
+          return res.status(422).json({error:'Choose a valid time within the campaign schedule.'});
+        preselected.push({item,professionalKey,professional,service,window,index:i});
+      }
+      for(let i=0;i<preselected.length;i++)for(let j=i+1;j<preselected.length;j++){
+        if(llTouchCalendarIntervalOverlaps(preselected[i].window,preselected[j].window))
+          return res.status(422).json({error:'Your appointments cannot overlap. Choose different start times.'});
+      }
+      // Live Vagaro+Google+SQL preflight; only the SQL RPC can atomically win a contested slot.
+      for (const entry of preselected) {
+        const offers=await llTouchPrepayOffers(entry.item,entry.professionalKey);
+        if(!offers.times.includes(entry.window.time))return res.status(409).json({
+          error:'A selected time is no longer available. No payment was taken. Please refresh the schedule.'});
+      }
+      const holdKey=crypto.randomUUID();
+      const customerHash=crypto.createHash('sha256').update(email).digest('hex');
+      const holdRecords=preselected.map(p=>({
+        item_index:p.index,provider_id:p.professional.providerId,service_id:p.service.serviceId,customer_hash:customerHash,
+        appointment_date:LLTOUCH_CAMPAIGN_DATE,appointment_time:p.window.time,
+        starts_at:p.window.start.toISOString(),ends_at:p.window.end.toISOString()
+      }));
+      const {data:holds,error:holdError}=await academySupabase.rpc('lltouch_pwyc_checkout_hold_batch',{
+        p_records:holdRecords,p_hold_key:holdKey,p_ttl_minutes:40
+      });
+      if(holdError||!Array.isArray(holds)||holds.length!==items.length) {
+        console.error('PWYC prepay atomic hold failed:',holdError?.message||'unexpected count');
+        return res.status(409).json({error:'The selected slot was taken. No payment was created. Please choose another time.'});
+      }
+      prepayHoldKey=holdKey;
     }
     const metadata={brand:"lltouch",campaign:"pwyc-2026-11-09",customer_email:email,
-      full_name:fullName,customer_phone:phone,cart_items_count:String(items.length)};
+      full_name:fullName,customer_phone:phone,cart_items_count:String(items.length),
+      ...(prepayHoldKey?{pwyc_hold_key:prepayHoldKey}: {})};
     const lines=items.map((item,i)=>{
       metadata[`lltouch_item_${i}`]=JSON.stringify(item.siteItem);
       return {quantity:1,price_data:{currency:"usd",unit_amount:item.amount,
-        product_data:{name:`Pay What You Can — ${item.title}`,description:"One session, November 9, 2026 only. Appointment must be selected after payment.",
+        product_data:{name:`Pay What You Can — ${item.title}`,description:prepayHoldKey?"One session, November 9, 2026. Time selected before payment; confirm on Success page.":"One session, November 9, 2026 only. Appointment must be selected after payment.",
           metadata:{source:"lltouch-site",mode:item.siteItem.type,service:item.siteItem.service,area:item.siteItem.area||"",package:"single",campaign:"pwyc-2026-11-09"}}}};
     });
-    const session=await stripe.checkout.sessions.create({mode:"payment",customer_email:email,
-      customer_creation:"always",line_items:lines,metadata,
-      payment_intent_data:{metadata:{brand:"lltouch",campaign:"pwyc-2026-11-09",customer_email:email,
-        full_name:fullName,customer_phone:phone}},
-      success_url:"https://lltouch.com/pay-what-you-can-success?session_id={CHECKOUT_SESSION_ID}&campaign=pwyc-2026-11-09",
-      cancel_url:"https://lltouch.com/pay-what-you-can"});
+    let session;
+    try {
+      session=await stripe.checkout.sessions.create({mode:"payment",customer_email:email,
+        customer_creation:"always",line_items:lines,metadata,
+        ...(prepayHoldKey?{expires_at:Math.floor(Date.now()/1000)+31*60}:{}),
+        payment_intent_data:{metadata:{brand:"lltouch",campaign:"pwyc-2026-11-09",customer_email:email,
+          full_name:fullName,customer_phone:phone}},
+        success_url:"https://lltouch.com/pay-what-you-can-success?session_id={CHECKOUT_SESSION_ID}&campaign=pwyc-2026-11-09",
+        cancel_url:"https://lltouch.com/pay-what-you-can"});
+      if(prepayHoldKey){
+        const {data:attached,error:attachError}=await academySupabase.rpc('lltouch_pwyc_attach_checkout_hold',{
+          p_hold_key:prepayHoldKey,p_session_id:session.id});
+        if(attachError||attached!==items.length)throw new Error('Could not link reserved times to Stripe.');
+      }
+    }catch(err){
+      // Never return an unpaid checkout URL if its reservation cannot be tracked.
+      if(session?.id){try{await stripe.checkout.sessions.expire(session.id)}catch(e){
+        console.error('PWYC failed to expire orphan checkout',session.id,String(e?.message||e));}}
+      if(prepayHoldKey){try{await llTouchReleasePrepayHold(prepayHoldKey)}catch(e){
+        console.error('PWYC failed to release orphan hold',prepayHoldKey,String(e?.message||e));}}
+      throw err;
+    }
     return res.json({url:session.url});
   }catch(err){console.error("PWYC checkout:",err);return res.status(503).json({error:"Unable to start campaign checkout. Please contact LL Touch."});}
 });
@@ -4338,10 +4480,21 @@ app.get("/lltouch/campaign/nov09/session/:id",checkoutLimiter,async(req,res)=>{
     const confirmedCount = bookingOptions.filter(o => bookings.some(b =>
       b.service_id === o.vagaroService.serviceId && b.status === "confirmed")).length;
     const recoveryAvailable = llTouchPWYCRecoveryEligible(session, bookingOptions, bookings);
+    const prepaymentHold=session.metadata?.pwyc_hold_key ? await llTouchPrepayHoldsForSession(session) : [];
+    const prepaymentExpired=Boolean(session.metadata?.pwyc_hold_key) &&
+      (prepaymentHold.length!==bookingOptions.length || prepaymentHold.some(h=>
+        h.status==='released' || (h.status==='held' && new Date(h.expires_at).getTime()<=Date.now())));
     const requiresManualReview = !recoveryAvailable && (bookings.some(b => b.status !== "confirmed") ||
       (confirmedCount > 0 && confirmedCount < bookingOptions.length));
-    return res.json({payment_status:session.payment_status,requiresManualReview,recoveryAvailable,items:bookingOptions.map(o=>({
-      index:o.index,title:o.vagaroService.title,category:o.siteItem.type,durationMinutes:o.vagaroService.bookingDurationMinutes,
+    return res.json({payment_status:session.payment_status,requiresManualReview,recoveryAvailable,
+      prepaymentExpired,prepaymentReserved:Boolean(session.metadata?.pwyc_hold_key),
+      preselected:prepaymentHold.map(h=>({item_index:h.item_index,time:h.appointment_time,
+        professional_key:Object.keys(LLTOUCH_PROFESSIONALS).find(k=>LLTOUCH_PROFESSIONALS[k].providerId===h.provider_id)||'',
+        status:h.status})),
+      items:bookingOptions.map(o=>({
+      index:o.index,title:o.vagaroService.title,category:o.siteItem.type,
+      durationMinutes:bookings.find(b=>b.service_id===o.vagaroService.serviceId && b.status==='confirmed')?.duration_minutes
+        || o.vagaroService.bookingDurationMinutes,
       providers:llTouchAllowedProfessionals(session,o).map(key=>({id:key,name:LLTOUCH_PROFESSIONALS[key].name})),
       confirmed:bookings.some(b=>b.service_id===o.vagaroService.serviceId&&b.status==="confirmed")
     }))});
@@ -6087,6 +6240,20 @@ app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, async (req, r
   if (selected.size!==options.length || !options.every(o=>selected.has(o.index)))
     return res.status(422).json({ok:false,code:"INCOMPLETE_SELECTION",error:"All purchased treatments need a time."});
   const planned=Array.from(selected.values()).sort((a,b)=>a.option.index-b.option.index);
+  const prepayHoldKey=String(session.metadata?.pwyc_hold_key||'');
+  if(prepayHoldKey){
+    try {
+      const holds=await llTouchPrepayHoldsForSession(session);
+      if(holds.length!==planned.length || planned.some(p=>{
+        const h=holds.find(h=>Number(h.item_index)===p.option.index);
+        return !h || h.status!=='held' || new Date(h.expires_at).getTime()<=Date.now() ||
+          h.service_id!==p.option.vagaroService.serviceId ||
+          h.provider_id!==p.professional.providerId || h.appointment_time!==p.window.time;
+      })) return res.status(409).json({ok:false,code:'PREPAY_HOLD_EXPIRED',
+        error:'Your payment was received, but the temporary time hold expired or changed. Contact LL Touch; do not pay again.'});
+    }catch(e){return res.status(503).json({ok:false,code:'PREPAY_HOLD_UNVERIFIED',
+      error:'Could not verify your prepaid reservation. Contact LL Touch; do not pay again.'});}
+  }
   for (let i=0;i<planned.length;i++)for(let j=i+1;j<planned.length;j++){
     if (llTouchCalendarIntervalOverlaps(planned[i].window,planned[j].window))
       return res.status(409).json({ok:false,code:"CUSTOMER_TIME_CONFLICT",error:"Your treatments cannot overlap. Choose different times."});
@@ -6127,8 +6294,11 @@ app.post("/lltouch/campaign/nov09/confirm-batch", checkoutLimiter, async (req, r
   }));
   let held=[];
   try {
-    const rpcName = recovery ? "lltouch_pwyc_retry_failed_batch" : "lltouch_pwyc_hold_batch";
-    const {data,error}=await academySupabase.rpc(rpcName,{p_records:records});
+    const rpcName = recovery ? "lltouch_pwyc_retry_failed_batch" :
+      (prepayHoldKey ? 'lltouch_pwyc_confirm_checkout_hold' : 'lltouch_pwyc_hold_batch');
+    const rpcArgs=prepayHoldKey && !recovery ? {p_records:records,p_hold_key:prepayHoldKey,p_session_id:session.id} :
+      {p_records:records};
+    const {data,error}=await academySupabase.rpc(rpcName,rpcArgs);
     if(error)throw error;
     if(!Array.isArray(data)||data.length!==planned.length)throw new Error("Unexpected batch hold count");
     held=data;
@@ -6349,6 +6519,7 @@ app.get("/lltouch/integration-readiness",checkoutLimiter,(_,res)=>{
   return res.json({readyToEnableCampaign:base&&isGoogleCalendarConfigured()&&llTouchAppointmentsReadiness(),
     professionalMapsConfigured:base,
     campaignEnabled:LLTOUCH_PWYC_ENABLED,recoveryEnabled:LLTOUCH_PWYC_RECOVERY_ENABLED,
+    prepayHoldEnabled:LLTOUCH_PWYC_PREPAY_HOLD_ENABLED,
     crossServiceConstraintReady:LLTOUCH_CROSS_SERVICE_CONSTRAINT_READY,multiProviderEnabled:LLTOUCH_MULTI_PROVIDER_ENABLED,
     studioEnabled:LLB_STUDIO_BOOKING_ENABLED,successV2Enabled:LLTOUCH_SUCCESS_V2_ENABLED,
     studioServicesMapped:Object.keys(LLB_SERVICES).filter(k=>Boolean(llbStudioServiceOption(k))).length,
