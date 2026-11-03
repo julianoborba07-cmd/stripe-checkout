@@ -1450,7 +1450,7 @@ function llTouchGetProfessional(session, option, requestedKey) {
   return professional?.providerId && professional?.calendarId ? { key, ...professional } : null;
 }
 // Campaign-only fixed starts (local clinic time, 09-Nov-2026).
-// Facials: 10:00 / 11:15 / 12:30 / 13:45 / 15:00; duration 75 min.
+// Facials: 10:00 / 11:15 / 12:30 / 13:45 / 15:00 / 16:15; duration 75 min.
 // Laser: every 20 min from 10:00 through 13:40; duration 20 min.
 // Only start times ALSO offered by Vagaro and passing Google/Supabase/hold checks may be booked.
 // Never apply this rule to general LL Touch, LL Brows Studio or Academy bookings.
@@ -1470,7 +1470,7 @@ function llTouchCampaignTimeAllowed(window, professionalKey) {
   const start = Number(window.time.slice(0,2))*60 + Number(window.time.slice(3,5));
   const end = Number(window.endWallClock.time.slice(0,2))*60 + Number(window.endWallClock.time.slice(3,5));
   return window.endWallClock.date === LLTOUCH_CAMPAIGN_DATE && start >= 600 &&
-    end <= (professionalKey === "jenn" ? 840 : 1020) &&
+    end <= (professionalKey === "jenn" ? 840 : 1050) &&
     llTouchCampaignStartAligned(window, professionalKey);
 }
 // Exact Vagaro IDs for Studio have NOT yet been fully mapped. No guessed IDs.
