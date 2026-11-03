@@ -5742,7 +5742,7 @@ function llTouchBookedResponse(record, alreadyConfirmed = false) {
 }
 
 // LL Touch-only calendar lookup. Does not change Academy calendar selection.
-async function llTouchBusyEventsForCalendar(date, calendarId) {
+async function llTouchBusyEventsForCalendar(date, calendarId, includeVagaroMirrors = false) {
   if (!calendarId || !isGoogleCalendarConfigured()) throw new Error("Calendar unavailable.");
   const from = zonedAcademyDateToUtc(date, "00:00", GOOGLE_CALENDAR_TIMEZONE);
   const untilDate = academyAddDaysISO(date, 2);
@@ -5755,8 +5755,11 @@ async function llTouchBusyEventsForCalendar(date, calendarId) {
     if(page)params.set("pageToken",page);
     const response = await googleCalendarRequest(`/calendars/${encodeURIComponent(calendarId)}/events?${params}`);
     for(const item of Array.isArray(response.items)?response.items:[]) {
-      // Vagaro-origin mirror events are already represented by Vagaro availability.
-      if(isVagaroSyncedGoogleEvent(item))continue;
+      // The Pay What You Can funnel retains its already-tested mirror handling.
+      // General LL Touch scheduling must ALSO regard Vagaro-synced Google BUSY
+      // events as conflicts. The Vagaro availability feed may include raw 5-minute
+      // candidate starts that do not reflect the current provider calendar.
+      if (!includeVagaroMirrors && isVagaroSyncedGoogleEvent(item)) continue;
       const interval = academyGoogleEventInterval(item);
       if(interval)events.push(interval);
     }
@@ -6032,10 +6035,15 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
     });
   }
 
-  // Unlike Vagaro-synced mirror events, independently created Google BUSY
-  // events (including Academy sessions and existing LL Touch bookings) block.
+  // All independently-created Google BUSY events block. For the general
+  // Success flow, include Vagaro-synced mirror events as well.
   try {
-    const busy = await llTouchBusyEventsForCalendar(date, professional.calendarId);
+    // General LL Touch: honor ALL Google BUSY events (including Vagaro mirrors).
+    // Campaign & Academy/Studio behavior remains unchanged.
+    const busy = await llTouchBusyEventsForCalendar(
+      date, professional.calendarId,
+      !llTouchIsCampaign(session) && session?.metadata?.brand !== "ll_brows"
+    );
     if (busy.some((event) => llTouchCalendarIntervalOverlaps(window, event))) {
       return res.status(409).json({
         ok: false, code: "GOOGLE_SLOT_TAKEN", error: "This time has just been reserved. Please choose another."
@@ -6508,6 +6516,32 @@ app.post("/llb/studio/confirm", checkoutLimiter, (req,res) => {
   req.llTouchBookingRoute = "studio";return llTouchHandleAppointmentConfirmation(req,res);
 });
 
+// GENERAL LL TOUCH SUCCESS ONLY: choose non-overlapping starts spaced by the
+// actual duration of the purchased procedure (including supported add-ons).
+// Starts are selected only from slots that have already passed Vagaro + Google
+// Calendar + Supabase busy-window checks. Does not apply to PWYC or LL Brows.
+function llTouchCompactGeneralStarts(slots, durationMinutes) {
+  if (!Number.isInteger(Number(durationMinutes)) || Number(durationMinutes) <= 0)
+    return [];
+  const candidates = (Array.isArray(slots) ? slots : [])
+    .map((slot) => ({ slot, window: llTouchAppointmentWindow(slot.date, slot.time, durationMinutes) }))
+    .filter((candidate) => candidate.window)
+    .sort((a, b) => a.window.start.getTime() - b.window.start.getTime());
+  const result = [];
+  let nextStartMs = -Infinity;
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const startMs = candidate.window.start.getTime();
+    const uniqueKey = `${candidate.window.date}|${candidate.window.time}`;
+    if (seen.has(uniqueKey)) continue;
+    seen.add(uniqueKey);
+    if (startMs < nextStartMs) continue;
+    result.push({ ...candidate.slot, date: candidate.window.date, time: candidate.window.time });
+    nextStartMs = candidate.window.end.getTime();
+  }
+  return result;
+}
+
 async function llTouchHandleAvailability(req, res) {
   try {
     const sessionId = cleanLeadField(req.body.session_id, 120);
@@ -6585,8 +6619,34 @@ async function llTouchHandleAvailability(req, res) {
       });
     }
 
-    const busyEvents = await llTouchBusyEventsForCalendar(date, professional.calendarId);
-    const slots = rawSlots.filter((slot) => {
+    // For the general Success flow, do NOT ignore Vagaro-created Google busy
+    // events. Always fail closed when the calendar or database cannot be read.
+    // PWYC and Studio retain their existing filtering and slot presentation.
+    const strictGeneral = !llTouchIsCampaign(session) &&
+      session?.metadata?.brand !== "ll_brows";
+    const busyEvents = await llTouchBusyEventsForCalendar(
+      date, professional.calendarId, strictGeneral
+    );
+
+    let dbBusy = [];
+    if (strictGeneral) {
+      const { data, error } = await academySupabase
+        .from("lltouch_appointments")
+        .select("starts_at,ends_at")
+        .eq("provider_id", professional.providerId)
+        .eq("appointment_date", date)
+        .in("status", ["pending", "confirmed"]);
+      if (error) throw new Error("Existing reservations could not be verified.");
+      dbBusy = (data || []).map((record) => ({
+        start: new Date(record.starts_at), end: new Date(record.ends_at)
+      }));
+      if (dbBusy.some((event) => !Number.isFinite(event.start.getTime()) ||
+          !Number.isFinite(event.end.getTime()) || event.end <= event.start))
+        throw new Error("Existing reservations contained an invalid time window.");
+    }
+
+    const verifiedSlots = rawSlots.filter((slot) => {
+      if (slot.date !== date) return false;
       const window = llTouchAppointmentWindow(
         slot.date,
         slot.time,
@@ -6596,9 +6656,17 @@ async function llTouchHandleAvailability(req, res) {
         window &&
         window.start.getTime() >= Date.now() + 10 * 60 * 1000 &&
         llTouchProposedTimeAllowed(session, window, professional) &&
-        !busyEvents.some((event) => llTouchCalendarIntervalOverlaps(window, event))
+        !busyEvents.some((event) => llTouchCalendarIntervalOverlaps(window, event)) &&
+        !dbBusy.some((event) => llTouchCalendarIntervalOverlaps(window, event))
       );
     });
+
+    // User-facing schedule: no 5-minute wall of buttons for 75-minute facials.
+    // Each next displayed start must be >= the previous one's end, while the
+    // algorithm may restart at the first genuinely free slot after an interruption.
+    const slots = strictGeneral
+      ? llTouchCompactGeneralStarts(verifiedSlots, selected.vagaroService.bookingDurationMinutes)
+      : verifiedSlots;
 
     res.json({
       status: 200,
@@ -6620,6 +6688,7 @@ async function llTouchHandleAvailability(req, res) {
         key:professional.key
       },
       slots,
+      ...(strictGeneral ? {slotIntervalMinutes:Number(selected.vagaroService.bookingDurationMinutes), calendarVerification:"Vagaro + Google BUSY events + Supabase"} : {}),
       ...(llTouchIsCampaign(session) ? {} : {rawAvailability:availability.data}),
       fallbackUrl: VAGARO_LISTING_URL,
       note:
