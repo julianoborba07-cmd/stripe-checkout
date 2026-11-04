@@ -6089,6 +6089,16 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
   }
 
   const existing = llTouchExistingBookingForOption(rows, selected, options);
+  // Regular Success / Studio: a cancelled appointment is historical, not an
+  // active booking. A new paid-order attempt is allowed ONLY after verifying
+  // its previous Google events have really been removed. PWYC recovery stays
+  // on its separate, explicitly gated workflow.
+  const cancelledAttempts = llTouchIsCampaign(session) ? [] : rows.filter(r =>
+    r.status === "cancelled" && (
+      (r.item_index !== null && r.item_index !== undefined && Number(r.item_index) === selectedIndex) ||
+      String(r.service_id || "") === String(service.serviceId || "")
+    )
+  );
   if (!existing && rows.some(r => r.service_id !== service.serviceId && ["pending","confirmed"].includes(r.status) &&
        new Date(r.starts_at) < window.end && new Date(r.ends_at) > window.start))
     return res.status(409).json({ok:false,code:"CUSTOMER_TIME_CONFLICT",error:"Your other treatment is already booked at this time. Please choose a non-overlapping slot."});
@@ -6115,6 +6125,21 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
       ok: false, code: "RECIPIENT_DETAILS_REQUIRED",
       error: "Enter the name, email and phone of the person receiving the treatment before booking."
     });
+  }
+
+  // Do not trust a manually changed SQL status alone as proof of cancellation:
+  // the original Google event may still be present and blocking Vagaro.
+  if (cancelledAttempts.length) {
+    try {
+      if (!await llTouchPWYCOldEventsAbsent(cancelledAttempts)) {
+        return res.status(409).json({ok:false,code:"OLD_EVENT_STILL_ACTIVE",
+          error:"The cancelled appointment still has an active calendar event. Contact the clinic before rebooking; do not pay again."});
+      }
+    } catch (error) {
+      console.error("Cancelled paid-order event verification failed:", String(error?.message || error));
+      return res.status(503).json({ok:false,code:"OLD_EVENT_UNVERIFIED",
+        error:"The earlier calendar cancellation could not be verified. Contact the clinic before rebooking; do not pay again."});
+    }
   }
 
   // Recheck Vagaro immediately before booking: never trust a frontend slot.
@@ -6161,7 +6186,13 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
     });
   }
 
-  const eventId = llTouchAppointmentEventId(session.id, service.serviceId, date, selectedTime, professional.providerId);
+  // Use a distinct deterministic Google event ID for each rebooking attempt.
+  // Cancelled records retain their old google_event_id UNIQUE values for audit.
+  // In particular, rebooking the same time must not reuse a Google tombstone.
+  const retrySuffix = cancelledAttempts.length ? `rebook-${cancelledAttempts.length + 1}` : "";
+  const eventId = llTouchAppointmentEventId(
+    session.id, service.serviceId, date, selectedTime, professional.providerId, retrySuffix
+  );
   // A confirmed appointment is always owned by the SERVICE RECIPIENT,
   // not necessarily by the person who paid for it.
   const customerEmail = recipient.email;
@@ -6205,6 +6236,13 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
     .single();
 
   if (insertError || !pending) {
+    if (cancelledAttempts.length && String(insertError?.code || "") === "23505") {
+      // The production DB may still have an unconditional UNIQUE constraint
+      // from the original schema. Do not pretend the displayed slot was taken.
+      console.error("Cancelled paid-order rebooking blocked by a database unique constraint:", insertError);
+      return res.status(409).json({ok:false,code:"CANCELLED_REBOOK_SCHEMA_BLOCKED",
+        error:"The cancelled reservation still blocks rebooking in the database. Contact the clinic; do not purchase again."});
+    }
     if (["23505", "23P01"].includes(String(insertError?.code || ""))) {
       return res.status(409).json({
         ok: false, code: "SLOT_RESERVED", error: "This time or treatment is already reserved. Please reload the schedule."
