@@ -4115,9 +4115,11 @@ function llSuccessCustomerContact(session) {
   const metadata = session?.metadata || {};
   const details = session?.customer_details || {};
   return {
-    name: cleanLeadField(metadata.full_name || metadata.customer_name || details.name, 120),
-    email: cleanLeadField(details.email || session?.customer_email || metadata.customer_email, 254),
-    phone: cleanLeadField(metadata.customer_phone || metadata.phone_number || metadata.phone || details.phone, 40)
+    // Appointment recipient is separate from the checkout payer. PWYC still uses
+    // its own pre-checkout name/phone; do not overwrite the payer's Stripe profile.
+    name: cleanLeadField(metadata.appointment_customer_name || metadata.full_name || metadata.customer_name || details.name, 120),
+    email: cleanLeadField(metadata.appointment_customer_email || details.email || session?.customer_email || metadata.customer_email, 254),
+    phone: cleanLeadField(metadata.appointment_customer_phone || metadata.customer_phone || metadata.phone_number || metadata.phone || details.phone, 40)
   };
 }
 
@@ -4183,7 +4185,7 @@ app.get("/checkout-session/:id", async (req, res) => {
       id: session.id,
       email: session.customer_details?.email || session.customer_email || session.metadata?.customer_email || "",
       // Paid-only personal details; existing orders and scheduling payloads remain intact.
-      ...(contact ? { customer_name: contact.name, customer_phone: contact.phone } : {}),
+      ...(contact ? { customer_name: contact.name, customer_phone: contact.phone, appointment_email: contact.email } : {}),
       payment_status: session.payment_status,
       total: session.amount_total / 100,
       subtotal: session.amount_subtotal ? session.amount_subtotal / 100 : null,
@@ -4574,9 +4576,10 @@ app.get("/llb/studio/session/:id",checkoutLimiter,async(req,res)=>{
     const booked=await llTouchReadBookings(session.id);
     const options=llbStudioSessionOptions(session);
     const contact=llSuccessCustomerContact(session);
+    const priorRecipient=booked.find(b=>b.status==="confirmed"&&b.customer_name&&b.customer_email);
     return res.json({payment_status:"paid",bookingEnabled:LLB_STUDIO_BOOKING_ENABLED,
-      customerName:contact.name,
-      customerEmail:contact.email,
+      customerName:priorRecipient?.customer_name||contact.name,
+      customerEmail:priorRecipient?.customer_email||contact.email,
       customerPhone:contact.phone,
       totalCents:Number(session.amount_total||0),currency:String(session.currency||"usd"),
       items:keys.map((key,index)=>{
@@ -5740,6 +5743,8 @@ function llTouchPublicAppointment(record) {
   return {
     serviceId: record.service_id,
     serviceTitle: record.service_title,
+    customerName: record.customer_name || null,
+    customerEmail: record.customer_email || null,
     appointmentDate: record.appointment_date,
     appointmentTime: record.appointment_time,
     durationMinutes: record.duration_minutes,
@@ -5755,7 +5760,7 @@ function llTouchPublicAppointment(record) {
 async function llTouchReadBookings(sessionId) {
   const { data, error } = await academySupabase
     .from("lltouch_appointments")
-    .select("id,stripe_session_id,service_id,service_title,item_index,provider_id,appointment_date,appointment_time,duration_minutes,starts_at,ends_at,google_event_id,status,created_at")
+    .select("id,stripe_session_id,service_id,service_title,item_index,provider_id,appointment_date,appointment_time,duration_minutes,starts_at,ends_at,google_event_id,status,created_at,customer_name,customer_email")
     .eq("stripe_session_id", sessionId)
     .order("created_at", { ascending: true });
 
@@ -5948,6 +5953,40 @@ app.get("/lltouch/bookings/:sessionId", checkoutLimiter, async (req, res) => {
   }
 });
 
+
+// The person RECEIVING the treatment is entered on the paid Success page.
+// Never assume that the cardholder, Stripe Customer or payer is the recipient.
+function llTouchValidateAppointmentRecipient(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  if (["name","email","phone"].some(key => typeof input[key] !== "string")) return null;
+  const name = cleanLeadField(input.name, 120);
+  const email = cleanLeadField(input.email, 254).toLowerCase();
+  const phone = cleanLeadField(input.phone, 40);
+  // Flattening whitespace above prevents newlines in Calendar notes.
+  if (name.length < 2 || name.length > 120 || /[<>\u0000-\u001f\u007f]/.test(name)) return null;
+  if (!isValidEmail(email) || email.length > 254 || /[<>\u0000-\u001f\u007f]/.test(email)) return null;
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length < 7 || digits.length > 15 || !/^[+\d()\s.\-]+$/.test(phone)) return null;
+  return { name, email, phone };
+}
+
+// Store recipient contact separately from Stripe's payment/customer fields.
+// This runs only AFTER a real reservation is confirmed. An unavailable Stripe
+// metadata update must never turn a successful booking into a reported failure.
+async function llTouchRememberAppointmentRecipient(session, recipient) {
+  try {
+    await stripe.checkout.sessions.update(session.id, {
+      metadata: {
+        appointment_customer_name: recipient.name,
+        appointment_customer_email: recipient.email,
+        appointment_customer_phone: recipient.phone
+      }
+    });
+  } catch (error) {
+    console.error("LL Touch appointment recipient metadata sync failed:", String(error?.message || error));
+  }
+}
+
 // Confirms the first appointment for a purchased treatment. A package does
 // not imply booking all future sessions in one transaction.
 async function llTouchHandleAppointmentConfirmation(req, res) {
@@ -6043,6 +6082,18 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
     });
   }
 
+  // For regular LL Touch and LL Brows Studio, recipient details MUST be
+  // supplied by the paid customer on Success. PWYC has its own verified flow.
+  const recipient = llTouchIsCampaign(session)
+    ? llSuccessCustomerContact(session)
+    : llTouchValidateAppointmentRecipient(req.body?.appointment_customer);
+  if (!recipient) {
+    return res.status(422).json({
+      ok: false, code: "RECIPIENT_DETAILS_REQUIRED",
+      error: "Enter the name, email and phone of the person receiving the treatment before booking."
+    });
+  }
+
   // Recheck Vagaro immediately before booking: never trust a frontend slot.
   let availability;
   try {
@@ -6088,9 +6139,11 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
   }
 
   const eventId = llTouchAppointmentEventId(session.id, service.serviceId, date, selectedTime, professional.providerId);
-  const customerEmail = cleanLeadField(session.customer_details?.email || session.customer_email || session.metadata?.customer_email, 254).toLowerCase();
-  const customerName = cleanLeadField(session.metadata?.full_name || session.customer_details?.name || "LL Touch Client", 120);
-  const customerPhone = cleanLeadField(session.metadata?.customer_phone || session.customer_details?.phone || "", 32);
+  // A confirmed appointment is always owned by the SERVICE RECIPIENT,
+  // not necessarily by the person who paid for it.
+  const customerEmail = recipient.email;
+  const customerName = recipient.name;
+  const customerPhone = recipient.phone;
   const siteItem = selected.siteItem || {};
   const itemSummary = [
     siteItem.service || siteItem.serviceKey || service.title,
@@ -6222,9 +6275,12 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
     });
   }
 
-  // Clear Academy's availability cache so this LL Touch slot disappears
-  // immediately for candidates using the shared Google Calendar.
+  // Clear Academy's availability cache immediately after confirmation.
+  // The Google event and SQL reservation already exist at this point.
   clearAcademyAvailableDatesCache();
+  // Keep the recipient separate from the Stripe payer and payment details.
+  // Metadata sync errors never change a confirmed reservation to failed.
+  if (!llTouchIsCampaign(session)) await llTouchRememberAppointmentRecipient(session, recipient);
   return res.status(201).json(llTouchBookedResponse(confirmed));
 }
 app.post("/lltouch/confirm-appointment", checkoutLimiter, llTouchHandleAppointmentConfirmation);
