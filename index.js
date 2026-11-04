@@ -4246,6 +4246,12 @@ app.post("/llb/create-checkout-session", checkoutLimiter, async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
+      // Session-only branding for LL Brows. LL Touch/PWYC remain unchanged.
+      branding_settings: {
+        display_name: "LL Brows Studio & Academy",
+        background_color: "#F7F5F1",
+        button_color: "#332D29"
+      },
       customer_email: email,
       line_items: normalizedItems.map(({ serviceKey, service, quantity }) =>
         createLLBrowsLineItem(serviceKey, service, quantity)
