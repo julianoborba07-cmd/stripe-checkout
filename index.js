@@ -4109,6 +4109,18 @@ app.get("/customer", async (req, res) => {
   }
 });
 
+// DISPLAY ONLY: reuse Stripe verified customer details for LL Touch and LL Brows
+// success screens. No booking, scheduling, webhook or checkout mutations.
+function llSuccessCustomerContact(session) {
+  const metadata = session?.metadata || {};
+  const details = session?.customer_details || {};
+  return {
+    name: cleanLeadField(metadata.full_name || metadata.customer_name || details.name, 120),
+    email: cleanLeadField(details.email || session?.customer_email || metadata.customer_email, 254),
+    phone: cleanLeadField(metadata.customer_phone || metadata.phone_number || metadata.phone || details.phone, 40)
+  };
+}
+
 app.get("/checkout-session/:id", async (req, res) => {
   try {
     const session = await getStripeSessionExpanded(req.params.id);
@@ -4166,9 +4178,12 @@ app.get("/checkout-session/:id", async (req, res) => {
       fallbackUrl: VAGARO_LISTING_URL
     }));
 
+    const contact = session.payment_status === "paid" ? llSuccessCustomerContact(session) : null;
     res.json({
       id: session.id,
-      email: session.customer_details?.email,
+      email: session.customer_details?.email || session.customer_email || session.metadata?.customer_email || "",
+      // Paid-only personal details; existing orders and scheduling payloads remain intact.
+      ...(contact ? { customer_name: contact.name, customer_phone: contact.phone } : {}),
       payment_status: session.payment_status,
       total: session.amount_total / 100,
       subtotal: session.amount_subtotal ? session.amount_subtotal / 100 : null,
@@ -4558,8 +4573,11 @@ app.get("/llb/studio/session/:id",checkoutLimiter,async(req,res)=>{
     const keys=String(session.metadata.service_keys||"").split(",").filter(Boolean);
     const booked=await llTouchReadBookings(session.id);
     const options=llbStudioSessionOptions(session);
+    const contact=llSuccessCustomerContact(session);
     return res.json({payment_status:"paid",bookingEnabled:LLB_STUDIO_BOOKING_ENABLED,
-      customerEmail:session.customer_details?.email||session.customer_email||"",
+      customerName:contact.name,
+      customerEmail:contact.email,
+      customerPhone:contact.phone,
       totalCents:Number(session.amount_total||0),currency:String(session.currency||"usd"),
       items:keys.map((key,index)=>{
         const item=options.find(o=>o.index===index);
