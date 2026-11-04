@@ -4552,12 +4552,20 @@ app.get("/llb/studio/session/:id",checkoutLimiter,async(req,res)=>{
     const keys=String(session.metadata.service_keys||"").split(",").filter(Boolean);
     const booked=await llTouchReadBookings(session.id);
     const options=llbStudioSessionOptions(session);
-    return res.json({payment_status:"paid",items:keys.map((key,index)=>{
-      const item=options.find(o=>o.index===index);
-      return {index,key,title:LLB_SERVICES[key]?.name||key,canBookOnline:LLB_STUDIO_BOOKING_ENABLED&&Boolean(item),
-        confirmed:Boolean(item&&booked.some(b=>b.service_id===item.vagaroService.serviceId&&b.status==="confirmed")),
-        providers:[{id:"ludimilla",name:"Ludimilla Leite"}]};
-    })});
+    return res.json({payment_status:"paid",bookingEnabled:LLB_STUDIO_BOOKING_ENABLED,
+      customerEmail:session.customer_details?.email||session.customer_email||"",
+      totalCents:Number(session.amount_total||0),currency:String(session.currency||"usd"),
+      items:keys.map((key,index)=>{
+        const item=options.find(o=>o.index===index);
+        const confirmation=item&&booked.find(b=>b.service_id===item.vagaroService.serviceId&&b.status==="confirmed");
+        return {index,key,title:LLB_SERVICES[key]?.name||key,
+          unitAmountCents:Number(LLB_SERVICES[key]?.unitAmount||0),
+          durationMinutes:item?.vagaroService?.bookingDurationMinutes||null,
+          canBookOnline:LLB_STUDIO_BOOKING_ENABLED&&Boolean(item),
+          confirmed:Boolean(confirmation),
+          appointment:confirmation?llTouchPublicAppointment(confirmation):null,
+          providers:[{id:"ludimilla",name:"Ludimilla Leite"}]};
+      })});
   }catch(err){console.error("Studio session:",err);return res.status(503).json({error:"Unable to retrieve Studio order."});}
 });
 
@@ -6038,11 +6046,10 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
   // All independently-created Google BUSY events block. For the general
   // Success flow, include Vagaro-synced mirror events as well.
   try {
-    // General LL Touch: honor ALL Google BUSY events (including Vagaro mirrors).
-    // Campaign & Academy/Studio behavior remains unchanged.
+    // LL Touch general and LL Brows Studio honor ALL Google BUSY events,
+    // including Vagaro mirrors, before creating the atomic SQL reservation.
     const busy = await llTouchBusyEventsForCalendar(
-      date, professional.calendarId,
-      !llTouchIsCampaign(session) && session?.metadata?.brand !== "ll_brows"
+      date, professional.calendarId, !llTouchIsCampaign(session)
     );
     if (busy.some((event) => llTouchCalendarIntervalOverlaps(window, event))) {
       return res.status(409).json({
@@ -6109,11 +6116,12 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
     });
   }
 
+  const bookingBrand = session.metadata?.brand === "ll_brows" ? "LL Brows Studio" : "LL Touch";
   const eventBody = {
     id: eventId,
-    summary: `LL Touch | ${service.title} | ${customerName} | ${professional.name} | PAID`,
+    summary: `${bookingBrand} | ${service.title} | ${customerName} | ${professional.name} | PAID`,
     description: [
-      "LL Touch paid appointment — Google Calendar -> Vagaro BUSY Personal Task",
+      `${bookingBrand} paid appointment — Google Calendar -> Vagaro BUSY Personal Task`,
       `Customer: ${customerName}`,
       `Email: ${customerEmail}`,
       ...(customerPhone ? [`Phone: ${customerPhone}`] : []),
@@ -6619,17 +6627,18 @@ async function llTouchHandleAvailability(req, res) {
       });
     }
 
-    // For the general Success flow, do NOT ignore Vagaro-created Google busy
-    // events. Always fail closed when the calendar or database cannot be read.
-    // PWYC and Studio retain their existing filtering and slot presentation.
+    // LL Touch general Success and LL Brows Studio both reject Google BUSY
+    // mirrors and overlapping SQL holds; PWYC keeps its separately-tested flow.
     const strictGeneral = !llTouchIsCampaign(session) &&
       session?.metadata?.brand !== "ll_brows";
+    const strictStudio = session?.metadata?.brand === "ll_brows";
+    const strictPaidBooking = strictGeneral || strictStudio;
     const busyEvents = await llTouchBusyEventsForCalendar(
-      date, professional.calendarId, strictGeneral
+      date, professional.calendarId, strictPaidBooking
     );
 
     let dbBusy = [];
-    if (strictGeneral) {
+    if (strictPaidBooking) {
       const { data, error } = await academySupabase
         .from("lltouch_appointments")
         .select("starts_at,ends_at")
@@ -6664,7 +6673,7 @@ async function llTouchHandleAvailability(req, res) {
     // User-facing schedule: no 5-minute wall of buttons for 75-minute facials.
     // Each next displayed start must be >= the previous one's end, while the
     // algorithm may restart at the first genuinely free slot after an interruption.
-    const slots = strictGeneral
+    const slots = strictPaidBooking
       ? llTouchCompactGeneralStarts(verifiedSlots, selected.vagaroService.bookingDurationMinutes)
       : verifiedSlots;
 
@@ -6688,7 +6697,7 @@ async function llTouchHandleAvailability(req, res) {
         key:professional.key
       },
       slots,
-      ...(strictGeneral ? {slotIntervalMinutes:Number(selected.vagaroService.bookingDurationMinutes), calendarVerification:"Vagaro + Google BUSY events + Supabase"} : {}),
+      ...(strictPaidBooking ? {slotIntervalMinutes:Number(selected.vagaroService.bookingDurationMinutes), calendarVerification:"Vagaro + Google BUSY events + Supabase"} : {}),
       ...(llTouchIsCampaign(session) ? {} : {rawAvailability:availability.data}),
       fallbackUrl: VAGARO_LISTING_URL,
       note:
@@ -6813,6 +6822,76 @@ app.post('/lltouch/general-available-dates', checkoutLimiter, async (req, res) =
   } catch (error) {
     console.error('LL Touch general-date search error:', String(error?.message || error));
     return res.status(503).json({ok:false,error:'Could not verify available dates. Please retry.'});
+  }
+});
+
+// LL BROWS STUDIO ONLY: paid-order search across 28 days, Ludimilla exclusively.
+// Reuses the same strict Vagaro + full Google BUSY + Supabase verification as
+// general LL Touch Success, but NEVER changes the existing general/PWYC routes.
+app.post("/llb/studio/available-dates", checkoutLimiter, async (req, res) => {
+  try {
+    if (!LLB_STUDIO_BOOKING_ENABLED)
+      return res.status(503).json({ok:false,code:"STUDIO_NOT_ENABLED",error:"Studio booking is not enabled yet."});
+    if (!llTouchAppointmentsReadiness())
+      return res.status(503).json({ok:false,code:"BOOKING_UNAVAILABLE",error:"Booking calendars are not ready."});
+    const sessionId = cleanLeadField(req.body?.session_id, 120);
+    const itemIndex = Number(req.body?.item_index);
+    const today = llTouchGeneralTodayISO();
+    const horizonEnd = academyAddDaysISO(today, 27);
+    const startDate = req.body?.start_date ? formatDateOnly(req.body.start_date) : today;
+    const limit = Math.min(5, Math.max(1, Number(req.body?.limit) || 5));
+    const maxChecks = Math.min(4, Math.max(1, Number(req.body?.max_checks) || 2));
+    if (!sessionId || !Number.isInteger(itemIndex) || itemIndex < 0 ||
+        !startDate || startDate < today || startDate > horizonEnd)
+      return res.status(400).json({ok:false,error:"Invalid paid session, item or search date."});
+    const session = await getStripeSessionExpanded(sessionId);
+    if (session.metadata?.brand !== "ll_brows" || !llTouchPaidSession(session))
+      return res.status(403).json({ok:false,error:"A paid LL Brows Studio order is required."});
+    const selected = llbStudioSessionOptions(session).find(o=>o.index===itemIndex);
+    if (!selected || llTouchBookingNeedsManualScheduling(selected.vagaroService))
+      return res.status(422).json({ok:false,error:"This purchased treatment requires assistance."});
+    const professional = llTouchGetProfessional(session, selected, "ludimilla");
+    if (!professional || professional.key !== "ludimilla")
+      return res.status(503).json({ok:false,error:"Ludimilla's calendar is unavailable."});
+    const existing = await llTouchReadBookings(session.id);
+    if (existing.some(b=>b.service_id===selected.vagaroService.serviceId && b.status==="confirmed"))
+      return res.json({ok:true,dates:[],next_date:null,horizon_end:horizonEnd,alreadyConfirmed:true});
+    if (existing.some(b=>b.service_id===selected.vagaroService.serviceId && b.status!=="cancelled"))
+      return res.status(409).json({ok:false,code:"BOOKING_REVIEW_REQUIRED",error:"This purchased service has a previous booking attempt. Contact the clinic."});
+    const dates = [], seen = new Set();
+    let cursor = startDate, checks = 0;
+    // Vagaro may suggest the next available date instead of the requested date.
+    // Never display that suggestion before calendar + database verification.
+    while (cursor <= horizonEnd && dates.length < limit && checks < maxChecks) {
+      const response = await searchVagaroAvailability({
+        date:cursor,serviceId:selected.vagaroService.serviceId,
+        addOnIds:selected.vagaroService.addOnIds||[],serviceProviderId:professional.providerId
+      });
+      checks++;
+      const proposed = (response.data||[]).map(day=>({
+        date:String(day.appointmentDate||"").slice(0,10),timeSlot:day.timeSlot||[]
+      })).filter(day=>/^\d{4}-\d{2}-\d{2}$/.test(day.date)&&day.date>=cursor)
+        .sort((a,b)=>a.date.localeCompare(b.date));
+      if (!proposed.length) {cursor=academyAddDaysISO(cursor,1);continue;}
+      let furthest=cursor;
+      for (const day of proposed) {
+        if (day.date>horizonEnd) {cursor=academyAddDaysISO(horizonEnd,1);break;}
+        if (seen.has(day.date))continue;
+        seen.add(day.date);
+        if (day.date>furthest)furthest=day.date;
+        if (!day.timeSlot.length)continue;
+        const slots=await llTouchGeneralVerifiedDay({session,selected,professional,date:day.date,vagaroDay:day});
+        if (slots.length)dates.push({date:day.date,slots});
+        if (dates.length>=limit)break;
+      }
+      if (cursor<=horizonEnd)cursor=academyAddDaysISO(furthest,1);
+    }
+    return res.json({ok:true,professional:"Ludimilla Leite",dates,
+      next_date:cursor<=horizonEnd?cursor:null,horizon_end:horizonEnd,
+      checks,max_dates:limit,verification:"Vagaro + Google BUSY + Supabase; rechecked at confirmation"});
+  } catch (error) {
+    console.error("LL Brows Studio available-dates error:",String(error?.message||error));
+    return res.status(503).json({ok:false,error:"Could not verify Studio dates. Please try again."});
   }
 });
 
