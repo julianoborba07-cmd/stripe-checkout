@@ -6704,6 +6704,118 @@ async function llTouchHandleAvailability(req, res) {
     });
   }
 }
+
+// Success geral LL Touch ONLY: verified multi-day look-ahead.
+// Leaves PWYC/Studio/Academy availability routes unchanged. Payment is checked
+// before every search; final appointment confirmation still rechecks availability.
+const LLTOUCH_GENERAL_DATE_CACHE = new Map();
+const LLTOUCH_GENERAL_DATE_CACHE_TTL_MS = 25000;
+function llTouchGeneralTodayISO() {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: LLTOUCH_SERVICE_CALENDAR_TIMEZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date()).filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+async function llTouchGeneralVerifiedDay({ session, selected, professional, date, vagaroDay }) {
+  const cacheKey = [session.id, selected.index, professional.key, date].join('|');
+  const cached = LLTOUCH_GENERAL_DATE_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.at < LLTOUCH_GENERAL_DATE_CACHE_TTL_MS) return cached.slots;
+  if (!isGoogleCalendarConfigured()) throw new Error('Google Calendar verification is unavailable.');
+  const [busyEvents, reservations] = await Promise.all([
+    llTouchBusyEventsForCalendar(date, professional.calendarId, true),
+    academySupabase.from('lltouch_appointments').select('starts_at,ends_at')
+      .eq('provider_id', professional.providerId).eq('appointment_date', date)
+      .in('status', ['pending', 'confirmed'])
+  ]);
+  if (reservations.error) throw new Error('Existing bookings could not be verified.');
+  const dbBusy = (reservations.data || []).map(record => ({
+    start: new Date(record.starts_at), end: new Date(record.ends_at)
+  }));
+  if (dbBusy.some(e => !Number.isFinite(e.start.getTime()) || !Number.isFinite(e.end.getTime()) || e.end <= e.start))
+    throw new Error('An existing reservation has an invalid time window.');
+  const proposed = (Array.isArray(vagaroDay.timeSlot) ? vagaroDay.timeSlot : []).map(time => ({
+    date, time, professional: professional.name, serviceProviderId: professional.providerId,
+    serviceId: selected.vagaroService.serviceId,
+    serviceTitle: selected.vagaroService.title
+  }));
+  const valid = proposed.filter(slot => {
+    const window = llTouchAppointmentWindow(date, slot.time, selected.vagaroService.bookingDurationMinutes);
+    return Boolean(window && window.start.getTime() >= Date.now() + 10 * 60 * 1000 &&
+      llTouchProposedTimeAllowed(session, window, professional) &&
+      !busyEvents.some(event => llTouchCalendarIntervalOverlaps(window, event)) &&
+      !dbBusy.some(event => llTouchCalendarIntervalOverlaps(window, event)));
+  });
+  const slots = llTouchCompactGeneralStarts(valid, selected.vagaroService.bookingDurationMinutes);
+  LLTOUCH_GENERAL_DATE_CACHE.set(cacheKey, { slots, at: Date.now() });
+  if (LLTOUCH_GENERAL_DATE_CACHE.size > 150) {
+    const oldest = LLTOUCH_GENERAL_DATE_CACHE.keys().next().value;
+    LLTOUCH_GENERAL_DATE_CACHE.delete(oldest);
+  }
+  return slots;
+}
+app.post('/lltouch/general-available-dates', checkoutLimiter, async (req, res) => {
+  try {
+    const sessionId = cleanLeadField(req.body?.session_id, 120);
+    const itemIndex = Number(req.body?.item_index);
+    const professionalKey = cleanLeadField(req.body?.professional_key, 40);
+    const today = llTouchGeneralTodayISO();
+    const endDate = academyAddDaysISO(today, 27);
+    const startDate = req.body?.start_date ? formatDateOnly(req.body.start_date) : today;
+    const limit = Math.min(5, Math.max(1, Number(req.body?.limit) || 5));
+    const maxChecks = Math.min(4, Math.max(1, Number(req.body?.max_checks) || 2));
+    if (!sessionId || !Number.isInteger(itemIndex) || !startDate || startDate < today || startDate > endDate)
+      return res.status(400).json({ error: 'Invalid session, purchased item or search date.' });
+    const session = await getStripeSessionExpanded(sessionId);
+    if (!llTouchPaidSession(session)) return res.status(403).json({ error: 'Payment is not confirmed.' });
+    if (llTouchIsCampaign(session) || session.metadata?.brand === 'll_brows')
+      return res.status(403).json({ error: 'Use the booking flow for this brand or campaign.' });
+    const selected = buildBookingOptionsFromSession(session)[itemIndex];
+    if (!selected || llTouchBookingNeedsManualScheduling(selected.vagaroService))
+      return res.status(422).json({ error: 'This purchased service requires assistance.' });
+    const professional = llTouchGetProfessional(session, selected, professionalKey);
+    if (!professional) return res.status(422).json({ error: 'Professional not allowed for this service.' });
+
+    const dates = [];
+    let cursor = startDate, checks = 0;
+    const visited = new Set();
+    // Vagaro frequently responds with the NEXT open date rather than the
+    // requested date. Jump directly to that hint; never treat it as an opening
+    // until Google + Supabase + duration checks have succeeded for that date.
+    while (cursor <= endDate && dates.length < limit && checks < maxChecks) {
+      const availability = await searchVagaroAvailability({
+        date: cursor, serviceId: selected.vagaroService.serviceId,
+        addOnIds: selected.vagaroService.addOnIds || [],
+        serviceProviderId: professional.providerId
+      });
+      checks++;
+      const candidateDays = (availability.data || []).map(day => ({
+        date: String(day.appointmentDate || '').slice(0, 10), timeSlot: day.timeSlot || []
+      })).filter(day => /^\d{4}-\d{2}-\d{2}$/.test(day.date) && day.date >= cursor)
+        .sort((a, b) => a.date.localeCompare(b.date));
+      if (!candidateDays.length) { cursor = academyAddDaysISO(cursor, 1); continue; }
+      let furthest = cursor;
+      for (const day of candidateDays) {
+        if (day.date > endDate) { cursor = academyAddDaysISO(endDate, 1); break; }
+        if (visited.has(day.date)) continue;
+        visited.add(day.date);
+        if (day.date > furthest) furthest = day.date;
+        if (!day.timeSlot.length) continue;
+        const slots = await llTouchGeneralVerifiedDay({ session, selected, professional, date: day.date, vagaroDay: day });
+        if (slots.length) dates.push({ date: day.date, slots });
+        if (dates.length >= limit) break;
+      }
+      if (cursor <= endDate) cursor = academyAddDaysISO(furthest, 1);
+    }
+    return res.json({ok:true, dates, next_date: cursor <= endDate ? cursor : null,
+      horizon_end: endDate, checks, max_dates: limit,
+      verification:'Vagaro + Google BUSY + Supabase; rechecked at confirmation'});
+  } catch (error) {
+    console.error('LL Touch general-date search error:', String(error?.message || error));
+    return res.status(503).json({ok:false,error:'Could not verify available dates. Please retry.'});
+  }
+});
+
 app.post("/vagaro/availability", checkoutLimiter, llTouchHandleAvailability);
 app.post("/lltouch/campaign/nov09/availability", checkoutLimiter, (req,res)=>{
   req.llTouchBookingRoute="campaign";req.body.professional_key=req.body.professional_key||req.body.provider_id;return llTouchHandleAvailability(req,res);
