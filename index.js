@@ -4584,11 +4584,14 @@ app.get("/llb/studio/session/:id",checkoutLimiter,async(req,res)=>{
       totalCents:Number(session.amount_total||0),currency:String(session.currency||"usd"),
       items:keys.map((key,index)=>{
         const item=options.find(o=>o.index===index);
-        const confirmation=item&&booked.find(b=>b.service_id===item.vagaroService.serviceId&&b.status==="confirmed");
+        const existing=item ? llTouchExistingBookingForOption(booked,item,options) :
+          (keys.length===1 ? booked.find(b=>b.status!=="cancelled") : null);
+        const confirmation=existing?.status==="confirmed" ? existing : null;
         return {index,key,title:LLB_SERVICES[key]?.name||key,
           unitAmountCents:Number(LLB_SERVICES[key]?.unitAmount||0),
           durationMinutes:item?.vagaroService?.bookingDurationMinutes||null,
-          canBookOnline:LLB_STUDIO_BOOKING_ENABLED&&Boolean(item),
+          canBookOnline:LLB_STUDIO_BOOKING_ENABLED&&Boolean(item)&&!existing,
+          bookingNeedsReview:Boolean(existing && existing.status!=="confirmed"),
           confirmed:Boolean(confirmation),
           appointment:confirmation?llTouchPublicAppointment(confirmation):null,
           providers:[{id:"ludimilla",name:"Ludimilla Leite"}]};
@@ -5742,6 +5745,7 @@ function llTouchAppointmentsReadiness() {
 function llTouchPublicAppointment(record) {
   return {
     serviceId: record.service_id,
+    itemIndex: record.item_index !== null && record.item_index !== undefined && Number.isInteger(Number(record.item_index)) ? Number(record.item_index) : null,
     serviceTitle: record.service_title,
     customerName: record.customer_name || null,
     customerEmail: record.customer_email || null,
@@ -5766,6 +5770,25 @@ async function llTouchReadBookings(sessionId) {
 
   if (error) throw new Error(error.message || "Could not read LL Touch appointments.");
   return data || [];
+}
+
+
+// Treat the purchased item, not a mutable Vagaro service mapping, as the
+// durable identity of its first appointment. Especially important for Studio
+// purchases where a service ID might be corrected after a successful booking.
+// Fail closed for any non-cancelled row linked to a single-item paid order.
+function llTouchExistingBookingForOption(rows, option, orderOptions) {
+  if (!option || !Array.isArray(rows)) return null;
+  const active = rows.filter(row => row && row.status !== "cancelled");
+  const itemIndex = Number(option.index);
+  const serviceId = String(option.vagaroService?.serviceId || "");
+  const candidates = active.filter(row =>
+    (Number.isInteger(itemIndex) && row.item_index !== null &&
+      row.item_index !== undefined && Number(row.item_index) === itemIndex) ||
+    (serviceId && String(row.service_id) === serviceId));
+  if (Array.isArray(orderOptions) && orderOptions.length === 1 && !candidates.length)
+    candidates.push(...active);
+  return candidates.find(row => row.status === "confirmed") || candidates[0] || null;
 }
 
 function llTouchBookedResponse(record, alreadyConfirmed = false) {
@@ -6065,7 +6088,7 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
     });
   }
 
-  const existing = rows.find((row) => row.service_id === service.serviceId);
+  const existing = llTouchExistingBookingForOption(rows, selected, options);
   if (!existing && rows.some(r => r.service_id !== service.serviceId && ["pending","confirmed"].includes(r.status) &&
        new Date(r.starts_at) < window.end && new Date(r.ends_at) > window.start))
     return res.status(409).json({ok:false,code:"CUSTOMER_TIME_CONFLICT",error:"Your other treatment is already booked at this time. Please choose a non-overlapping slot."});
@@ -6859,9 +6882,18 @@ app.post('/lltouch/general-available-dates', checkoutLimiter, async (req, res) =
     if (!llTouchPaidSession(session)) return res.status(403).json({ error: 'Payment is not confirmed.' });
     if (llTouchIsCampaign(session) || session.metadata?.brand === 'll_brows')
       return res.status(403).json({ error: 'Use the booking flow for this brand or campaign.' });
-    const selected = buildBookingOptionsFromSession(session)[itemIndex];
+    const orderOptions = buildBookingOptionsFromSession(session);
+    const selected = orderOptions[itemIndex];
     if (!selected || llTouchBookingNeedsManualScheduling(selected.vagaroService))
       return res.status(422).json({ error: 'This purchased service requires assistance.' });
+    // Never publish new openings for an item that already has a first booking.
+    const existing = llTouchExistingBookingForOption(await llTouchReadBookings(session.id), selected, orderOptions);
+    if (existing?.status === "confirmed")
+      return res.json({ok:true,dates:[],next_date:null,horizon_end:endDate,
+        alreadyConfirmed:true,appointment:llTouchPublicAppointment(existing)});
+    if (existing)
+      return res.status(409).json({ok:false,code:"BOOKING_REVIEW_REQUIRED",
+        error:"This purchase already has an appointment attempt. Contact the clinic before retrying."});
     const professional = llTouchGetProfessional(session, selected, professionalKey);
     if (!professional) return res.status(422).json({ error: 'Professional not allowed for this service.' });
 
@@ -6933,11 +6965,13 @@ app.post("/llb/studio/available-dates", checkoutLimiter, async (req, res) => {
     const professional = llTouchGetProfessional(session, selected, "ludimilla");
     if (!professional || professional.key !== "ludimilla")
       return res.status(503).json({ok:false,error:"Ludimilla's calendar is unavailable."});
-    const existing = await llTouchReadBookings(session.id);
-    if (existing.some(b=>b.service_id===selected.vagaroService.serviceId && b.status==="confirmed"))
-      return res.json({ok:true,dates:[],next_date:null,horizon_end:horizonEnd,alreadyConfirmed:true});
-    if (existing.some(b=>b.service_id===selected.vagaroService.serviceId && b.status!=="cancelled"))
-      return res.status(409).json({ok:false,code:"BOOKING_REVIEW_REQUIRED",error:"This purchased service has a previous booking attempt. Contact the clinic."});
+    const previous = llTouchExistingBookingForOption(await llTouchReadBookings(session.id),
+      selected,llbStudioSessionOptions(session));
+    if (previous?.status==="confirmed")
+      return res.json({ok:true,dates:[],next_date:null,horizon_end:horizonEnd,
+        alreadyConfirmed:true,appointment:llTouchPublicAppointment(previous)});
+    if (previous)
+      return res.status(409).json({ok:false,code:"BOOKING_REVIEW_REQUIRED",error:"This purchased service has a previous booking attempt. Contact the studio."});
     const dates = [], seen = new Set();
     let cursor = startDate, checks = 0;
     // Vagaro may suggest the next available date instead of the requested date.
