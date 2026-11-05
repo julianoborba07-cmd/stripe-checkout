@@ -970,7 +970,13 @@ async function vagaroRequest(path, options = {}) {
       data?.message ||
       "Vagaro API request failed";
 
-    throw new Error(message);
+    // Preserve Vagaro's field-level date rejection without changing the
+    // existing error contract for unrelated bookings or PWYC requests.
+    const requestError = new Error(message);
+    requestError.vagaroPastDate =
+      typeof data?.errors?.bookingItems === "string" &&
+      /Appointment Date can not be Past Date/i.test(data.errors.bookingItems);
+    throw requestError;
   }
 
   return data;
@@ -6942,11 +6948,23 @@ app.post('/lltouch/general-available-dates', checkoutLimiter, async (req, res) =
     // requested date. Jump directly to that hint; never treat it as an opening
     // until Google + Supabase + duration checks have succeeded for that date.
     while (cursor <= endDate && dates.length < limit && checks < maxChecks) {
-      const availability = await searchVagaroAvailability({
-        date: cursor, serviceId: selected.vagaroService.serviceId,
-        addOnIds: selected.vagaroService.addOnIds || [],
-        serviceProviderId: professional.providerId
-      });
+      let availability;
+      try {
+        availability = await searchVagaroAvailability({
+          date: cursor, serviceId: selected.vagaroService.serviceId,
+          addOnIds: selected.vagaroService.addOnIds || [],
+          serviceProviderId: professional.providerId
+        });
+      } catch (error) {
+        // Vagaro can reject TODAY after bookable hours have passed. Advance
+        // once to tomorrow; never ignore other errors or publish unverified slots.
+        if (cursor === today && error?.vagaroPastDate === true) {
+          console.warn('LL Touch: Vagaro rejected today as past; retrying tomorrow.', {date: cursor});
+          cursor = academyAddDaysISO(today, 1);
+          continue;
+        }
+        throw error;
+      }
       checks++;
       const candidateDays = (availability.data || []).map(day => ({
         date: String(day.appointmentDate || '').slice(0, 10), timeSlot: day.timeSlot || []
@@ -7015,10 +7033,21 @@ app.post("/llb/studio/available-dates", checkoutLimiter, async (req, res) => {
     // Vagaro may suggest the next available date instead of the requested date.
     // Never display that suggestion before calendar + database verification.
     while (cursor <= horizonEnd && dates.length < limit && checks < maxChecks) {
-      const response = await searchVagaroAvailability({
-        date:cursor,serviceId:selected.vagaroService.serviceId,
-        addOnIds:selected.vagaroService.addOnIds||[],serviceProviderId:professional.providerId
-      });
+      let response;
+      try {
+        response = await searchVagaroAvailability({
+          date:cursor,serviceId:selected.vagaroService.serviceId,
+          addOnIds:selected.vagaroService.addOnIds||[],serviceProviderId:professional.providerId
+        });
+      } catch (error) {
+        // Only skip same-day if Vagaro explicitly rejects that date as past.
+        if (cursor === today && error?.vagaroPastDate === true) {
+          console.warn('LL Brows Studio: Vagaro rejected today as past; retrying tomorrow.', {date: cursor});
+          cursor = academyAddDaysISO(today, 1);
+          continue;
+        }
+        throw error;
+      }
       checks++;
       const proposed = (response.data||[]).map(day=>({
         date:String(day.appointmentDate||"").slice(0,10),timeSlot:day.timeSlot||[]
