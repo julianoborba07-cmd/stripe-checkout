@@ -171,6 +171,35 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    // Reusable LL Touch /offer funnel, isolated from PWYC and legacy HydraFacial orders.
+    if (event.data.object?.metadata?.offer_flow === 'lltouch-offer-v2') {
+      try {
+        await llOfferHandleStripeEvent(event);
+        return res.json({ received: true });
+      } catch (error) {
+        console.error('LL Touch offer webhook reconciliation failed:',String(error?.message||error));
+        return res.status(503).json({ received:false }); // Stripe safely retries
+      }
+    }
+    // HydraFacial Early Black Friday - isolated quota ledger; does not affect PWYC.
+    if (event.data.object?.metadata?.campaign === 'hydrafacial-early-bf-2026') {
+      const paid = (event.type === 'checkout.session.completed' && event.data.object.payment_status === 'paid') ||
+        event.type === 'checkout.session.async_payment_succeeded';
+      const expired = event.type === 'checkout.session.expired';
+      if (!paid && !expired) return res.json({received:true});
+      try {
+        const claimId = cleanLeadField(event.data.object.metadata.hydra_claim_id, 40);
+        if (!/^[a-f0-9-]{36}$/i.test(claimId)) throw new Error('Missing campaign claim ID');
+        const {data, error} = await academySupabase.from('lltouch_hydra_promotional_claims')
+          .update(paid ? {state:'paid',paid_at:new Date().toISOString(),updated_at:new Date().toISOString()}
+                       : {state:'released',updated_at:new Date().toISOString()})
+          .eq('id',claimId).eq('stripe_session_id',event.data.object.id)
+          .in('state', paid ? ['pending','paid'] : ['pending']).select('id');
+        if (error || (paid && !data?.length)) throw new Error(error?.message || 'Campaign claim not reconciled');
+      } catch (e) { console.error('HydraFacial promo ledger webhook error:',String(e?.message||e));
+        return res.status(503).json({received:false}); }
+      return res.json({received:true});
+    }
     if (event.type === 'checkout.session.expired' &&
       event.data.object?.metadata?.campaign==='pwyc-2026-11-09' &&
       event.data.object?.metadata?.pwyc_hold_key) {
@@ -1446,6 +1475,7 @@ function llTouchAllowedProfessionals(session, option) {
   if (session?.metadata?.brand === "ll_brows") return ["ludimilla"];
   if (llTouchIsCampaign(session)) return option?.siteItem?.type === "laser"
     ? ["jenn"] : ["ludimilla", "carol"];
+  if (session?.metadata?.offer_flow === "lltouch-offer-v2" && session?.metadata?.brand === "lltouch") return ["ludimilla", "carol"];
   return LLTOUCH_MULTI_PROVIDER_ENABLED ? ["ludimilla", "carol"] : ["ludimilla"];
 }
 function llTouchGetProfessional(session, option, requestedKey) {
@@ -4211,6 +4241,468 @@ app.get("/checkout-session/:id", async (req, res) => {
 // ROUTES - CHECKOUT
 // ==============================
 
+// ==============================
+// EARLY BLACK FRIDAY HYDRAFACIAL: 5 deposit claims, distinct from PWYC.
+// Existing /success uses llTouch item metadata to book Hydra Facial after payment.
+// Deposit $25; promotional session $99; $74 payable at clinic.
+// Keep disabled by default until Supabase migration + controlled smoke tests.
+// ==============================
+const LLTOUCH_HYDRA_CAMPAIGN_ENABLED = process.env.LLTOUCH_HYDRA_CAMPAIGN_ENABLED === 'true';
+const LLTOUCH_HYDRA_CAMPAIGN_END = Date.parse('2026-11-10T00:00:00-05:00');
+const LLTOUCH_HYDRA_CAMPAIGN_START = Date.parse('2026-11-05T00:00:00-05:00');
+app.post('/lltouch/hydrafacial/checkout', checkoutLimiter, async (req,res) => {
+  return res.status(410).json({error:'This campaign now uses /offer and /offer-reserve. Please reopen the offer page.'});
+
+  if(!LLTOUCH_HYDRA_CAMPAIGN_ENABLED) return res.status(503).json({error:'This promotion is not available yet.'});
+  if(Date.now()<LLTOUCH_HYDRA_CAMPAIGN_START || Date.now()>=LLTOUCH_HYDRA_CAMPAIGN_END)
+    return res.status(410).json({error:'The promotional window has ended.'});
+  const name=cleanLeadField(req.body?.name,120), email=cleanLeadField(req.body?.email,254).toLowerCase();
+  const phone=cleanLeadField(req.body?.phone,40);
+  if(name.length<3 || !isValidEmail(email) || phone.replace(/\D/g,'').length<10 || req.body?.accepted_terms!==true)
+    return res.status(400).json({error:'Please complete your name, valid email, phone and terms.'});
+  let claimId=null;
+  try {
+    const reserved=await academySupabase.rpc('lltouch_hydra_reserve_promo_slot',{
+      p_name:name,p_email:email,p_phone:phone
+    });
+    if(reserved.error) throw reserved.error;
+    claimId=reserved.data;
+    if(!claimId) return res.status(409).json({error:'All five promotional reservations have been claimed.'});
+    const siteItem={type:'med-spa',service:'hydrafacial',package:'single',addon:'none',quantity:1};
+    const now=Math.floor(Date.now()/1000);
+    const session=await stripe.checkout.sessions.create({
+      mode:'payment',payment_method_types:['card'],expires_at:now+1800,
+      customer_email:email,
+      line_items:[{quantity:1,price_data:{currency:'usd',unit_amount:2500,
+        product_data:{name:'HydraFacial — Early Black Friday reservation deposit',
+          description:'$25 deposit toward one $99 HydraFacial session; $74 due at your visit.',
+          metadata:{source:'lltouch-site',mode:'med-spa',service:'hydrafacial',package:'single',addon:'none'}}}}],
+      metadata:{brand:'lltouch',campaign:'hydrafacial-early-bf-2026',hydra_claim_id:String(claimId),
+        appointment_customer_name:name,appointment_customer_email:email,appointment_customer_phone:phone,
+        customer_email:email,primary_site_item:JSON.stringify(siteItem),lltouch_item_0:JSON.stringify(siteItem),
+        offer_price_usd:'99',deposit_usd:'25',balance_due_usd:'74'},
+      payment_intent_data:{metadata:{brand:'lltouch',campaign:'hydrafacial-early-bf-2026',hydra_claim_id:String(claimId)}},
+      success_url:'https://lltouch.com/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url:'https://lltouch.com/hydrafacial-early-black-friday-reserve'
+    },{idempotencyKey:'hydra-bf-2026-'+claimId});
+    const attached=await academySupabase.from('lltouch_hydra_promotional_claims')
+      .update({stripe_session_id:session.id,updated_at:new Date().toISOString()})
+      .eq('id',claimId).eq('state','pending').select('id');
+    if(attached.error || !attached.data?.length){
+      try{await stripe.checkout.sessions.expire(session.id)}catch{}
+      throw new Error(attached.error?.message||'Claim not bound to Stripe');
+    }
+    return res.json({url:session.url});
+  } catch(e) {
+    console.error('HydraFacial campaign checkout failed:',String(e?.message||e));
+    if(claimId) { try {await academySupabase.from('lltouch_hydra_promotional_claims')
+      .update({state:'released',updated_at:new Date().toISOString()}).eq('id',claimId).eq('state','pending')}catch{} }
+    return res.status(503).json({error:'Checkout is temporarily unavailable. Please try again.'});
+  }
+});
+
+// ===========================================================================
+// LL TOUCH /OFFER v3: reusable campaign, 15-minute verified checkout-start window,
+// prepayment Carol/Ludimilla availability, $25 deposit, paid-only auto-booking.
+// This block does NOT modify PWYC/Studio/Academy behavior.
+// IMPORTANT: configure only after Supabase migration, test and staff approval.
+// Future offers: update this ONE configuration block and corresponding page copy.
+// ===========================================================================
+const LLTOUCH_OFFER = Object.freeze({
+  enabled: process.env.LLTOUCH_OFFER_ENABLED === 'true',
+  campaignKey: 'hydrafacial-early-bf-2026-v2',
+  title: 'HydraFacial',
+  offerLabel: 'Early Black Friday · November 5–9',
+  regularPriceCents: 34900,
+  marketing: {
+    headline: 'Glow more.', headlineEm: 'Spend less.',
+    description: 'A thoughtfully curated HydraFacial experience at LL Touch, Abington. Refresh your skincare ritual with an exclusive introductory price.',
+    featureIntro: 'HydraFacial combines cleansing, exfoliation, extraction and hydration in a customizable facial experience. Your provider will review suitability.',
+    features: [
+      {title:'Cleanse',description:'Comfortable cleansing and exfoliation, tailored to your skin.'},
+      {title:'Refine',description:'Careful extraction and attention to skin texture.'},
+      {title:'Hydrate',description:'Serum infusion designed to support a refreshed, hydrated appearance.'}
+    ],
+    heroImageUrl:'https://images.unsplash.com/photo-1570172619644-dfd03ed5d881?auto=format&fit=crop&w=1500&q=85'
+  },
+  siteItem: {type:'med-spa',service:'hydrafacial',package:'single',addon:'none',quantity:1},
+  priceCents: 9900,
+  depositCents: 2500,
+  capacity: null,
+  offerStartsAt: Date.parse('2026-11-05T00:00:00-05:00'),
+  offerEndsAt: Date.parse('2026-11-10T00:00:00-05:00'),
+  holdMinutes: 15,
+  timezone: 'America/New_York',
+  origin: 'https://lltouch.com',
+  providerKeys: ['ludimilla','carol']
+});
+const LL_OFFER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const llOfferMoney = cents => `$${(cents/100).toFixed(2)}`;
+function llOfferService() {
+  const service = resolveVagaroServiceFromSiteItem(LLTOUCH_OFFER.siteItem);
+  if(!service || llTouchBookingNeedsManualScheduling(service)) throw new Error('Offer service is not mapped to a bookable Vagaro service.');
+  return service;
+}
+function llOfferOpen() {
+  return LLTOUCH_OFFER.enabled && Date.now() >= LLTOUCH_OFFER.offerStartsAt && Date.now() < LLTOUCH_OFFER.offerEndsAt;
+}
+function llOfferCheckReady(res) {
+  if(!llOfferOpen()) {
+    res.status(503).json({ok:false,code:'OFFER_CLOSED',error:'This promotional offer is not accepting new reservations.'});
+    return false;
+  }
+  if(!llTouchAppointmentsReadiness()) {
+    res.status(503).json({ok:false,code:'BOOKING_NOT_READY',error:'Live booking calendars are unavailable. Please contact LL Touch.'});
+    return false;
+  }
+  return true;
+}
+async function llOfferGet(id, currentCampaignOnly=true) {
+  if(!LL_OFFER_UUID.test(String(id||''))) return null;
+  let query=academySupabase.from('lltouch_offer_claims').select('*').eq('id',id);
+  if(currentCampaignOnly)query=query.eq('campaign_key',LLTOUCH_OFFER.campaignKey);
+  const {data,error}=await query.maybeSingle();
+  if(error) throw error;
+  return data;
+}
+function llOfferPublic(claim) {
+  const active=Boolean(claim && (claim.state==='held' && new Date(claim.hold_expires_at).getTime()>Date.now() ||
+    ['checkout','paid','processing','confirmed','review'].includes(claim.state)));
+  return {ok:true,active,state:claim?.state||'missing',deadline:claim?.hold_expires_at||null,
+    person:claim?{name:claim.customer_name,email:claim.customer_email,phone:claim.customer_phone}:null,
+    selection:claim?.appointment_date?{date:claim.appointment_date,time:claim.appointment_time,
+      professionalKey:claim.provider_key,professionalName:LLTOUCH_PROFESSIONALS[claim.provider_key]?.name||null}:null,
+    booked:claim?.state==='confirmed', totalCents:LLTOUCH_OFFER.priceCents, depositCents:LLTOUCH_OFFER.depositCents};
+}
+// Reconcile abandoned Stripe checkouts BEFORE new claims. A checkout is NOT
+// released just because the initial 15-minute timer elapsed: payment might
+// already have been captured but its webhook could be delayed. Never oversell.
+let llOfferSweeping=false;
+async function llOfferSweepExpired() {
+  if(llOfferSweeping || !LLTOUCH_OFFER.enabled) return;
+  llOfferSweeping=true;
+  try {
+    const {data,error}=await academySupabase.from('lltouch_offer_claims')
+      .select('id,stripe_session_id,state,checkout_expires_at')
+      .eq('state','checkout')
+      .lt('checkout_expires_at',new Date(Date.now()-10000).toISOString()).limit(12);
+    if(error) throw error;
+    for(const row of data||[]) {
+      if(!row.stripe_session_id) continue;
+      try {
+        let session=await stripe.checkout.sessions.retrieve(row.stripe_session_id);
+        if(session.payment_status==='paid') {
+          await llOfferProcessPaid(session,await llOfferActualPaidAt(session));
+          continue;
+        }
+        if(session.status==='open') {
+          try {session=await stripe.checkout.sessions.expire(session.id)}
+          catch(e) {session=await stripe.checkout.sessions.retrieve(row.stripe_session_id)}
+        }
+        if(session.status==='expired' && session.payment_status!=='paid') {
+          await academySupabase.from('lltouch_offer_claims')
+            .update({state:'expired',updated_at:new Date().toISOString()})
+            .eq('id',row.id).eq('state','checkout');
+        }
+      } catch(e) {console.error('Offer checkout reconciliation pending:',row.id,String(e?.message||e));}
+    }
+    // Processing older than 3 minutes may have created a Google event.
+    // Never retry blindly; retain quota and flag for operator reconciliation.
+    const {data:stale,error:staleErr}=await academySupabase.from('lltouch_offer_claims')
+      .select('id,processing_started_at').eq('campaign_key',LLTOUCH_OFFER.campaignKey)
+      .eq('state','processing').lt('processing_started_at',new Date(Date.now()-180000).toISOString()).limit(12);
+    if(staleErr)throw staleErr;
+    for(const row of stale||[]) {
+      console.error('Offer appointment in processing state requires reconciliation',row.id);
+      await academySupabase.from('lltouch_offer_claims').update({state:'review',updated_at:new Date().toISOString()})
+        .eq('id',row.id).eq('state','processing');
+    }
+  } catch(e) {console.error('Offer checkout sweep failed:',String(e?.message||e));}
+  finally{llOfferSweeping=false;}
+}
+app.get('/lltouch/offer/config',checkoutLimiter,async(_req,res)=>{
+  // Public, static configuration only. No raw Vagaro secrets or customer data.
+  res.json({ok:true,enabled:llOfferOpen(),title:LLTOUCH_OFFER.title,priceCents:LLTOUCH_OFFER.priceCents,
+    depositCents:LLTOUCH_OFFER.depositCents,regularPriceCents:LLTOUCH_OFFER.regularPriceCents,offerLabel:LLTOUCH_OFFER.offerLabel,marketing:LLTOUCH_OFFER.marketing,holdMinutes:LLTOUCH_OFFER.holdMinutes,
+    offerEndsAt:new Date(LLTOUCH_OFFER.offerEndsAt).toISOString(),providers:LLTOUCH_OFFER.providerKeys.map(key=>({key,name:LLTOUCH_PROFESSIONALS[key].name}))});
+});
+app.post('/lltouch/offer/hold',checkoutLimiter,async(req,res)=>{
+  if(!llOfferCheckReady(res)) return;
+  const name=cleanLeadField(req.body?.name,120);
+  const email=cleanLeadField(req.body?.email,254).toLowerCase();
+  const phone=cleanLeadField(req.body?.phone,40);
+  const nonce=cleanLeadField(req.body?.client_nonce,45);
+  if(name.length<3||!isValidEmail(email)||phone.replace(/\D/g,'').length<10||!LL_OFFER_UUID.test(nonce)||req.body?.consent!==true)
+    return res.status(400).json({ok:false,error:'Complete your contact details and consent.'});
+  try {
+    await llOfferSweepExpired();
+    const {data,error}=await academySupabase.rpc('lltouch_offer_begin',{
+      p_campaign:LLTOUCH_OFFER.campaignKey,p_nonce:nonce,p_name:name,p_email:email,p_phone:phone
+      // No sales-cap argument is sent; the offer is limited by real availability.
+    });
+    if(error)throw error;
+    const result=Array.isArray(data)?data[0]:data;
+    if(!result?.claim_id) return res.status(409).json({ok:false,code:result?.outcome||'FULL',error:result?.outcome==='already_held'
+      ?'You already have a temporary offer hold. Continue from the browser where you claimed it.'
+      :'Please begin a new 15-minute window from the offer page.'});
+    res.json({ok:true,hold_id:result.claim_id,deadline:result.deadline,holdMinutes:LLTOUCH_OFFER.holdMinutes});
+  }catch(error){console.error('Offer hold creation failed:',String(error?.message||error));res.status(503).json({ok:false,error:'The temporary hold could not be created. Please retry.'});}
+});
+app.post('/lltouch/offer/status',checkoutLimiter,async(req,res)=>{
+  try {
+    const claim=await llOfferGet(req.body?.hold_id);
+    if(!claim)return res.status(404).json({ok:false,error:'No matching offer hold.'});
+    if(claim.state==='held'&&new Date(claim.hold_expires_at).getTime()<=Date.now()){
+      await academySupabase.from('lltouch_offer_claims').update({state:'expired',updated_at:new Date().toISOString()})
+        .eq('id',claim.id).eq('state','held');
+      claim.state='expired';
+    }
+    res.json(llOfferPublic(claim));
+  }catch(e){console.error('Offer status unavailable:',String(e?.message||e));res.status(503).json({ok:false,error:'We could not verify your offer hold.'});}
+});
+async function llOfferBlockOtherHeldSlots(professional, date, slots, claimId) {
+  const {data,error}=await academySupabase.from('lltouch_offer_claims')
+    .select('id,starts_at,ends_at,state,hold_expires_at')
+    .eq('provider_id',professional.providerId).eq('appointment_date',date)
+    .in('state',['held','checkout','paid','processing','confirmed','review']);
+  if(error)throw error;
+  const busy=(data||[]).filter(row=> row.id!==claimId && (row.state!=='held'||new Date(row.hold_expires_at).getTime()>Date.now()));
+  return slots.filter(slot=>{
+    const w=llTouchAppointmentWindow(date,slot.time,llOfferService().bookingDurationMinutes);
+    return Boolean(w && !busy.some(row=>w.start < new Date(row.ends_at)&&w.end > new Date(row.starts_at)));
+  });
+}
+app.post('/lltouch/offer/dates',checkoutLimiter,async(req,res)=>{
+  if(!llOfferCheckReady(res))return;
+  try {
+    const claim=await llOfferGet(req.body?.hold_id);
+    if(!claim||claim.state!=='held'||new Date(claim.hold_expires_at).getTime()<=Date.now())
+      return res.status(410).json({ok:false,code:'HOLD_EXPIRED',error:'Your 15-minute window has expired. Return to the offer page to start a new one.'});
+    const providerKey=cleanLeadField(req.body?.professional_key,20);
+    if(!LLTOUCH_OFFER.providerKeys.includes(providerKey))return res.status(400).json({ok:false,error:'Select an available professional.'});
+    const professional={key:providerKey,...LLTOUCH_PROFESSIONALS[providerKey]};
+    if(!professional.providerId||!professional.calendarId)return res.status(503).json({ok:false,error:'This calendar is not configured.'});
+    const today=llTouchGeneralTodayISO(),horizon=academyAddDaysISO(today,27);
+    const start=req.body?.start_date?formatDateOnly(req.body.start_date):today;
+    if(!start||start<today||start>horizon)return res.status(400).json({ok:false,error:'Search date outside the next 28 days.'});
+    const service=llOfferService();
+    const fakeSession={id:'offer:'+claim.id,metadata:{brand:'lltouch',campaign:LLTOUCH_OFFER.campaignKey}};
+    const selected={index:0,vagaroService:service};
+    let cursor=start,checks=0,dates=[];
+    const seen=new Set();
+    while(cursor<=horizon && checks<3 && dates.length<5) {
+      let result;
+      try {result=await searchVagaroAvailability({date:cursor,serviceId:service.serviceId,
+        addOnIds:service.addOnIds||[],serviceProviderId:professional.providerId});}
+      catch(e){
+        if(cursor===today&&e?.vagaroPastDate){cursor=academyAddDaysISO(today,1);continue;}
+        throw e;
+      }
+      checks++;
+      const candidates=(result.data||[]).map(day=>({date:String(day.appointmentDate||'').slice(0,10),timeSlot:day.timeSlot||[]}))
+        .filter(day=>/^\d{4}-\d{2}-\d{2}$/.test(day.date)&&day.date>=cursor)
+        .sort((a,b)=>a.date.localeCompare(b.date));
+      if(!candidates.length){cursor=academyAddDaysISO(cursor,1);continue;}
+      let furthest=cursor;
+      for(const day of candidates){
+        if(day.date>horizon)break;
+        if(seen.has(day.date))continue;
+        seen.add(day.date);
+        if(day.date>furthest)furthest=day.date;
+        if(!day.timeSlot.length)continue;
+        const verified=await llTouchGeneralVerifiedDay({session:fakeSession,selected,professional,date:day.date,vagaroDay:day});
+        const free=await llOfferBlockOtherHeldSlots(professional,day.date,verified,claim.id);
+        if(free.length)dates.push({date:day.date,slots:free.map(s=>s.time)});
+        if(dates.length>=5)break;
+      }
+      cursor=academyAddDaysISO(furthest,1);
+    }
+    res.json({ok:true,providerKey,dates,next_date:cursor<=horizon?cursor:null,horizon_end:horizon,
+      verification:'Vagaro + Google Calendar + Supabase; rechecked before payment'});
+  }catch(e){console.error('Offer available-dates failed:',String(e?.message||e));res.status(503).json({ok:false,error:'Live availability could not be verified. Please retry.'});}
+});
+app.post('/lltouch/offer/checkout',checkoutLimiter,async(req,res)=>{
+  if(!llOfferCheckReady(res))return;
+  let claim=null,createdSession=null;
+  try {
+    claim=await llOfferGet(req.body?.hold_id);
+    if(!claim)return res.status(404).json({ok:false,error:'The offer hold was not found.'});
+    if(claim.state==='checkout'&&claim.stripe_session_id){
+      const existing=await stripe.checkout.sessions.retrieve(claim.stripe_session_id);
+      if(existing.status==='open' && existing.url)return res.json({ok:true,url:existing.url,resumed:true});
+      return res.status(409).json({ok:false,error:'The previous secure checkout is no longer available. Contact LL Touch.'});
+    }
+    if(claim.state!=='held'||new Date(claim.hold_expires_at).getTime()<=Date.now())
+      return res.status(410).json({ok:false,error:'Your temporary hold has expired. Please return to the offer.'});
+    if(req.body?.accepted_terms!==true)return res.status(422).json({ok:false,error:'Please accept the deposit terms.'});
+    const key=cleanLeadField(req.body?.professional_key,20);
+    const date=formatDateOnly(req.body?.date),time=normalizeAcademyTime(req.body?.time);
+    if(!LLTOUCH_OFFER.providerKeys.includes(key)||!date||!time)return res.status(422).json({ok:false,error:'Choose a professional, date and time.'});
+    const professional={key,...LLTOUCH_PROFESSIONALS[key]};
+    if(!professional.providerId||!professional.calendarId)return res.status(503).json({ok:false,error:'Provider calendar unavailable.'});
+    const service=llOfferService();
+    const window=llTouchAppointmentWindow(date,time,service.bookingDurationMinutes);
+    const today=llTouchGeneralTodayISO();
+    if(!window||window.start.getTime() < Date.now()+10*60000||date<today||date>academyAddDaysISO(today,27))
+      return res.status(422).json({ok:false,error:'The selected time is outside the booking window.'});
+    const [vagaro,busy]=await Promise.all([
+      searchVagaroAvailability({date,serviceId:service.serviceId,addOnIds:service.addOnIds||[],serviceProviderId:professional.providerId}),
+      llTouchBusyEventsForCalendar(date,professional.calendarId,true)
+    ]);
+    const inVagaro=(vagaro.data||[]).some(day=>normalizeAcademyDateValue(day.appointmentDate,date)===date &&
+      (day.timeSlot||[]).some(t=>normalizeAcademyTime(t)===time));
+    if(!inVagaro||busy.some(event=>llTouchCalendarIntervalOverlaps(window,event)))
+      return res.status(409).json({ok:false,error:'That time is no longer available. Please select another.'});
+    const {data:locked,error:lockErr}=await academySupabase.rpc('lltouch_offer_lock_time',{
+      p_id:claim.id,p_campaign:LLTOUCH_OFFER.campaignKey,p_provider_key:key,p_provider_id:professional.providerId,
+      p_service_id:service.serviceId,p_date:date,p_time:time,
+      p_start:window.start.toISOString(),p_end:window.end.toISOString()
+    });
+    if(lockErr)throw lockErr;
+    if(locked!==true)return res.status(409).json({ok:false,error:'The selected time is no longer available, or the 15-minute window has ended. Refresh availability.'});
+    const ttl=Math.floor(Date.now()/1000)+1860; // Stripe Checkout requires >=30m; 1m network margin.
+    const item=LLTOUCH_OFFER.siteItem;
+    createdSession=await stripe.checkout.sessions.create({
+      mode:'payment',payment_method_types:['card'],expires_at:ttl,
+      customer_email:claim.customer_email,
+      line_items:[{quantity:1,price_data:{currency:'usd',unit_amount:LLTOUCH_OFFER.depositCents,
+        product_data:{name:`${LLTOUCH_OFFER.title} — Early Black Friday deposit`,
+        description:`${llOfferMoney(LLTOUCH_OFFER.depositCents)} deposit toward one ${llOfferMoney(LLTOUCH_OFFER.priceCents)} session; ${llOfferMoney(LLTOUCH_OFFER.priceCents-LLTOUCH_OFFER.depositCents)} due at visit.`,
+        metadata:{source:'lltouch-site',mode:item.type,service:item.service,package:'single',addon:'none'}}}}],
+      metadata:{brand:'lltouch',campaign:LLTOUCH_OFFER.campaignKey,offer_flow:'lltouch-offer-v2',offer_claim_id:claim.id,
+        appointment_customer_name:claim.customer_name,appointment_customer_email:claim.customer_email,
+        appointment_customer_phone:claim.customer_phone,customer_email:claim.customer_email,
+        offer_provider_key:key,offer_date:date,offer_time:time,
+        primary_site_item:JSON.stringify(item),lltouch_item_0:JSON.stringify(item),
+        offer_price_usd:String(LLTOUCH_OFFER.priceCents/100),deposit_usd:String(LLTOUCH_OFFER.depositCents/100),
+        balance_due_usd:String((LLTOUCH_OFFER.priceCents-LLTOUCH_OFFER.depositCents)/100)},
+      payment_intent_data:{metadata:{brand:'lltouch',campaign:LLTOUCH_OFFER.campaignKey,offer_flow:'lltouch-offer-v2',offer_claim_id:claim.id}},
+      success_url:`${LLTOUCH_OFFER.origin}/offer-reserve?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:`${LLTOUCH_OFFER.origin}/offer-reserve?cancelled=1`
+    },{idempotencyKey:`lltouch-offer-${claim.id}-${key}-${date}-${time}`});
+    const {data:bound,error:bindErr}=await academySupabase.rpc('lltouch_offer_bind_checkout',{
+      p_id:claim.id,p_campaign:LLTOUCH_OFFER.campaignKey,p_session:createdSession.id,
+      p_checkout_expiry:new Date(ttl*1000).toISOString()
+    });
+    if(bindErr || bound!==true){
+      try{await stripe.checkout.sessions.expire(createdSession.id)}catch{}
+      throw bindErr||new Error('The offer hold expired while creating payment. Please restart.');
+    }
+    res.json({ok:true,url:createdSession.url,hold_until:claim.hold_expires_at});
+  }catch(e){
+    console.error('LL Touch offer checkout error:',String(e?.message||e));
+    // A failed attempt never releases a PAID place. Unpaid selected slot
+    // expires with its original hold; a retry can resume the same checkout.
+    return res.status(503).json({ok:false,error:'We could not open secure payment. Please retry or contact LL Touch.'});
+  }
+});
+// Invoke the already-validated paid-only appointment confirmation handler
+// (Google Calendar event -> Vagaro BUSY Personal Task + Supabase appointment).
+// Capture its response instead of inventing a separate booking algorithm.
+async function llOfferConfirmPaidAppointment(session,claim){
+  let code=200,result=null;
+  const fakeRes={status(n){code=n;return this;},json(body){result=body;return this;}};
+  await llTouchHandleAppointmentConfirmation({llTouchOfferAutoBooking:true,body:{
+    session_id:session.id,item_index:0,professional_key:claim.provider_key,
+    date:claim.appointment_date,time:claim.appointment_time,
+    appointment_customer:{name:claim.customer_name,email:claim.customer_email,phone:claim.customer_phone}
+  }},fakeRes);
+  return {code,result};
+}
+async function llOfferActualPaidAt(session) {
+  const id=typeof session.payment_intent==='string' ? session.payment_intent : session.payment_intent?.id;
+  if(!id)throw new Error('PaymentIntent is unavailable; Stripe webhook will reconcile payment.');
+  const pi=await stripe.paymentIntents.retrieve(id,{expand:['latest_charge']});
+  if(pi.status!=='succeeded')throw new Error('PaymentIntent is not confirmed.');
+  const charge=pi.latest_charge;
+  if(!charge || typeof charge==='string' || !Number.isFinite(Number(charge.created)))
+    throw new Error('Paid timestamp is unavailable.');
+  return new Date(Number(charge.created)*1000);
+}
+async function llOfferProcessPaid(session,paidAt){
+  const claimId=session.metadata?.offer_claim_id;
+  const claim=await llOfferGet(claimId,false);
+  if(!claim || claim.stripe_session_id!==session.id)throw new Error('Offer claim and paid Stripe session do not match.');
+  if(session.payment_status!=='paid')return;
+  const {data:marked,error:markError}=await academySupabase.rpc('lltouch_offer_mark_paid',{
+    p_id:claim.id,p_campaign:claim.campaign_key,p_session:session.id,p_paid_at:paidAt.toISOString()
+  });
+  if(markError)throw markError;
+  if(marked==='late'||marked==='missing'||marked==='invalid') {
+    console.error('PAID OFFER REQUIRES MANUAL REFUND/RECONCILIATION',session.id,marked);
+    const {error}=await academySupabase.from('lltouch_offer_claims')
+      .update({state:'review',paid_at:paidAt.toISOString(),updated_at:new Date().toISOString()})
+      .eq('id',claim.id).eq('stripe_session_id',session.id).neq('state','confirmed');
+    if(error)throw error;
+    return;
+  }
+  if(marked==='confirmed'||marked==='processing')return;
+  // For safety do not repeat a partially-created Google event indefinitely.
+  if(marked==='review')return;
+  const {data:claimed,error:claimError}=await academySupabase.rpc('lltouch_offer_claim_processing',{p_id:claim.id,p_session:session.id});
+  if(claimError)throw claimError;
+  if(claimed!==true)return; // another worker owns confirmation
+  const {code,result}=await llOfferConfirmPaidAppointment(session,claim);
+  if(code>=200&&code<300&&result?.ok&&result?.appointment?.bookingId) {
+    const {error}=await academySupabase.from('lltouch_offer_claims').update({
+      state:'confirmed',booking_id:result.appointment.bookingId,
+      updated_at:new Date().toISOString()}).eq('id',claim.id).eq('state','processing');
+    if(error)throw error;
+    return;
+  }
+  console.error('PAID OFFER REQUIRES STAFF BOOKING REVIEW',claim.id,code,result?.code||'unknown');
+  const {error}=await academySupabase.from('lltouch_offer_claims')
+    .update({state:'review',updated_at:new Date().toISOString()})
+    .eq('id',claim.id).eq('state','processing');
+  if(error)throw error;
+}
+async function llOfferHandleStripeEvent(event){
+  const obj=event.data.object;
+  const id=String(obj.metadata?.offer_claim_id||'');
+  if(!LL_OFFER_UUID.test(id))throw new Error('Invalid offer claim on Stripe event');
+  if(event.type==='checkout.session.expired'){
+    const {error}=await academySupabase.from('lltouch_offer_claims')
+      .update({state:'expired',updated_at:new Date().toISOString()})
+      .eq('id',id).eq('stripe_session_id',obj.id).eq('state','checkout');
+    if(error)throw error;
+    return;
+  }
+  if(!['checkout.session.completed','checkout.session.async_payment_succeeded'].includes(event.type))return;
+  const session=await getStripeSessionExpanded(obj.id);
+  if(session.payment_status!=='paid')return;
+  // Use the actual successful Stripe charge time, not webhook delivery time.
+  // Webhook processing may be delayed beyond the Checkout expiry.
+  await llOfferProcessPaid(session,await llOfferActualPaidAt(session));
+}
+app.get('/lltouch/offer/receipt',checkoutLimiter,async(req,res)=>{
+  const sid=cleanLeadField(req.query?.session_id,160);
+  if(!/^cs_(live|test)_[a-zA-Z0-9]+$/.test(sid))return res.status(400).json({ok:false,error:'Invalid payment reference.'});
+  try{
+    const session=await getStripeSessionExpanded(sid);
+    if(session.metadata?.offer_flow!=='lltouch-offer-v2')
+      return res.status(404).json({ok:false,error:'Payment does not belong to this offer.'});
+    if(session.payment_status==='paid')await llOfferProcessPaid(session,await llOfferActualPaidAt(session));
+    const claim=await llOfferGet(session.metadata.offer_claim_id,false);
+    if(!claim||claim.stripe_session_id!==session.id)return res.status(404).json({ok:false,error:'Payment reconciliation is not available.'});
+    let booking=null;
+    if(claim.state==='confirmed'){
+      const rows=await llTouchReadBookings(sid);
+      const row=rows.find(b=>b.status==='confirmed' && b.id===claim.booking_id);
+      if(row)booking=llTouchPublicAppointment(row);
+    }
+    res.json({ok:true,paid:session.payment_status==='paid',state:claim.state,booking,
+      priceCents:Number(session.metadata.offer_price_usd||99)*100,depositCents:Number(session.metadata.deposit_usd||25)*100,
+      message:claim.state==='review'?'Payment received. Our team must verify your appointment. Do not pay again.':
+        claim.state==='confirmed'?'Appointment confirmed.': 'Payment is being verified. Please do not pay again.'});
+  }catch(e){console.error('Offer receipt status error:',String(e?.message||e));res.status(503).json({ok:false,error:'Payment status could not be verified. Please contact LL Touch; do not pay again.'});}
+});
+if(LLTOUCH_OFFER.enabled){
+  setInterval(()=>{void llOfferSweepExpired()},60000);
+  setTimeout(()=>{void llOfferSweepExpired()},4000);
+}
+// ===========================================================================
+
+
 app.post("/llb/create-checkout-session", checkoutLimiter, async (req, res) => {
   try {
     const email = cleanLeadField(req.body?.email, 254).toLowerCase();
@@ -6056,6 +6548,8 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
   if (llTouchIsCampaign(session) && !LLTOUCH_PWYC_ENABLED)
     return res.status(503).json({ok:false,error:"Campaign booking is not enabled yet."});
 
+  if (session.metadata?.offer_flow === 'lltouch-offer-v2' && !req.llTouchOfferAutoBooking)
+    return res.status(403).json({ok:false,code:'OFFER_AUTO_CONFIRM_ONLY',error:'This offer is confirmed automatically after payment.'});
   const options = buildBookingOptionsFromSession(session);
   const selected = options[selectedIndex];
   if (!selected) {
@@ -6273,6 +6767,14 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
       `Professional: ${professional.name}`,
       `Purchase details: ${itemSummary || service.title}`,
       `Paid order total: ${((session.amount_total || 0) / 100).toFixed(2)} ${String(session.currency || "usd").toUpperCase()}`,
+      ...(session.metadata?.offer_flow === 'lltouch-offer-v2' ? [
+        `LL TOUCH PROMOTIONAL OFFER: price $${session.metadata.offer_price_usd} total, deposit $${session.metadata.deposit_usd} paid online, balance $${session.metadata.balance_due_usd} due at visit.`,
+        `This booking was automatically confirmed after verified Stripe payment.`
+      ] : []),
+      ...(session.metadata?.campaign === 'hydrafacial-early-bf-2026' ? [
+        'EARLY BLACK FRIDAY HYDRAFACIAL: promotional price $99 total; $25 deposit paid online; $74 due at visit.',
+        'Offer is for one session and includes no additional paid sessions.'
+      ] : []),
       `Stripe checkout session: ${session.id}`,
       `LL Touch booking reference: ${pending.id}`,
       "If service history is required, convert this Personal Task into a Vagaro appointment."
