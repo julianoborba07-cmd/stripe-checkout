@@ -4336,6 +4336,124 @@ const LLTOUCH_OFFER = Object.freeze({
   origin: 'https://lltouch.com',
   providerKeys: ['ludimilla','carol']
 });
+// ==============================
+// LL TOUCH META CONVERSIONS API (ISOLATED /offer FUNNEL)
+// The outbox is durable; a Meta outage must NEVER interfere with booking/payment.
+// Apply 03_meta_outbox_supabase.sql before enabling the integration.
+// ==============================
+const LL_META_PIXEL_ID = process.env.LLTOUCH_META_PIXEL_ID || '1320463056123280';
+const LL_META_ACCESS_TOKEN = process.env.LLTOUCH_META_CAPI_TOKEN || '';
+const LL_META_ENABLED = process.env.LLTOUCH_META_CAPI_ENABLED === 'true';
+const LL_META_API_VERSION = process.env.LLTOUCH_META_GRAPH_VERSION || 'v26.0';
+const LL_META_TEST_EVENT_CODE = process.env.LLTOUCH_META_TEST_EVENT_CODE || '';
+const LL_META_OUTBOX = 'lltouch_offer_meta_events';
+const llMetaSha256 = value => crypto.createHash('sha256').update(value).digest('hex');
+function llMetaMatchedData(name, email, phone, req, tracking) {
+  // Do not pass plaintext identity data to Meta; fbp/fbc are not hashed.
+  const normalizedEmail=String(email||'').trim().toLowerCase();
+  const digits=String(phone||'').replace(/\D/g,'');
+  const normalizedPhone=digits.length===10?'1'+digits:digits;
+  const parts=String(name||'').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const data={};
+  if(normalizedEmail) data.em=[llMetaSha256(normalizedEmail)];
+  if(normalizedPhone.length>=10) data.ph=[llMetaSha256(normalizedPhone)];
+  if(parts[0]) data.fn=[llMetaSha256(parts[0])];
+  if(parts.length>1) data.ln=[llMetaSha256(parts.at(-1))];
+  const fbp=String(tracking?.fbp||'').trim().slice(0,300);
+  const fbc=String(tracking?.fbc||'').trim().slice(0,600);
+  if(/^fb\.1\.\d{10,16}\.[a-zA-Z0-9._~-]{1,220}$/.test(fbp)) data.fbp=fbp;
+  if(/^fb\.1\.\d{10,16}\.[a-zA-Z0-9._~-]{1,512}$/.test(fbc)) data.fbc=fbc;
+  if(req?.ip && /^[0-9a-fA-F:.,\s]{3,80}$/.test(req.ip))data.client_ip_address=req.ip.trim();
+  const ua=String(req?.get?.('user-agent')||'').slice(0,450);
+  if(ua)data.client_user_agent=ua;
+  return data;
+}
+async function llMetaUpsertEvent(entry){
+  const {error}=await academySupabase.from(LL_META_OUTBOX).upsert(entry,{onConflict:'event_id',ignoreDuplicates:true});
+  if(error)throw error;
+}
+async function llMetaEnqueueLead(claimId, nonce, fields, req){
+  const entry={
+    event_id:`lltouch-offer-lead-${nonce}`,claim_id:claimId,event_name:'Lead',
+    event_time:new Date().toISOString(),state:'pending',
+    payload:{event_name:'Lead',event_id:`lltouch-offer-lead-${nonce}`,
+      action_source:'website',event_source_url:`${LLTOUCH_OFFER.origin}/offer`,
+      user_data:llMetaMatchedData(fields.name,fields.email,fields.phone,req,fields.meta),
+      custom_data:{campaign_key:'lltouch-offer-v2'}}
+  };
+  await llMetaUpsertEvent(entry);
+}
+async function llMetaEnqueuePurchase(session, claim, paidAt){
+  // Lead and Purchase share the same first-touch identifiers even across Stripe.
+  const {data:lead,error:lookupError}=await academySupabase.from(LL_META_OUTBOX)
+    .select('payload').eq('claim_id',claim.id).eq('event_name','Lead').maybeSingle();
+  if(lookupError)throw lookupError;
+  const inherited={...(lead?.payload?.user_data||{})};
+  // If a lead event was unavailable, still match using verified checkout details.
+  const base=llMetaMatchedData(claim.customer_name,claim.customer_email,claim.customer_phone,null,null);
+  const amount=Number(session.amount_total);
+  const cents=Number.isSafeInteger(amount)&&amount>0?amount:LLTOUCH_OFFER.depositCents;
+  const currency=String(session.currency||'usd').toUpperCase();
+  const eventId=`lltouch-offer-purchase-${session.id}`;
+  const entry={
+    event_id:eventId,claim_id:claim.id,event_name:'Purchase',
+    event_time:paidAt.toISOString(),stripe_session_id:session.id,state:'pending',
+    payload:{event_name:'Purchase',event_id:eventId,action_source:'website',
+      event_source_url:`${LLTOUCH_OFFER.origin}/offer-reserve`,
+      user_data:{...base,...inherited},
+      custom_data:{currency,value:cents/100,campaign_key:'lltouch-offer-v2'}}
+  };
+  await llMetaUpsertEvent(entry);
+}
+let llMetaFlushing=false;
+async function llMetaFlush(){
+  if(!LL_META_ENABLED||!LL_META_ACCESS_TOKEN||llMetaFlushing)return;
+  llMetaFlushing=true;
+  try {
+    const {data:batch,error}=await academySupabase.rpc('lltouch_offer_meta_claim_batch',{p_limit:8});
+    if(error)throw error;
+    for(const row of batch||[]){
+      try {
+        // Meta rejects events that are more than 7 days old.
+        if(Date.now()-new Date(row.event_time).getTime() > 6*24*60*60*1000)
+          throw new Error('Event older than 6 days; manual review required');
+        const payload={...row.payload,event_time:Math.floor(new Date(row.event_time).getTime()/1000)};
+        const body={data:[payload],access_token:LL_META_ACCESS_TOKEN};
+        if(LL_META_TEST_EVENT_CODE)body.test_event_code=LL_META_TEST_EVENT_CODE;
+        const reply=await fetch(`https://graph.facebook.com/${LL_META_API_VERSION}/${encodeURIComponent(LL_META_PIXEL_ID)}/events`,{
+          method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),
+          signal:AbortSignal.timeout(9000)
+        });
+        const response=await reply.json().catch(()=>({}));
+        if(!reply.ok||Number(response.events_received)<1)
+          throw new Error('Meta rejected event: '+String(response.error?.message||`HTTP ${reply.status}`).slice(0,180));
+        const {error:updateErr}=await academySupabase.from(LL_META_OUTBOX).update({
+          state:'sent',sent_at:new Date().toISOString(),lease_expires_at:null,last_error:null,updated_at:new Date().toISOString()
+        }).eq('event_id',row.event_id).eq('state','sending').eq('attempts',row.attempts);
+        if(updateErr)throw updateErr;
+      }catch(err){
+        const exhausted=row.attempts>=9 || Date.now()-new Date(row.event_time).getTime()>6*24*60*60*1000;
+        const seconds=Math.min(3600,30*Math.pow(2,Math.min(7,Number(row.attempts)||1)));
+        const {error:updateErr}=await academySupabase.from(LL_META_OUTBOX).update({
+          state:exhausted?'failed':'pending',
+          next_attempt_at:new Date(Date.now()+seconds*1000).toISOString(),lease_expires_at:null,
+          last_error:String(err?.message||err).slice(0,250),updated_at:new Date().toISOString()
+        }).eq('event_id',row.event_id).eq('state','sending').eq('attempts',row.attempts);
+        if(updateErr)console.error('LL Touch Meta outbox status error:',String(updateErr.message||updateErr));
+        console.error('LL Touch Meta event retry queued:',row.event_name,row.event_id.slice(0,40));
+      }
+    }
+  }catch(err){console.error('LL Touch Meta queue error:',String(err?.message||err));}
+  finally{llMetaFlushing=false;}
+}
+if(LL_META_ENABLED){
+  if(!LL_META_ACCESS_TOKEN) console.warn('LL Touch Meta CAPI enabled without a token; events will stay queued.');
+  const metaTimer=setInterval(()=>{void llMetaFlush()},30000);
+  metaTimer.unref?.();
+  const metaStartup=setTimeout(()=>{void llMetaFlush()},5000);
+  metaStartup.unref?.();
+}
+
 const LL_OFFER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const llOfferMoney = cents => `$${(cents/100).toFixed(2)}`;
 function llOfferService() {
@@ -4445,6 +4563,12 @@ app.post('/lltouch/offer/hold',checkoutLimiter,async(req,res)=>{
     if(!result?.claim_id) return res.status(409).json({ok:false,code:result?.outcome||'FULL',error:result?.outcome==='already_held'
       ?'You already have a temporary offer hold. Continue from the browser where you claimed it.'
       :'Please begin a new 15-minute window from the offer page.'});
+    // After a successful 15-minute hold, persist a matchable, idempotent Lead event.
+    // Never make a marketing service failure prevent a legitimate booking.
+    try{
+      await llMetaEnqueueLead(result.claim_id,nonce,{name,email,phone,meta:req.body?.meta},req);
+      void llMetaFlush();
+    }catch(metaError){console.error('LL Touch Meta lead queue unavailable:',String(metaError?.message||metaError));}
     res.json({ok:true,hold_id:result.claim_id,deadline:result.deadline,holdMinutes:LLTOUCH_OFFER.holdMinutes});
   }catch(error){console.error('Offer hold creation failed:',String(error?.message||error));res.status(503).json({ok:false,error:'The temporary hold could not be created. Please retry.'});}
 });
@@ -4628,6 +4752,12 @@ async function llOfferProcessPaid(session,paidAt){
     p_id:claim.id,p_campaign:claim.campaign_key,p_session:session.id,p_paid_at:paidAt.toISOString()
   });
   if(markError)throw markError;
+  // Purchase means funds captured, even if a booking later requires staff review.
+  // Stripe session ID is the stable deduplication key on webhook and receipt retries.
+  if(marked!=='missing' && marked!=='invalid' && marked!=='late'){
+    try{await llMetaEnqueuePurchase(session,claim,paidAt); void llMetaFlush()}
+    catch(metaError){console.error('LL Touch Meta purchase queue unavailable:',String(metaError?.message||metaError));}
+  }
   if(marked==='late'||marked==='missing'||marked==='invalid') {
     console.error('PAID OFFER REQUIRES MANUAL REFUND/RECONCILIATION',session.id,marked);
     const {error}=await academySupabase.from('lltouch_offer_claims')
