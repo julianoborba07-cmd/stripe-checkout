@@ -4302,7 +4302,7 @@ app.post('/lltouch/hydrafacial/checkout', checkoutLimiter, async (req,res) => {
 });
 
 // ===========================================================================
-// LL TOUCH /OFFER v3: reusable campaign, 15-minute verified checkout-start window,
+// LL TOUCH /OFFER v3: reusable campaign, 10-minute verified checkout-start window,
 // prepayment Carol/Ludimilla availability, $25 deposit, paid-only auto-booking.
 // This block does NOT modify PWYC/Studio/Academy behavior.
 // IMPORTANT: configure only after Supabase migration, test and staff approval.
@@ -4332,7 +4332,7 @@ const LLTOUCH_OFFER = Object.freeze({
   capacity: null,
   offerStartsAt: Date.parse('2026-11-05T00:00:00-05:00'),
   offerEndsAt: Date.parse('2026-11-10T00:00:00-05:00'),
-  holdMinutes: 15,
+  holdMinutes: 10,
   timezone: 'America/New_York',
   origin: 'https://lltouch.com',
   providerKeys: ['ludimilla','carol']
@@ -4685,7 +4685,7 @@ function llOfferPublic(claim) {
     booked:claim?.state==='confirmed', totalCents:LLTOUCH_OFFER.priceCents, depositCents:LLTOUCH_OFFER.depositCents};
 }
 // Reconcile abandoned Stripe checkouts BEFORE new claims. A checkout is NOT
-// released just because the initial 15-minute timer elapsed: payment might
+// released just because the initial 10-minute timer elapsed: payment might
 // already have been captured but its webhook could be delayed. Never oversell.
 let llOfferSweeping=false;
 async function llOfferSweepExpired() {
@@ -4757,8 +4757,8 @@ app.post('/lltouch/offer/hold',checkoutLimiter,async(req,res)=>{
     const result=Array.isArray(data)?data[0]:data;
     if(!result?.claim_id) return res.status(409).json({ok:false,code:result?.outcome||'FULL',error:result?.outcome==='already_held'
       ?'You already have a temporary offer hold. Continue from the browser where you claimed it.'
-      :'Please begin a new 15-minute window from the offer page.'});
-    // After a successful 15-minute hold, persist a matchable, idempotent Lead event.
+      :'Please begin a new 10-minute window from the offer page.'});
+    // After a successful 10-minute hold, persist a matchable, idempotent Lead event.
     // Never make a marketing service failure prevent a legitimate booking.
     try{
       await llMetaEnqueueLead(result.claim_id,nonce,{name,email,phone,meta:req.body?.meta},req);
@@ -4801,7 +4801,7 @@ app.post('/lltouch/offer/dates',checkoutLimiter,async(req,res)=>{
   try {
     const claim=await llOfferGet(req.body?.hold_id);
     if(!claim||claim.state!=='held'||new Date(claim.hold_expires_at).getTime()<=Date.now())
-      return res.status(410).json({ok:false,code:'HOLD_EXPIRED',error:'Your 15-minute window has expired. Return to the offer page to start a new one.'});
+      return res.status(410).json({ok:false,code:'HOLD_EXPIRED',error:'Your 10-minute window has expired. Return to the offer page to start a new one.'});
     const providerKey=cleanLeadField(req.body?.professional_key,20);
     if(!LLTOUCH_OFFER.providerKeys.includes(providerKey))return res.status(400).json({ok:false,error:'Select an available professional.'});
     const professional={key:providerKey,...LLTOUCH_PROFESSIONALS[providerKey]};
@@ -4943,7 +4943,7 @@ app.post('/lltouch/offer/checkout',checkoutLimiter,async(req,res)=>{
       p_start:window.start.toISOString(),p_end:window.end.toISOString()
     });
     if(lockErr)throw lockErr;
-    if(locked!==true)return res.status(409).json({ok:false,error:'The selected time is no longer available, or the 15-minute window has ended. Refresh availability.'});
+    if(locked!==true)return res.status(409).json({ok:false,error:'The selected time is no longer available, or the 10-minute window has ended. Refresh availability.'});
     const ttl=Math.floor(Date.now()/1000)+1860; // Stripe Checkout requires >=30m; 1m network margin.
     const item=LLTOUCH_OFFER.siteItem;
     createdSession=await stripe.checkout.sessions.create({
