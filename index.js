@@ -4879,8 +4879,8 @@ app.post('/lltouch/offer/checkout',checkoutLimiter,async(req,res)=>{
         dateDay===0 || preferredDate<today || preferredDate>academyAddDaysISO(today,90) ||
         !requestWindow || requestWindow.start.getTime()<Date.now()+10*60000 ||
         !Number.isFinite(duration)||duration<=0 || startMinutes<540 ||
-        startMinutes+duration>1080)
-        return res.status(422).json({ok:false,error:'Choose a preferred Monday–Saturday date and a time that fits between 9 AM and 6 PM (Eastern). This is a request, not a confirmed appointment.'});
+        startMinutes>1080)
+        return res.status(422).json({ok:false,error:'Choose a preferred Monday–Saturday date and a requested start time from 9 AM through 6 PM (Eastern). This is a request, not a confirmed appointment.'});
       const {data:prepared,error:prepareError}=await academySupabase.rpc('lltouch_offer_preferred_prepare',{
         p_id:claim.id,p_campaign:LLTOUCH_OFFER.campaignKey,
         p_date:preferredDate,p_time:preferredTime,p_provider:requestedProvider
