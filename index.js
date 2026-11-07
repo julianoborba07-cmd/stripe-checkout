@@ -4308,6 +4308,7 @@ app.post('/lltouch/hydrafacial/checkout', checkoutLimiter, async (req,res) => {
 // IMPORTANT: configure only after Supabase migration, test and staff approval.
 // Future offers: update this ONE configuration block and corresponding page copy.
 // ===========================================================================
+const LLTOUCH_PREFERRED_REQUEST_ENABLED = process.env.LLTOUCH_PREFERRED_REQUEST_ENABLED === 'true';
 const LLTOUCH_OFFER = Object.freeze({
   enabled: process.env.LLTOUCH_OFFER_ENABLED === 'true',
   campaignKey: 'hydrafacial-early-bf-2026-v2',
@@ -4469,6 +4470,7 @@ const LL_GHL_SMS_FIELD_KEY = String(process.env.LLTOUCH_GHL_SMS_FIELD_KEY || 'sm
 const LL_GHL_QUEUE = 'lltouch_offer_ghl_outbox';
 const LL_GHL_LEAD_TAG = 'llt-hydrafacial-lead';
 const LL_GHL_PAID_TAG = 'llt-hydrafacial-paid';
+const LL_GHL_PREFERRED_TAG = 'llt-hydrafacial-preferred';
 // The opt-in copy in /offer corresponds to this audit-version identifier.
 const LL_GHL_CONSENT_VERSION = 'lltouch-offer-marketing-sms-v1-20261107';
 
@@ -4562,9 +4564,17 @@ async function llGhlEnqueueLead(claimId,person,smsConsent) {
 }
 async function llGhlEnqueuePaid(session,claim) {
   if(!LL_GHL_ENABLED)return;
+  let bookingMode='suggested';
+  if(LLTOUCH_PREFERRED_REQUEST_ENABLED){
+    // Session metadata is present on webhooks, but not always on reconciliation jobs.
+    const {data:pref,error}=await academySupabase.from('lltouch_offer_preferred_requests')
+      .select('claim_id').eq('claim_id',claim.id).eq('stripe_session_id',session.id).maybeSingle();
+    if(error)throw error;
+    if(pref)bookingMode='preferred';
+  }
   await llGhlEnqueue({key:'paid:'+session.id,type:'paid',claimId:claim.id,
     payload:{person:{name:claim.customer_name,email:claim.customer_email,phone:claim.customer_phone},
-      stripeSessionId:session.id}});
+      stripeSessionId:session.id,bookingMode}});
 }
 let llGhlDraining=false;
 async function llGhlDrain(){
@@ -4582,6 +4592,7 @@ async function llGhlDrain(){
         const consent=isLead && p.smsConsent===true;
         const id=await llGhlUpsertContact(person,{setSmsConsent:isLead,smsConsent:consent});
         await llGhlAddTag(id,isLead?LL_GHL_LEAD_TAG:LL_GHL_PAID_TAG);
+        if(!isLead && p.bookingMode==='preferred')await llGhlAddTag(id,LL_GHL_PREFERRED_TAG);
         // SMS lead recovery only if affirmatively opted in and the offer can
         // still be valid after the GoHighLevel workflow's ten-minute wait.
         if(isLead && consent && llGhlPhone(person.phone).startsWith('+1') &&
@@ -4670,6 +4681,7 @@ function llOfferPublic(claim) {
     person:claim?{name:claim.customer_name,email:claim.customer_email,phone:claim.customer_phone}:null,
     selection:claim?.appointment_date?{date:claim.appointment_date,time:claim.appointment_time,
       professionalKey:claim.provider_key,professionalName:LLTOUCH_PROFESSIONALS[claim.provider_key]?.name||null}:null,
+    bookingMode:claim?.state==='checkout' && !claim?.provider_id ? 'preferred':'suggested',
     booked:claim?.state==='confirmed', totalCents:LLTOUCH_OFFER.priceCents, depositCents:LLTOUCH_OFFER.depositCents};
 }
 // Reconcile abandoned Stripe checkouts BEFORE new claims. A checkout is NOT
@@ -4722,7 +4734,10 @@ app.get('/lltouch/offer/config',checkoutLimiter,async(_req,res)=>{
   // Public, static configuration only. No raw Vagaro secrets or customer data.
   res.json({ok:true,enabled:llOfferOpen(),title:LLTOUCH_OFFER.title,priceCents:LLTOUCH_OFFER.priceCents,
     depositCents:LLTOUCH_OFFER.depositCents,regularPriceCents:LLTOUCH_OFFER.regularPriceCents,offerLabel:LLTOUCH_OFFER.offerLabel,marketing:LLTOUCH_OFFER.marketing,holdMinutes:LLTOUCH_OFFER.holdMinutes,
-    offerEndsAt:new Date(LLTOUCH_OFFER.offerEndsAt).toISOString(),providers:LLTOUCH_OFFER.providerKeys.map(key=>({key,name:LLTOUCH_PROFESSIONALS[key].name}))});
+    offerEndsAt:new Date(LLTOUCH_OFFER.offerEndsAt).toISOString(),providers:LLTOUCH_OFFER.providerKeys.map(key=>({key,name:LLTOUCH_PROFESSIONALS[key].name})),
+    preferredBookingEnabled:LLTOUCH_PREFERRED_REQUEST_ENABLED,
+    preferredMaxDays:90,
+    preferredDurationMinutes:LLTOUCH_PREFERRED_REQUEST_ENABLED ? llOfferService().bookingDurationMinutes : null});
 });
 app.post('/lltouch/offer/hold',checkoutLimiter,async(req,res)=>{
   if(!llOfferCheckReady(res)) return;
@@ -4844,6 +4859,66 @@ app.post('/lltouch/offer/checkout',checkoutLimiter,async(req,res)=>{
     if(claim.state!=='held'||new Date(claim.hold_expires_at).getTime()<=Date.now())
       return res.status(410).json({ok:false,error:'Your temporary hold has expired. Please return to the offer.'});
     if(req.body?.accepted_terms!==true)return res.status(422).json({ok:false,error:'Please accept the deposit terms.'});
+    // Manually coordinated preference: payment is valid, but NEVER creates a
+    // Google Calendar / Vagaro booking. A staff member must confirm availability.
+    if(req.body?.booking_mode==='preferred'){
+      if(!LLTOUCH_PREFERRED_REQUEST_ENABLED)
+        return res.status(503).json({ok:false,error:'Preferred-time requests are not enabled yet.'});
+      const preferredDate=formatDateOnly(req.body?.date);
+      const preferredTime=normalizeAcademyTime(req.body?.time);
+      const requestedProvider=cleanLeadField(req.body?.professional_key,20)||'either';
+      const timeMatch=/^(\d{2}):(00|30)$/.exec(preferredTime||'');
+      const duration=Number(llOfferService().bookingDurationMinutes);
+      const dateDay=preferredDate?new Date(preferredDate+'T12:00:00Z').getUTCDay():0;
+      const startMinutes=timeMatch?Number(timeMatch[1])*60+Number(timeMatch[2]):-1;
+      const requestWindow=preferredDate&&preferredTime?
+        llTouchAppointmentWindow(preferredDate,preferredTime,duration):null;
+      const today=llTouchGeneralTodayISO();
+      if(!preferredDate||!timeMatch||![0,30].includes(Number(timeMatch[2])) ||
+        !['either',...LLTOUCH_OFFER.providerKeys].includes(requestedProvider) ||
+        dateDay===0 || preferredDate<today || preferredDate>academyAddDaysISO(today,90) ||
+        !requestWindow || requestWindow.start.getTime()<Date.now()+10*60000 ||
+        !Number.isFinite(duration)||duration<=0 || startMinutes<540 ||
+        startMinutes+duration>1080)
+        return res.status(422).json({ok:false,error:'Choose a preferred Monday–Saturday date and a time that fits between 9 AM and 6 PM (Eastern). This is a request, not a confirmed appointment.'});
+      const {data:prepared,error:prepareError}=await academySupabase.rpc('lltouch_offer_preferred_prepare',{
+        p_id:claim.id,p_campaign:LLTOUCH_OFFER.campaignKey,
+        p_date:preferredDate,p_time:preferredTime,p_provider:requestedProvider
+      });
+      if(prepareError)throw prepareError;
+      if(prepared!==true)return res.status(409).json({ok:false,error:'This offer window has ended. Please return to the offer and try again.'});
+      const ttl=Math.floor(Date.now()/1000)+1860;
+      const item=LLTOUCH_OFFER.siteItem;
+      createdSession=await stripe.checkout.sessions.create({
+        mode:'payment',payment_method_types:['card'],expires_at:ttl,
+        customer_email:claim.customer_email,
+        line_items:[{quantity:1,price_data:{currency:'usd',unit_amount:LLTOUCH_OFFER.depositCents,
+          product_data:{name:`${LLTOUCH_OFFER.title} — preferred appointment request deposit`,
+            description:`${llOfferMoney(LLTOUCH_OFFER.depositCents)} deposit toward a ${llOfferMoney(LLTOUCH_OFFER.priceCents)} session. Preferred time is NOT an appointment confirmation.`}}}],
+        metadata:{brand:'lltouch',campaign:LLTOUCH_OFFER.campaignKey,
+          offer_flow:'lltouch-offer-v2',offer_booking_mode:'preferred',offer_claim_id:claim.id,
+          offer_preferred_date:preferredDate,offer_preferred_time:preferredTime,
+          offer_preferred_provider:requestedProvider,
+          offer_price_usd:String(LLTOUCH_OFFER.priceCents/100),
+          deposit_usd:String(LLTOUCH_OFFER.depositCents/100),
+          balance_due_usd:String((LLTOUCH_OFFER.priceCents-LLTOUCH_OFFER.depositCents)/100),
+          primary_site_item:JSON.stringify(item)},
+        payment_intent_data:{metadata:{brand:'lltouch',campaign:LLTOUCH_OFFER.campaignKey,
+          offer_flow:'lltouch-offer-v2',offer_booking_mode:'preferred',offer_claim_id:claim.id}},
+        success_url:`${LLTOUCH_OFFER.origin}/offer-reserve?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url:`${LLTOUCH_OFFER.origin}/offer-reserve?cancelled=1`
+      },{idempotencyKey:`lltouch-offer-preferred-${claim.id}-${preferredDate}-${preferredTime}-${requestedProvider}`});
+      const {data:bound,error:bindError}=await academySupabase.rpc('lltouch_offer_preferred_bind_checkout',{
+        p_id:claim.id,p_campaign:LLTOUCH_OFFER.campaignKey,p_session:createdSession.id,
+        p_checkout_expiry:new Date(ttl*1000).toISOString()
+      });
+      if(bindError||bound!==true){
+        try{await stripe.checkout.sessions.expire(createdSession.id)}catch{}
+        throw bindError||new Error('The offer window expired while opening payment.');
+      }
+      return res.json({ok:true,url:createdSession.url,bookingMode:'preferred',
+        hold_until:claim.hold_expires_at});
+    }
     const key=cleanLeadField(req.body?.professional_key,20);
     const date=formatDateOnly(req.body?.date),time=normalizeAcademyTime(req.body?.time);
     if(!LLTOUCH_OFFER.providerKeys.includes(key)||!date||!time)return res.status(422).json({ok:false,error:'Choose a professional, date and time.'});
@@ -4955,6 +5030,16 @@ async function llOfferProcessPaid(session,paidAt){
     if(error)throw error;
     return;
   }
+  if(session.metadata?.offer_booking_mode==='preferred'){
+    if(!LLTOUCH_PREFERRED_REQUEST_ENABLED)
+      throw new Error('Received preferred appointment payment but the preferred feature is disabled. Staff reconciliation required.');
+    const {data:accepted,error:preferredError}=await academySupabase.rpc('lltouch_offer_preferred_paid',{
+      p_id:claim.id,p_campaign:claim.campaign_key,p_session:session.id,p_paid_at:paidAt.toISOString()
+    });
+    if(preferredError||accepted!==true)throw preferredError||new Error('Preferred deposit requires staff reconciliation.');
+    // NO llOfferConfirmPaidAppointment here: no Google event or Vagaro busy task.
+    return;
+  }
   if(marked==='confirmed'||marked==='processing')return;
   // For safety do not repeat a partially-created Google event indefinitely.
   if(marked==='review')return;
@@ -5009,11 +5094,47 @@ app.get('/lltouch/offer/receipt',checkoutLimiter,async(req,res)=>{
       const row=rows.find(b=>b.status==='confirmed' && b.id===claim.booking_id);
       if(row)booking=llTouchPublicAppointment(row);
     }
+    const bookingMode=session.metadata?.offer_booking_mode==='preferred'?'preferred':'suggested';
+    let preferred=null;
+    if(bookingMode==='preferred' && LLTOUCH_PREFERRED_REQUEST_ENABLED){
+      const {data:pref,error:prefError}=await academySupabase.from('lltouch_offer_preferred_requests')
+        .select('preferred_date,preferred_time,provider_preference,status,web3forms_sent_at')
+        .eq('claim_id',claim.id).eq('stripe_session_id',session.id).maybeSingle();
+      if(prefError)throw prefError;
+      if(pref)preferred={date:pref.preferred_date,time:pref.preferred_time,
+        providerPreference:pref.provider_preference,status:pref.status,
+        web3formsNotified:Boolean(pref.web3forms_sent_at),
+        ...(session.payment_status==='paid'?{person:{name:claim.customer_name,
+          email:claim.customer_email,phone:claim.customer_phone}}:{})};
+    }
     res.json({ok:true,paid:session.payment_status==='paid',state:claim.state,booking,
+      bookingMode,preferred,
       priceCents:Number(session.metadata.offer_price_usd||99)*100,depositCents:Number(session.metadata.deposit_usd||25)*100,
-      message:claim.state==='review'?'Payment received. Our team must verify your appointment. Do not pay again.':
+      message:bookingMode==='preferred' && session.payment_status==='paid'?
+        'Your $25 deposit is confirmed. Your preferred time is a request, NOT a confirmed appointment. LL Touch will contact you to coordinate availability.':
+        claim.state==='review'?'Payment received. Our team must verify your appointment. Do not pay again.':
         claim.state==='confirmed'?'Appointment confirmed.': 'Payment is being verified. Please do not pay again.'});
   }catch(e){console.error('Offer receipt status error:',String(e?.message||e));res.status(503).json({ok:false,error:'Payment status could not be verified. Please contact LL Touch; do not pay again.'});}
+});
+// Optional browser-side Web3Forms confirmation. Verified paid receipt required;
+// the Supabase queue remains authoritative if the customer closes the page.
+app.post('/lltouch/offer/preferred/web3forms-ack',checkoutLimiter,async(req,res)=>{
+  if(!LLTOUCH_PREFERRED_REQUEST_ENABLED)return res.status(404).json({ok:false,error:'Unavailable'});
+  const sid=cleanLeadField(req.body?.session_id,160);
+  if(!/^cs_(live|test)_[a-zA-Z0-9]+$/.test(sid))
+    return res.status(400).json({ok:false,error:'Invalid payment reference'});
+  try{
+    const session=await getStripeSessionExpanded(sid);
+    if(session.metadata?.offer_flow!=='lltouch-offer-v2' ||
+       session.metadata?.offer_booking_mode!=='preferred' || session.payment_status!=='paid')
+      return res.status(403).json({ok:false,error:'A paid preferred request is required'});
+    const {data:ack,error}=await academySupabase.rpc('lltouch_offer_preferred_ack_web3forms',{
+      p_id:session.metadata.offer_claim_id,p_session:sid
+    });
+    if(error)throw error;
+    res.json({ok:ack===true});
+  }catch(e){console.error('Preferred Web3Forms acknowledgement failed:',String(e?.message||e));
+    res.status(503).json({ok:false,error:'Could not record staff notification'});}
 });
 if(LLTOUCH_OFFER.enabled){
   setInterval(()=>{void llOfferSweepExpired()},60000);
