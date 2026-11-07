@@ -4454,6 +4454,186 @@ if(LL_META_ENABLED){
   metaStartup.unref?.();
 }
 
+
+// ============================================================================
+// LL TOUCH -> HIGHLEVEL: CRM lead capture and paid deposit status (opt-in only).
+// This feature is isolated from the Stripe / Calendar / Vagaro booking workflow.
+// Apply 05_lltouch_offer_ghl_outbox.sql before LLTOUCH_GHL_ENABLED=true.
+// Never put access tokens or the HighLevel inbound webhook URL in browser HTML.
+// ============================================================================
+const LL_GHL_ENABLED = process.env.LLTOUCH_GHL_ENABLED === 'true';
+const LL_GHL_TOKEN = String(process.env.LLTOUCH_GHL_PRIVATE_TOKEN || '').trim();
+const LL_GHL_LOCATION = String(process.env.LLTOUCH_GHL_LOCATION_ID || '').trim();
+const LL_GHL_LEAD_WEBHOOK = String(process.env.LLTOUCH_GHL_LEAD_WEBHOOK_URL || '').trim();
+const LL_GHL_SMS_FIELD_KEY = String(process.env.LLTOUCH_GHL_SMS_FIELD_KEY || 'sms_marketing_consent').trim();
+const LL_GHL_QUEUE = 'lltouch_offer_ghl_outbox';
+const LL_GHL_LEAD_TAG = 'llt-hydrafacial-lead';
+const LL_GHL_PAID_TAG = 'llt-hydrafacial-paid';
+// The opt-in copy in /offer corresponds to this audit-version identifier.
+const LL_GHL_CONSENT_VERSION = 'lltouch-offer-marketing-sms-v1-20261107';
+
+function llGhlPhone(value) {
+  const source=String(value||'').trim();
+  const digits=source.replace(/\D/g,'');
+  if(source.startsWith('+') && digits.length>=10 && digits.length<=15) return '+'+digits;
+  if(digits.length===10)return '+1'+digits;
+  if(digits.length===11 && digits.startsWith('1'))return '+'+digits;
+  // Do not guess country codes for other unprefixed numbers.
+  return '';
+}
+function llGhlNameParts(name) {
+  const parts=cleanLeadField(name,120).split(/\s+/).filter(Boolean);
+  return {firstName:parts[0]||'',lastName:parts.slice(1).join(' ')};
+}
+async function llGhlRequest(path,method,body) {
+  if(!LL_GHL_TOKEN || !LL_GHL_LOCATION)throw new Error('GHL credentials not configured');
+  const response=await fetch('https://services.leadconnectorhq.com'+path,{
+    method,headers:{'Authorization':'Bearer '+LL_GHL_TOKEN,'Version':'v3',
+      'Accept':'application/json','Content-Type':'application/json'},
+    body:JSON.stringify(body),signal:AbortSignal.timeout(10000)
+  });
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error('GHL HTTP '+response.status+' '+String(data?.message||data?.error||'').slice(0,110));
+  return data;
+}
+async function llGhlUpsertContact(person,{setSmsConsent=false,smsConsent=false}={}) {
+  const contact={locationId:LL_GHL_LOCATION,name:cleanLeadField(person.name,120),
+    email:cleanLeadField(person.email,254).toLowerCase(),source:'LL Touch /offer'};
+  const phone=llGhlPhone(person.phone);
+  if(phone)contact.phone=phone;
+  Object.assign(contact,llGhlNameParts(contact.name));
+  if(setSmsConsent){
+    if(!LL_GHL_SMS_FIELD_KEY)throw new Error('Missing GHL SMS custom-field key');
+    contact.customFields=[{key:LL_GHL_SMS_FIELD_KEY,fieldValue:smsConsent?'Yes':'No'}];
+  }
+  const result=await llGhlRequest('/contacts/upsert','POST',contact);
+  if(!result?.contact?.id)throw new Error('GHL contact upsert returned no ID');
+  return result.contact.id;
+}
+async function llGhlAddTag(id,tag) {
+  await llGhlRequest('/contacts/'+encodeURIComponent(id)+'/tags','POST',{tags:[tag]});
+}
+async function llGhlTriggerLeadWebhook(person,context) {
+  // Configured only on the Render server. Never reflect this URL to the client.
+  const url=new URL(LL_GHL_LEAD_WEBHOOK);
+  if(url.protocol!=='https:' || url.hostname!=='services.leadconnectorhq.com')
+    throw new Error('GHL lead webhook URL must be a LeadConnector HTTPS webhook');
+  const parts=llGhlNameParts(person.name);
+  const payload={...parts,first_name:parts.firstName,last_name:parts.lastName,
+    name:person.name,email:person.email,phone:llGhlPhone(person.phone)||person.phone,
+    source:'LL Touch Offer',campaign:LLTOUCH_OFFER.campaignKey,
+    event:'lead_captured',payment_status:'unpaid',
+    sms_marketing_consent:true,sms_marketing_consent_value:'Yes',
+    consent_version:LL_GHL_CONSENT_VERSION,offer_claim_id:context.claimId,
+    event_id:'lltouch-ghl-lead-'+context.claimId};
+  const response=await fetch(url.toString(),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload),signal:AbortSignal.timeout(10000)});
+  if(!response.ok)throw new Error('GHL inbound webhook HTTP '+response.status);
+}
+async function llGhlEnqueue(event) {
+  if(!LL_GHL_ENABLED)return;
+  const {error}=await academySupabase.from(LL_GHL_QUEUE).upsert({
+    event_key:event.key,event_type:event.type,claim_id:event.claimId,
+    payload:event.payload,status:'pending',next_attempt_at:new Date().toISOString()
+  },{onConflict:'event_key',ignoreDuplicates:true});
+  if(error)throw error;
+}
+async function llGhlEnqueueLead(claimId,person,smsConsent) {
+  if(!LL_GHL_ENABLED)return;
+  // Consent must be audited before any positive GHL consent is set.
+  let safeConsent=false;
+  try {
+    const {error}=await academySupabase.from('lltouch_offer_ghl_sms_consents').upsert({
+      claim_id:claimId,campaign_key:LLTOUCH_OFFER.campaignKey,
+      customer_email:person.email,customer_phone:llGhlPhone(person.phone)||person.phone,
+      consent_granted:smsConsent===true,consent_version:LL_GHL_CONSENT_VERSION,
+      source_url:LLTOUCH_OFFER.origin+'/offer'
+    },{onConflict:'claim_id',ignoreDuplicates:true});
+    if(error)throw error;
+    // A prior claim's consent choice must never be silently changed on retry.
+    const {data:record,error:readError}=await academySupabase.from('lltouch_offer_ghl_sms_consents')
+      .select('consent_granted').eq('claim_id',claimId).single();
+    if(readError || !record)throw readError||new Error('Consent evidence could not be verified');
+    safeConsent=record.consent_granted===true;
+  }catch(err){console.error('GHL consent evidence unavailable; defaulting to NO:',String(err?.message||err));}
+  await llGhlEnqueue({key:'lead:'+claimId,type:'lead',claimId,payload:{
+    person,smsConsent:safeConsent,offerEndsAt:new Date(LLTOUCH_OFFER.offerEndsAt).toISOString()
+  }});
+}
+async function llGhlEnqueuePaid(session,claim) {
+  if(!LL_GHL_ENABLED)return;
+  await llGhlEnqueue({key:'paid:'+session.id,type:'paid',claimId:claim.id,
+    payload:{person:{name:claim.customer_name,email:claim.customer_email,phone:claim.customer_phone},
+      stripeSessionId:session.id}});
+}
+let llGhlDraining=false;
+async function llGhlDrain(){
+  if(!LL_GHL_ENABLED || llGhlDraining)return;
+  llGhlDraining=true;
+  try {
+    if(!LL_GHL_TOKEN||!LL_GHL_LOCATION)throw new Error('GHL token/location not configured');
+    const {data:jobs,error}=await academySupabase.rpc('lltouch_offer_ghl_claim_batch',{p_limit:8});
+    if(error)throw error;
+    for(const job of jobs||[]){
+      try{
+        const p=job.payload||{};
+        const person=p.person||{};
+        const isLead=job.event_type==='lead';
+        const consent=isLead && p.smsConsent===true;
+        const id=await llGhlUpsertContact(person,{setSmsConsent:isLead,smsConsent:consent});
+        await llGhlAddTag(id,isLead?LL_GHL_LEAD_TAG:LL_GHL_PAID_TAG);
+        // SMS lead recovery only if affirmatively opted in and the offer can
+        // still be valid after the GoHighLevel workflow's ten-minute wait.
+        if(isLead && consent && llGhlPhone(person.phone).startsWith('+1') &&
+          Date.now()+10*60000 < new Date(p.offerEndsAt).getTime()){
+          await llGhlTriggerLeadWebhook(person,{claimId:job.claim_id});
+        }
+        const {error:doneErr}=await academySupabase.from(LL_GHL_QUEUE).update({
+          status:'sent',sent_at:new Date().toISOString(),lease_expires_at:null,
+          last_error:null,updated_at:new Date().toISOString()
+        }).eq('event_key',job.event_key).eq('status','sending');
+        if(doneErr)throw doneErr;
+      }catch(err){
+        const attempts=Number(job.attempts)||1;
+        const retrySeconds=Math.min(3600,20*2**Math.min(attempts,7));
+        const {error:updateErr}=await academySupabase.from(LL_GHL_QUEUE).update({
+          status:attempts>=12?'failed':'pending',
+          next_attempt_at:new Date(Date.now()+retrySeconds*1000).toISOString(),
+          lease_expires_at:null,last_error:String(err?.message||err).slice(0,180),
+          updated_at:new Date().toISOString()
+        }).eq('event_key',job.event_key).eq('status','sending');
+        if(updateErr)console.error('GHL outbox retry state error',String(updateErr.message));
+        console.error('GHL sync retry queued',job.event_type,job.event_key.slice(0,45));
+      }
+    }
+  }catch(err){console.error('GHL background sync unavailable:',String(err?.message||err));}
+  finally{llGhlDraining=false;}
+}
+async function llGhlReconcilePaid(){
+  if(!LL_GHL_ENABLED)return;
+  // Rebuild missing paid-tag jobs after any temporary Supabase/outbox outage.
+  // This is intentionally limited to the current campaign and to paid claims.
+  try{
+    const {data,error}=await academySupabase.from('lltouch_offer_claims')
+      .select('id,customer_name,customer_email,customer_phone,stripe_session_id,paid_at')
+      .eq('campaign_key',LLTOUCH_OFFER.campaignKey).not('paid_at','is',null)
+      .not('stripe_session_id','is',null).order('paid_at',{ascending:false}).limit(100);
+    if(error)throw error;
+    for(const claim of data||[]){
+      if(!/^cs_(test|live)_[A-Za-z0-9]+$/.test(claim.stripe_session_id))continue;
+      await llGhlEnqueuePaid({id:claim.stripe_session_id},claim);
+    }
+  }catch(e){console.error('GHL paid-tag reconciliation unavailable:',String(e?.message||e));}
+}
+if(LL_GHL_ENABLED){
+  if(!LL_GHL_TOKEN || !LL_GHL_LOCATION || !LL_GHL_LEAD_WEBHOOK)
+    console.warn('GHL enabled but some Render credentials are missing. Keep workflow unpublished.');
+  const ghlTimer=setInterval(()=>{void llGhlDrain();},15000);ghlTimer.unref?.();
+  const ghlRecon=setInterval(()=>{void llGhlReconcilePaid();},120000);ghlRecon.unref?.();
+  const ghlStart=setTimeout(()=>{void llGhlReconcilePaid().then(llGhlDrain);},5000);ghlStart.unref?.();
+}
+// ============================================================================
+
 const LL_OFFER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const llOfferMoney = cents => `$${(cents/100).toFixed(2)}`;
 function llOfferService() {
@@ -4569,6 +4749,11 @@ app.post('/lltouch/offer/hold',checkoutLimiter,async(req,res)=>{
       await llMetaEnqueueLead(result.claim_id,nonce,{name,email,phone,meta:req.body?.meta},req);
       void llMetaFlush();
     }catch(metaError){console.error('LL Touch Meta lead queue unavailable:',String(metaError?.message||metaError));}
+    // CRM leads are queued durably; no CRM outage may block an existing reservation.
+    try{
+      await llGhlEnqueueLead(result.claim_id,{name,email,phone},req.body?.sms_marketing_consent===true);
+      void llGhlDrain();
+    }catch(ghlError){console.error('LL Touch GHL lead enqueue failed:',String(ghlError?.message||ghlError));}
     res.json({ok:true,hold_id:result.claim_id,deadline:result.deadline,holdMinutes:LLTOUCH_OFFER.holdMinutes});
   }catch(error){console.error('Offer hold creation failed:',String(error?.message||error));res.status(503).json({ok:false,error:'The temporary hold could not be created. Please retry.'});}
 });
@@ -4752,6 +4937,10 @@ async function llOfferProcessPaid(session,paidAt){
     p_id:claim.id,p_campaign:claim.campaign_key,p_session:session.id,p_paid_at:paidAt.toISOString()
   });
   if(markError)throw markError;
+  // Inform GHL of a REAL paid deposit from server-verified Stripe data.
+  // This is separate from booking, so failures never create double bookings.
+  try{await llGhlEnqueuePaid(session,claim);void llGhlDrain();}
+  catch(ghlError){console.error('LL Touch GHL paid-tag enqueue failed:',String(ghlError?.message||ghlError));}
   // Purchase means funds captured, even if a booking later requires staff review.
   // Stripe session ID is the stable deduplication key on webhook and receipt retries.
   if(marked!=='missing' && marked!=='invalid' && marked!=='late'){
