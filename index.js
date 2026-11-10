@@ -4943,9 +4943,105 @@ app.get('/lltouch/campaigns/public-config', checkoutLimiter, async (_req, res) =
   }
 });
 
+// ============================================================================
+// LL TOUCH CAMPAIGN MANAGER — ETAPA 02B-1: PRIVATE HERO URL EDITOR
+// READ / UPDATE ONLY. Does not switch checkout, prices or booking modes.
+// Basic HTTP auth is used over Render HTTPS; credentials are environment-only.
+// Never embed this private panel inside Webflow or expose a Supabase service key.
+// ============================================================================
+const LL_CM_ADMIN_HTML = "<!doctype html>\n<html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>LL Touch · Campaign Manager</title>\n<style>\n:root{--ivory:#f8f5f0;--espresso:#4e301f;--gold:#b99a6b;--ink:#27211d;--line:#e2d8cb}\n*{box-sizing:border-box}body{margin:0;background:var(--ivory);color:var(--ink);font:14px/1.55 system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}\nmain{max-width:1140px;margin:auto;padding:40px 24px 90px}h1,h2{font-family:Georgia,'Times New Roman',serif;font-weight:400;color:var(--espresso);line-height:1.13}h1{font-size:clamp(30px,4vw,48px);margin:6px 0 10px}h2{font-size:25px;margin:0 0 16px}.eyebrow{letter-spacing:.18em;text-transform:uppercase;font-size:11px;color:var(--gold);font-weight:650}\n.muted{color:#675d54}.intro{max-width:700px;margin:0 0 30px}.panel{border:1px solid var(--line);background:#fffdfa;padding:25px;border-radius:8px;margin:0 0 22px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:28px}.field{margin:15px 0}label{display:block;font-size:12px;letter-spacing:.05em;color:#655748;font-weight:700;margin-bottom:7px}input,select{display:block;width:100%;padding:13px 14px;border:1px solid #cfc1b1;border-radius:4px;color:var(--ink);background:#fff;font:inherit}input:focus,select:focus{outline:2px solid var(--gold);outline-offset:2px}.controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap}button{background:var(--espresso);color:white;border:1px solid var(--espresso);border-radius:4px;padding:13px 20px;font:650 12px system-ui;letter-spacing:.05em;cursor:pointer}button:disabled{opacity:.48;cursor:not-allowed}.secondary{background:transparent;color:var(--espresso)}.status{padding:12px 14px;border-left:3px solid var(--gold);background:#f5f0e8;margin:18px 0;min-height:42px}.status.error{border-color:#b45545;color:#823a2e}.previews{display:flex;align-items:start;gap:18px}.preview{background:#e1d6c6;border:1px solid var(--line);width:100%;overflow:hidden;position:relative;border-radius:4px;display:grid;place-items:center}.preview img{width:100%;height:100%;object-fit:cover;display:none}.preview span{position:absolute;color:#665b52;font-size:12px;text-align:center;padding:10px}.wide{aspect-ratio:16/9}.narrow{aspect-ratio:4/5;max-width:180px}.preview-label{font-size:11px;text-transform:uppercase;letter-spacing:.09em;margin:10px 0;color:#766553}.chip{padding:5px 9px;border:1px solid var(--line);border-radius:100px;font-size:11px;color:var(--espresso)}\n@media(max-width:720px){main{padding:26px 16px 70px}.grid{grid-template-columns:1fr}.panel{padding:18px}.previews{flex-wrap:wrap}.preview-container{width:100%}.narrow{max-width:210px}}\n</style></head><body><main>\n<div class=\"eyebrow\">LL Touch Advanced Aesthetics / Private console</div><h1>Campaign Manager</h1>\n<p class=\"muted intro\">Atualize as URLs da capa da página /offer. A imagem desktop usa proporção 16:9; tablet e celular usam 4:5. Esta tela <strong>não publica</strong> campanhas nem modifica pagamentos.</p>\n<div class=\"panel\">\n  <div class=\"eyebrow\">01 · Escolher campanha</div>\n  <div class=\"field\"><label for=\"campaign\">Campanha cadastrada</label><select id=\"campaign\" aria-label=\"Campanha\"><option>Carregando…</option></select></div>\n  <div class=\"controls\"><span id=\"version\" class=\"chip\">—</span><span id=\"campaign-status\" class=\"chip\">—</span><button type=\"button\" id=\"refresh\" class=\"secondary\">Atualizar lista</button></div>\n</div>\n<div class=\"panel\"><div class=\"eyebrow\">02 · Imagens da capa</div><h2>Hero images</h2>\n  <div class=\"grid\"><div>\n    <div class=\"field\"><label for=\"desktop\">URL da capa desktop · 16:9</label><input type=\"url\" id=\"desktop\" placeholder=\"https://...\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"2048\"></div>\n    <div class=\"field\"><label for=\"mobile\">URL da capa mobile + tablet · 4:5</label><input type=\"url\" id=\"mobile\" placeholder=\"https://...\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"2048\"></div>\n    <p class=\"muted\">Use uma imagem HTTPS pública, preferencialmente hospedada no Webflow CDN. O campo mobile também será utilizado no tablet.</p>\n    <div class=\"controls\"><button type=\"button\" id=\"save\" disabled>Salvar URLs no Supabase</button><button type=\"button\" class=\"secondary\" id=\"revert\">Descartar mudanças</button></div>\n    <div id=\"message\" class=\"status\" role=\"status\" aria-live=\"polite\">Selecione uma campanha para começar.</div>\n  </div><div>\n    <div class=\"previews\"><div class=\"preview-container\" style=\"flex:1\"><div class=\"preview wide\"><img id=\"preview-desktop\" alt=\"Capa desktop\"><span id=\"place-desktop\">Prévia desktop</span></div><div class=\"preview-label\">Desktop · 16:9</div></div><div class=\"preview-container\" style=\"width:38%;max-width:180px\"><div class=\"preview narrow\"><img id=\"preview-mobile\" alt=\"Capa mobile\"><span id=\"place-mobile\">Prévia mobile</span></div><div class=\"preview-label\">Tablet / Mobile · 4:5</div></div></div>\n  </div></div>\n</div>\n<p class=\"muted\">A pré-visualização é local. Somente clicar em “Salvar URLs” registra a edição. Para exibir a nova capa ao público, a campanha deve estar publicada e corresponder exatamente à oferta ativa no backend.</p>\n</main><script nonce=\"__NONCE__\">\n(()=>{'use strict';\nconst $=id=>document.getElementById(id);let rows=[], selected=null;\nconst msg=(s,error=false)=>{const el=$('message');el.textContent=s;el.classList.toggle('error',Boolean(error));};\nconst checkUrl=value=>{try{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&value.length<=2048&&!/[\\s<>\"']/u.test(value)}catch{return false}};\nfunction imagePreview(id,placeholder,url){const i=$(id),p=$(placeholder);i.style.display='none';p.style.display='';if(!checkUrl(url))return;i.onload=()=>{i.style.display='block';p.style.display='none'};i.onerror=()=>{i.style.display='none';p.textContent='Não foi possível carregar esta imagem';p.style.display=''};i.src=url;}\nfunction previews(){imagePreview('preview-desktop','place-desktop',$('desktop').value.trim());imagePreview('preview-mobile','place-mobile',$('mobile').value.trim());}\nfunction selectedRow(){return rows.find(r=>r.campaignKey===$('campaign').value)}\nfunction show(){selected=selectedRow();$('desktop').value=selected?.desktopUrl||'';$('mobile').value=selected?.mobileUrl||'';$('version').textContent='Versão '+(selected?.version||'—');$('campaign-status').textContent='Status '+(selected?.status||'—');$('save').disabled=!selected;msg(selected?'Imagens carregadas. Nenhuma edição aplicada ainda.':'Nenhuma campanha encontrada.');previews();}\nasync function request(path, opts={}){const r=await fetch(path,{credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const d=await r.json().catch(()=>({}));if(!r.ok||!d.ok)throw new Error(d.error||('HTTP '+r.status));return d;}\nasync function load(keep){$('save').disabled=true;msg('Lendo campanhas…');try{const d=await request('/lltouch/campaigns/admin/api/campaigns');rows=d.campaigns||[];const sel=$('campaign');sel.replaceChildren();for(const r of rows){const opt=document.createElement('option');opt.value=r.campaignKey;opt.textContent=r.internalName+' ('+r.status+')';sel.append(opt);}if(keep&&rows.some(r=>r.campaignKey===keep))sel.value=keep;show();}catch(e){msg('Não foi possível carregar as campanhas: '+e.message,true)}}\nasync function save(){const c=selectedRow();if(!c)return;const desktopUrl=$('desktop').value.trim(),mobileUrl=$('mobile').value.trim();if(!checkUrl(desktopUrl)||!checkUrl(mobileUrl))return msg('Insira duas URLs HTTPS válidas, sem espaços e com no máximo 2048 caracteres.',true);$('save').disabled=true;msg('Salvando as URLs…');try{const d=await request('/lltouch/campaigns/admin/api/campaigns/'+encodeURIComponent(c.campaignKey)+'/hero',{method:'PUT',body:JSON.stringify({expectedVersion:c.version,desktopUrl,mobileUrl})});await load(c.campaignKey);msg('URLs salvas. Nova versão '+d.version+'. Nenhum checkout foi alterado.');}catch(e){msg('Falha ao salvar: '+e.message+'. Atualize a lista caso outra pessoa tenha modificado a campanha.',true);}finally{$('save').disabled=false;}}\n$('desktop').addEventListener('input',previews);$('mobile').addEventListener('input',previews);$('campaign').addEventListener('change',show);$('refresh').addEventListener('click',()=>load($('campaign').value));$('revert').addEventListener('click',show);$('save').addEventListener('click',save);load();\n})();\n</script></body></html>";
+const LL_CM_ADMIN_LIMITER = rateLimit({windowMs:15*60*1000,max:40,
+  standardHeaders:'draft-7',legacyHeaders:false});
+function llCmAdminAuth(req,res,next){
+  res.set('Cache-Control','no-store');
+  res.set('X-Robots-Tag','noindex, nofollow');
+  const user=String(process.env.LLTOUCH_CM_ADMIN_USER||'').trim();
+  const password=String(process.env.LLTOUCH_CM_ADMIN_PASSWORD||'');
+  if(!process.env.SUPABASE_SERVICE_ROLE_KEY || !user || password.length<20)
+    return res.status(503).json({ok:false,error:'Private campaign editor is not configured in Render.'});
+  const auth=String(req.get('authorization')||'');
+  const encoded=auth.startsWith('Basic ')?auth.slice(6):'';
+  if(encoded.length>1400)return res.status(401).json({ok:false,error:'Access denied'});
+  let decoded='';
+  try{decoded=Buffer.from(encoded,'base64').toString('utf8')}catch{}
+  const delimiter=decoded.indexOf(':');
+  const candidateUser=delimiter>=0?decoded.slice(0,delimiter):'';
+  const candidatePass=delimiter>=0?decoded.slice(delimiter+1):'';
+  const digest=value=>crypto.createHash('sha256').update(value).digest();
+  const same=(a,b)=>crypto.timingSafeEqual(digest(a),digest(b));
+  if(!same(candidateUser,user) || !same(candidatePass,password)){
+    res.set('WWW-Authenticate','Basic realm="LL Touch Campaign Manager", charset="UTF-8"');
+    return res.status(401).send('Authentication required.');
+  }
+  next();
+}
+function llCmValidImageUrl(value){
+  if(typeof value!=='string'||value.length>2048||!/^https:\/\//i.test(value)||/[\s<>"']/.test(value))return false;
+  try{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&Boolean(u.hostname)}catch{return false}
+}
+function llCmAdminSameOrigin(req){
+  const origin=String(req.get('origin')||'');
+  if(!origin) return true; // non-browser API requests still require Basic credentials
+  try{const u=new URL(origin);return u.protocol==='https:' && u.host===req.get('host')}
+  catch{return false}
+}
+app.get('/lltouch/campaigns/admin',LL_CM_ADMIN_LIMITER,llCmAdminAuth,(req,res)=>{
+  const nonce=crypto.randomBytes(18).toString('base64');
+  res.set('Content-Security-Policy',`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`);
+  res.set('Referrer-Policy','no-referrer');
+  res.type('html').send(LL_CM_ADMIN_HTML.replace('__NONCE__',nonce));
+});
+app.get('/lltouch/campaigns/admin/api/campaigns',LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  try{
+    const {data:campaigns,error}=await academySupabase.from('lltouch_campaigns')
+      .select('id,campaign_key,internal_name,status,version,service_title,offer_starts_at,offer_ends_at')
+      .order('created_at',{ascending:false}).limit(100);
+    if(error)throw error;
+    const {data:assets,error:assetError}=await academySupabase.from('lltouch_campaign_assets')
+      .select('campaign_id,asset_type,device,position,image_url')
+      .eq('asset_type','hero').eq('position',0);
+    if(assetError)throw assetError;
+    res.json({ok:true,campaigns:(campaigns||[]).map(c=>{
+      const hero=(assets||[]).filter(a=>a.campaign_id===c.id);
+      const image=device=>hero.find(a=>a.device===device)?.image_url||'';
+      return {campaignKey:c.campaign_key,internalName:c.internal_name,status:c.status,
+        version:c.version,serviceTitle:c.service_title,
+        offerStartsAt:c.offer_starts_at,offerEndsAt:c.offer_ends_at,
+        desktopUrl:image('desktop'),mobileUrl:image('mobile')||image('tablet')};
+    })});
+  }catch(e){console.error('Campaign editor list failed:',String(e?.message||e));
+    res.status(503).json({ok:false,error:'Campaign listing unavailable.'});}
+});
+app.put('/lltouch/campaigns/admin/api/campaigns/:key/hero',LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  if(!llCmAdminSameOrigin(req))return res.status(403).json({ok:false,error:'Cross-origin write refused.'});
+  const key=String(req.params?.key||'').trim();
+  const {expectedVersion,desktopUrl,mobileUrl}=req.body||{};
+  if(!/^[a-z0-9][a-z0-9-]{3,95}$/.test(key)||!Number.isSafeInteger(expectedVersion)||
+     expectedVersion<1||!llCmValidImageUrl(desktopUrl)||!llCmValidImageUrl(mobileUrl))
+    return res.status(422).json({ok:false,error:'Invalid campaign, version or HTTPS image URLs.'});
+  try{
+    const {data,error}=await academySupabase.rpc('lltouch_cm_update_hero_urls',{
+      p_campaign_key:key,p_expected_version:expectedVersion,
+      p_desktop_url:desktopUrl,p_mobile_url:mobileUrl
+    });
+    if(error){
+      if(/VERSION_CONFLICT/i.test(error.message||''))return res.status(409).json({ok:false,error:'Campaign changed in another session. Reload before saving.'});
+      if(/NOT_FOUND/i.test(error.message||''))return res.status(404).json({ok:false,error:'Campaign not found.'});
+      if(/ARCHIVED/i.test(error.message||''))return res.status(409).json({ok:false,error:'Archived campaigns cannot be modified.'});
+      if(/INVALID_HERO_URL/i.test(error.message||''))return res.status(422).json({ok:false,error:'Please check both image URLs.'});
+      throw error;
+    }
+    const row=Array.isArray(data)?data[0]:data;
+    if(!row?.new_version)throw new Error('Missing new campaign version');
+    res.json({ok:true,campaignKey:key,version:row.new_version});
+  }catch(e){console.error('Campaign hero URL update failed:',String(e?.message||e));
+    res.status(503).json({ok:false,error:'Could not save hero URLs. Check migration 11 and Supabase permissions.'});}
+});
+// ============================================================================
+
 app.get('/lltouch/offer/config',checkoutLimiter,async(_req,res)=>{
   // Public, static configuration only. No raw Vagaro secrets or customer data.
-  res.json({ok:true,enabled:llOfferOpen(),title:LLTOUCH_OFFER.title,priceCents:LLTOUCH_OFFER.priceCents,
+  res.json({ok:true,enabled:llOfferOpen(),campaignKey:LLTOUCH_OFFER.campaignKey,title:LLTOUCH_OFFER.title,priceCents:LLTOUCH_OFFER.priceCents,
     depositCents:LLTOUCH_OFFER.depositCents,regularPriceCents:LLTOUCH_OFFER.regularPriceCents,offerLabel:LLTOUCH_OFFER.offerLabel,marketing:LLTOUCH_OFFER.marketing,holdMinutes:LLTOUCH_OFFER.holdMinutes,
     offerEndsAt:new Date(LLTOUCH_OFFER.offerEndsAt).toISOString(),providers:LLTOUCH_OFFER.providerKeys.map(key=>({key,name:LLTOUCH_PROFESSIONALS[key].name})),
     preferredBookingEnabled:LLTOUCH_PREFERRED_REQUEST_ENABLED,
