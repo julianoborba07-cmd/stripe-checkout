@@ -4337,6 +4337,202 @@ const LLTOUCH_OFFER = Object.freeze({
   origin: 'https://lltouch.com',
   providerKeys: ['ludimilla','carol']
 });
+// ============================================================================
+// LL TOUCH CAMPAIGN MANAGER — STAGE 02A — READ-ONLY / SINGLE FILE
+// All helpers are embedded in this index.js; no additional JS module needed.
+// Legacy /offer and /offer-reserve remain untouched, including Stripe,
+// Google Calendar, Vagaro, Web3Forms, Meta CAPI and GoHighLevel workflows.
+// ============================================================================
+const llTouchCampaignManager = (() => {
+// LL Touch Campaign Manager — Etapa 02A
+// Read-only, published-only campaign resolver. No payments, holds, or booking mutations.
+// Node.js >=18, ECMAScript module. Intended for import by the existing index.js.
+
+const KEY_RE = /^[a-z0-9][a-z0-9-]{3,95}$/;
+const VALID_TYPES = new Set(['laser', 'facial', 'med-spa', 'morpheus', 'full-body', 'membership']);
+const VALID_DEVICES = new Set(['all', 'desktop', 'tablet', 'mobile']);
+const VALID_ASSETS = new Set(['hero', 'logo', 'treatment', 'benefit', 'gallery', 'other']);
+
+function assertCondition(value, message) {
+  if (!value) throw new Error(`LL Touch campaign invalid: ${message}`);
+}
+function finiteInt(value, min, max) {
+  return Number.isSafeInteger(value) && value >= min && value <= max;
+}
+function isoMs(value) {
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : NaN;
+}
+function isHttpsUrl(value) {
+  try {
+    const u = new URL(value);
+    return u.protocol === 'https:' && !u.username && !u.password && u.hostname.length > 0;
+  } catch { return false; }
+}
+function sanitizedText(value, max = 900) {
+  return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+function moneyText(cents) { return `$${(cents / 100).toFixed(2)}`; }
+
+function validateCampaignRecord(row, { resolveService, providers }) {
+  assertCondition(row && typeof row === 'object', 'missing row');
+  assertCondition(row.status === 'published', 'only published campaigns may be served');
+  assertCondition(KEY_RE.test(row.campaign_key), 'invalid campaign key');
+  assertCondition(typeof row.id === 'string' && row.id.length > 0, 'missing campaign id');
+  assertCondition(finiteInt(row.version, 1, 1000000), 'version');
+  assertCondition(sanitizedText(row.service_title, 160).length > 0, 'service title');
+  assertCondition(row.currency === 'usd', 'currency');
+  assertCondition(finiteInt(row.price_cents, 1, 100000000), 'promotional price');
+  assertCondition(finiteInt(row.regular_price_cents, 1, 100000000), 'regular price');
+  assertCondition(finiteInt(row.deposit_cents, 0, row.price_cents), 'deposit');
+  assertCondition(finiteInt(row.hold_minutes, 1, 120), 'hold minutes');
+  assertCondition(finiteInt(row.treatment_duration_min, 5, 480), 'duration');
+  const startsAt = isoMs(row.offer_starts_at);
+  const endsAt = isoMs(row.offer_ends_at);
+  assertCondition(Number.isFinite(startsAt) && Number.isFinite(endsAt) && startsAt < endsAt, 'offer window');
+  assertCondition(row.timezone === 'America/New_York', 'unsupported time zone');
+  assertCondition(row.site_item && typeof row.site_item === 'object' && !Array.isArray(row.site_item), 'site_item');
+  assertCondition(VALID_TYPES.has(row.site_item.type), 'unknown site item type');
+  const service = resolveService(row.site_item);
+  assertCondition(service && service.serviceId && !service.unsupportedAddOn, 'Vagaro mapping is unavailable');
+  assertCondition(Number(service.bookingDurationMinutes) === Number(row.treatment_duration_min),
+    'configured duration differs from the Vagaro service mapping');
+  assertCondition(Array.isArray(row.provider_keys) && row.provider_keys.length > 0, 'provider list');
+  const unique = [...new Set(row.provider_keys)];
+  assertCondition(unique.length === row.provider_keys.length, 'duplicate provider keys');
+  for (const key of unique) {
+    assertCondition(providers[key]?.name && providers[key]?.providerId && providers[key]?.calendarId,
+      `provider ${key} lacks Vagaro or Google Calendar configuration`);
+  }
+  assertCondition(row.marketing && typeof row.marketing === 'object' && !Array.isArray(row.marketing), 'marketing');
+  assertCondition(row.preferred_booking_enabled === false || row.preferred_booking_enabled === true, 'preferred_booking_enabled');
+  assertCondition(finiteInt(row.preferred_max_days, 1, 365), 'preferred_max_days');
+  const formatHour = t => /^\d\d:\d\d(?::\d\d)?$/.test(String(t || ''));
+  assertCondition(formatHour(row.preferred_start_time) && formatHour(row.preferred_end_time), 'preferred hour format');
+  assertCondition(String(row.preferred_start_time) < String(row.preferred_end_time), 'preferred hour order');
+  return { campaignId: row.id, campaignKey: row.campaign_key, version: row.version,
+    title: sanitizedText(row.service_title, 160), status: row.status, currency: 'usd',
+    priceCents: row.price_cents, depositCents: row.deposit_cents,
+    regularPriceCents: row.regular_price_cents, holdMinutes: row.hold_minutes,
+    treatmentDurationMinutes: row.treatment_duration_min,
+    offerStartsAt: row.offer_starts_at, offerEndsAt: row.offer_ends_at,
+    timezone: row.timezone, offerLabel: sanitizedText(row.offer_label, 160),
+    siteItem: structuredClone(row.site_item), marketing: structuredClone(row.marketing),
+    providerKeys: unique, preferredBookingEnabled: row.preferred_booking_enabled,
+    preferredMaxDays: row.preferred_max_days,
+    preferredStartTime: String(row.preferred_start_time).slice(0, 5),
+    preferredEndTime: String(row.preferred_end_time).slice(0, 5) };
+}
+
+function normalizeAssets(rows) {
+  const assets = {};
+  for (const item of rows || []) {
+    if (!VALID_ASSETS.has(item.asset_type) || !VALID_DEVICES.has(item.device) || !isHttpsUrl(item.image_url)) continue;
+    const key = item.asset_type;
+    assets[key] ??= {};
+    assets[key][item.device] ??= [];
+    assets[key][item.device].push({url: item.image_url, alt: sanitizedText(item.alt_text, 160),
+      position: Number.isSafeInteger(item.position) ? item.position : 0});
+  }
+  for (const byDevice of Object.values(assets)) {
+    for (const key of Object.keys(byDevice)) {
+      byDevice[key].sort((a, b) => a.position - b.position);
+    }
+  }
+  return assets;
+}
+
+function publicCampaignConfig(campaign, providers, nowMs = Date.now()) {
+  if (!campaign) return {ok: true, enabled: false, campaignKey: null};
+  const started = isoMs(campaign.offerStartsAt) <= nowMs;
+  const notEnded = nowMs < isoMs(campaign.offerEndsAt);
+  const m = campaign.marketing || {};
+  return {
+    ok: true, enabled: started && notEnded, campaignKey: campaign.campaignKey,
+    title: campaign.title, priceCents: campaign.priceCents, depositCents: campaign.depositCents,
+    regularPriceCents: campaign.regularPriceCents, offerLabel: campaign.offerLabel,
+    holdMinutes: campaign.holdMinutes, offerEndsAt: campaign.offerEndsAt,
+    marketing: {headline: sanitizedText(m.headline, 200), headlineEm: sanitizedText(m.headlineEm, 200),
+      description: sanitizedText(m.description, 1500), featureIntro: sanitizedText(m.featureIntro, 1500),
+      features: Array.isArray(m.features) ? m.features.slice(0, 10).map(f => ({
+        title: sanitizedText(f.title, 140), description: sanitizedText(f.description, 500)})) : [],
+      heroImageUrl: campaign.assets?.hero?.desktop?.[0]?.url || ''},
+    assets: campaign.assets || {},
+    providers: campaign.providerKeys.map(key => ({key, name: providers[key].name})),
+    preferredBookingEnabled: campaign.preferredBookingEnabled,
+    preferredMaxDays: campaign.preferredMaxDays,
+    preferredDurationMinutes: campaign.preferredBookingEnabled ? campaign.treatmentDurationMinutes : null,
+    preferredStartTime: campaign.preferredStartTime,
+    preferredEndTime: campaign.preferredEndTime,
+    note: 'This endpoint is read-only. Booking and checkout remain on the existing legacy flow in Stage 2A.'
+  };
+}
+
+function immutableOfferSnapshot(campaign, bookingMode, claimId) {
+  assertCondition(campaign && KEY_RE.test(campaign.campaignKey), 'cannot snapshot missing campaign');
+  assertCondition(['suggested','preferred'].includes(bookingMode), 'booking mode');
+  assertCondition(/^[a-f0-9-]{36}$/i.test(String(claimId || '')), 'claim UUID');
+  // Pure helper: future Stage 2B writes this through a server-side transaction.
+  // This function makes NO database changes in Stage 2A.
+  return {
+    claim_id: claimId, campaign_id: campaign.campaignId,
+    campaign_key: campaign.campaignKey, campaign_version: campaign.version,
+    service_title: campaign.title, currency: campaign.currency,
+    price_cents: campaign.priceCents, deposit_cents: campaign.depositCents,
+    booking_mode: bookingMode,
+    offer_snapshot: {
+      campaignKey: campaign.campaignKey, version: campaign.version,
+      title: campaign.title, currency: campaign.currency,
+      regularPriceCents: campaign.regularPriceCents,
+      priceCents: campaign.priceCents, depositCents: campaign.depositCents,
+      holdMinutes: campaign.holdMinutes, treatmentDurationMinutes: campaign.treatmentDurationMinutes,
+      preferredBookingEnabled: campaign.preferredBookingEnabled,
+      preferredMaxDays: campaign.preferredMaxDays, preferredStartTime: campaign.preferredStartTime,
+      preferredEndTime: campaign.preferredEndTime, providerKeys: [...campaign.providerKeys],
+      siteItem: structuredClone(campaign.siteItem), timezone: campaign.timezone,
+      offerStartsAt: campaign.offerStartsAt, offerEndsAt: campaign.offerEndsAt,
+      offerLabel: campaign.offerLabel, marketing: structuredClone(campaign.marketing),
+      assets: structuredClone(campaign.assets || {})
+    }
+  };
+}
+
+function createCampaignManager({ supabase, providers, resolveService }) {
+  assertCondition(supabase && typeof supabase.from === 'function', 'Supabase client missing');
+  assertCondition(providers && typeof providers === 'object', 'providers registry missing');
+  assertCondition(typeof resolveService === 'function', 'service resolver missing');
+  return {
+    async getPublishedCampaign() {
+      // No caches: publishing or pausing a campaign is reflected immediately.
+      // Only published records can ever reach this public reader.
+      const {data:rows, error} = await supabase.from('lltouch_campaigns')
+        .select('id,campaign_key,version,status,service_title,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,treatment_duration_min,preferred_booking_enabled,preferred_max_days,preferred_start_time,preferred_end_time,provider_keys,offer_starts_at,offer_ends_at,timezone,offer_label,site_item,marketing')
+        .eq('status','published').limit(2);
+      if (error) throw new Error(`Campaign DB read failure: ${error.message}`);
+      if (!Array.isArray(rows) || rows.length === 0) return null;
+      assertCondition(rows.length === 1, 'multiple published campaigns');
+      const campaign = validateCampaignRecord(rows[0], {resolveService, providers});
+      const {data:assets, error:assetError} = await supabase.from('lltouch_campaign_assets')
+        .select('asset_type,device,position,image_url,alt_text')
+        .eq('campaign_id', campaign.campaignId).order('position', {ascending: true});
+      if (assetError) throw new Error(`Campaign media read failure: ${assetError.message}`);
+      campaign.assets = normalizeAssets(assets);
+      return campaign;
+    },
+    async getPublicConfig() {
+      const campaign = await this.getPublishedCampaign();
+      return publicCampaignConfig(campaign, providers);
+    }
+  };
+}
+
+  return createCampaignManager({
+    supabase: academySupabase,
+    providers: LLTOUCH_PROFESSIONALS,
+    resolveService: resolveVagaroServiceFromSiteItem
+  });
+})();
+
 // ==============================
 // LL TOUCH META CONVERSIONS API (ISOLATED /offer FUNNEL)
 // The outbox is durable; a Meta outage must NEVER interfere with booking/payment.
@@ -4730,6 +4926,23 @@ async function llOfferSweepExpired() {
   } catch(e) {console.error('Offer checkout sweep failed:',String(e?.message||e));}
   finally{llOfferSweeping=false;}
 }
+// LL Touch Campaign Manager / Stage 02A (read-only, published campaigns only).
+// This endpoint does not enable the public /offer checkout or change prices.
+app.get('/lltouch/campaigns/public-config', checkoutLimiter, async (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.set('X-Robots-Tag', 'noindex, nofollow');
+  try {
+    return res.json(await llTouchCampaignManager.getPublicConfig());
+  } catch (error) {
+    console.error('LL Touch campaign shadow read failed:', String(error?.message || error));
+    return res.status(503).json({
+      ok: false,
+      enabled: false,
+      error: 'Campaign configuration could not be safely verified.'
+    });
+  }
+});
+
 app.get('/lltouch/offer/config',checkoutLimiter,async(_req,res)=>{
   // Public, static configuration only. No raw Vagaro secrets or customer data.
   res.json({ok:true,enabled:llOfferOpen(),title:LLTOUCH_OFFER.title,priceCents:LLTOUCH_OFFER.priceCents,
