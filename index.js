@@ -4928,6 +4928,70 @@ async function llOfferSweepExpired() {
 }
 // LL Touch Campaign Manager / Stage 02A (read-only, published campaigns only).
 // This endpoint does not enable the public /offer checkout or change prices.
+
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | UNIVERSAL PAGE CONTRACT V1 | STAGE 03A
+// READ ONLY. Never enables payment or calendar booking by itself.
+// A campaign must be published and inside its Massachusetts validity window.
+// The independent legacy /lltouch/offer/* flow is deliberately NOT modified.
+// ============================================================================
+app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
+  res.set('Cache-Control','no-store, max-age=0');
+  res.set('X-Robots-Tag','noindex, nofollow');
+  const unavailable = {ok:true,enabled:false,campaignKey:null,bookingReady:false,offer:null};
+  try {
+    const {data:rows,error}=await academySupabase.from('lltouch_campaigns')
+      .select('id,campaign_key,version,status,service_title,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
+      .eq('status','published').limit(2);
+    if(error)throw error;
+    if(!rows?.length)return res.json(unavailable);
+    if(rows.length!==1)throw new Error('More than one campaign published');
+    const c=rows[0],now=Date.now();
+    const start=Date.parse(c.offer_starts_at),end=Date.parse(c.offer_ends_at);
+    if(!Number.isFinite(start)||!Number.isFinite(end)||start>=end || now<start || now>=end)
+      return res.json(unavailable);
+    if(!/^[a-z0-9][a-z0-9-]{3,95}$/.test(c.campaign_key||'')||
+       !Number.isSafeInteger(c.version)||c.version<1||
+       !Number.isSafeInteger(c.price_cents)||c.price_cents<=0||
+       !Number.isSafeInteger(c.regular_price_cents)||c.regular_price_cents<c.price_cents||
+       !Number.isSafeInteger(c.deposit_cents)||c.deposit_cents<0||c.deposit_cents>c.price_cents||
+       c.timezone!=='America/New_York')throw new Error('Invalid commercial terms');
+    const safe=(s,n=900)=>typeof s==='string'?s.trim().slice(0,n):'';
+    const validUrl=s=>{try{const u=new URL(s);return u.protocol==='https:'&&!u.username&&!u.password?u.href:'';}catch{return '';}};
+    const m=c.marketing&&typeof c.marketing==='object'&&!Array.isArray(c.marketing)?c.marketing:{};
+    const {data:media,error:mediaError}=await academySupabase.from('lltouch_campaign_assets')
+      .select('asset_type,device,position,image_url,alt_text')
+      .eq('campaign_id',c.id).eq('asset_type','hero').order('position',{ascending:true});
+    if(mediaError)throw mediaError;
+    const image=(d)=>(media||[]).find(a=>a.device===d&&a.position===0&&validUrl(a.image_url));
+    const desktop=image('desktop')||image('all'),mobile=image('mobile')||image('tablet')||desktop;
+    if(!desktop||!mobile)throw new Error('Missing approved hero imagery');
+    const features=Array.isArray(m.features)?m.features.slice(0,6).map(x=>({title:safe(x?.title,100),description:safe(x?.description,480)})).filter(x=>x.title&&x.description):[];
+    const faqs=Array.isArray(m.faq)?m.faq.slice(0,6).map(x=>({question:safe(x?.question,180),answer:safe(x?.answer,900)})).filter(x=>x.question&&x.answer):[];
+    const rawTerms=m.campaignMeta?.serviceTerms;
+    const terms=rawTerms&&typeof rawTerms==='object'&&!Array.isArray(rawTerms)?rawTerms:{};
+    return res.json({ok:true,enabled:true,campaignKey:c.campaign_key,
+      campaignVersion:c.version,bookingReady:false,bookingModes:{suggested:false,preferred:false},
+      note:'Stage 03A: universal display only; a server-side validated booking flow is required before checkout.',
+      offer:{title:safe(c.service_title,160),originalCents:c.regular_price_cents,
+        priceCents:c.price_cents,depositCents:c.deposit_cents,holdMinutes:c.hold_minutes,
+        offerLabel:safe(c.offer_label,160),startsAt:c.offer_starts_at,endsAt:c.offer_ends_at,
+        timezone:'America/New_York',
+        hero:{desktop:validUrl(desktop.image_url),mobile:validUrl(mobile.image_url),
+          alt:safe(desktop.alt_text||c.service_title,160)},
+        marketing:{headline:safe(m.headline,170),headlineEm:safe(m.headlineEm,170),
+          description:safe(m.description,1300),featureIntro:safe(m.featureIntro,1100),
+          sectionTitle:safe(m.sectionTitle,180),sectionBody:safe(m.sectionBody,1500),
+          whatToExpect:safe(m.whatToExpect,1100),whoItsFor:safe(m.whoItsFor,1100),
+          disclaimer:safe(m.disclaimer,500),ctaText:safe(m.ctaText,90),features,faq:faqs},
+        serviceTerms:{sessions:Number.isSafeInteger(terms.sessions)?terms.sessions:null,
+          singleAreaForAllSessions:terms.singleAreaForAllSessions===true,
+          eligibleAreasVerified:terms.eligibleAreasVerified===true,
+          areaPolicy:safe(terms.areaPolicy,70)}}});
+  }catch(e){console.error('LL Touch universal page config unavailable:',String(e?.message||e));
+    return res.status(503).json({ok:false,enabled:false,error:'Unable to verify active campaign.'});}
+});
+
 app.get('/lltouch/campaigns/public-config', checkoutLimiter, async (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.set('X-Robots-Tag', 'noindex, nofollow');
