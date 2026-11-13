@@ -8059,6 +8059,201 @@ app.get('/lltouch/campaigns/admin/api/reuse/verified-slots/:key',
 });
 // END CAMPAIGN STUDIO 03C-3 VERIFIED-SLOTS BRIDGE
 
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-4 | UNIVERSAL CONTACT + SLOT HOLD (GATED)
+// Reuses 03C-3 availability engine, existing Supabase hold ledger, and DB 35 RPC.
+// All public mutations remain OFF until explicit future release. No Stripe/GHL,
+// no Google Calendar creation, no Vagaro booking and no checkout endpoints here.
+// ============================================================================
+const LL_CM_03C4_CONTACT_ENABLED=process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_ENABLED==='true';
+const LL_CM_03C4_SLOT_ENABLED=process.env.LLTOUCH_CM_UNIVERSAL_SLOT_ENABLED==='true';
+const LL_CM_03C4_INTAKE_LIMITER=rateLimit({
+  windowMs:15*60*1000,max:8,standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'Too many requests. Please try again later.'}
+});
+const LL_CM_03C4_UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function llCm3C4PublicOrigin(req){
+  return ['https://lltouch.com','https://www.lltouch.com'].includes(String(req.get('origin')||''));
+}
+function llCm3C4Body(req){
+  const ct=String(req.get('content-type')||'');
+  return ct.startsWith('application/json') && !!req.body && typeof req.body==='object' &&
+    !Array.isArray(req.body) && JSON.stringify(req.body).length<=3500;
+}
+function llCm3C4Fail(res,e,label){
+  const code=String(e?.message||'');
+  if(/^(UNIVERSAL|INVALID_UNIVERSAL|SERVER_QUOTE|SLOT_ALREADY)_[A-Z_]{3,64}$/.test(code))
+    return res.status(409).json({ok:false,error:code.slice(0,90)});
+  console.error('Campaign Studio '+label+' failed:',code.slice(0,140));
+  return res.status(503).json({ok:false,error:'We could not verify your request. Please try again later.'});
+}
+async function llCm3C4Campaign(key){
+  if(!LL_CM_DISPLAY_KEY.test(key))throw Error('UNIVERSAL_CAMPAIGN_INVALID');
+  const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+    .select('id,campaign_key,version,status,service_title,site_item,marketing,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,timezone,offer_starts_at,offer_ends_at')
+    .eq('campaign_key',key).maybeSingle();
+  if(error)throw error;
+  if(!c)throw Error('UNIVERSAL_CAMPAIGN_NOT_FOUND');
+  const quote=llCmHoldPreviewTerms(c);
+  const contract=llCmBookingReuseContract(c);
+  if(contract.serviceStrategy!=='single-laser-offer'||contract.sessions!==3||
+    contract.areaPolicy!=='any-area-same-area'||contract.singleAreaForAllSessions!==true)
+    throw Error('UNIVERSAL_CAMPAIGN_CONTRACT_INVALID');
+  return {campaign:c,quote,contract};
+}
+function llCm3C4SelectArea(contract,key){
+  const area=contract.treatmentAreas.find(a=>a.key===key);
+  const stored=Object.prototype.hasOwnProperty.call(VAGARO_SERVICE_MAP.laser.byServiceName||{},key)
+    ? VAGARO_SERVICE_MAP.laser.byServiceName[key] : null;
+  // The sole 'Laser Offer' is currently 30 min. Larger areas are not silently shortened.
+  if(!area||!stored||stored.durationMinutes!==30 || !VAGARO_LASER_OFFER_SERVICE_ID)
+    throw Error('UNIVERSAL_AREA_REQUIRES_REVIEW');
+  return area;
+}
+function llCm3C4ContactInput(body){
+  const name=cleanLeadField(body?.name,120),email=String(body?.email||'').trim().toLowerCase(),
+    phone=cleanLeadField(body?.phone,40),area=String(body?.requested_area||''),
+    nonce=String(body?.client_nonce||'');
+  if(name.length<3||!isValidEmail(email)||email.length>254||
+     phone.length<7||phone.replace(/\D/g,'').length<10||phone.replace(/\D/g,'').length>15||
+     !LL_CM_03C4_UUID.test(nonce)||body?.consent!==true||
+     typeof body?.sms_marketing_consent!=='boolean'||
+     !/^[a-z0-9-]{2,80}$/.test(area))throw Error('INVALID_UNIVERSAL_CONTACT');
+  return {name,email,phone,area,nonce,sms:body.sms_marketing_consent};
+}
+// Future customer form entry. DISABLED by default, even for published campaigns.
+// Only creates a 10-minute contact/window record with NO provider and NO slot.
+app.post('/lltouch/campaigns/hold',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
+  res.set('Cache-Control','no-store');
+  if(!LL_CM_03C4_CONTACT_ENABLED)return res.status(403).json({ok:false,error:'CONTACT_INTAKE_DISABLED'});
+  if(!llCm3C4PublicOrigin(req))return res.status(403).json({ok:false,error:'Origin not allowed'});
+  if(!llCm3C4Body(req))return res.status(415).json({ok:false,error:'Expected compact JSON'});
+  try{
+    const input=llCm3C4ContactInput(req.body);
+    const key=String(req.body?.campaignKey||''),version=req.body?.campaignVersion;
+    const {campaign,quote,contract}=await llCm3C4Campaign(key);
+    if(version!==campaign.version)throw Error('UNIVERSAL_CAMPAIGN_VERSION_CHANGED');
+    llCm3C4SelectArea(contract,input.area);
+    const snapshot={mode:'universal-contact-no-checkout',campaignKey:key,campaignVersion:campaign.version,
+      serviceName:'Laser Offer',serviceId:String(VAGARO_LASER_OFFER_SERVICE_ID),
+      areaKey:input.area,areaPolicy:'any-area-same-area',sessions:3,durationMinutes:30,
+      priceCents:quote.priceCents,regularPriceCents:quote.regularPriceCents,
+      depositCents:quote.depositCents,holdMinutes:10,currency:'usd'};
+    const {data,error}=await academySupabase.rpc('lltouch_cm_universal_begin_contact',{
+      p_campaign_key:key,p_campaign_version:campaign.version,p_client_nonce:input.nonce,
+      p_customer_name:input.name,p_customer_email:input.email,p_customer_phone:input.phone,
+      p_contact_consent:true,p_sms_marketing_consent:input.sms,
+      p_treatment_area_key:input.area,p_quote_snapshot:snapshot
+    });
+    if(error)throw error;
+    if(!data?.ok||!LL_CM_03C4_UUID.test(data.holdId)||!Number.isFinite(Date.parse(data.expiresAt)))
+      throw Error('Unexpected contact acknowledgement');
+    return res.json({ok:true,hold_id:data.holdId,deadline:data.expiresAt,
+      campaignKey:key,campaignVersion:campaign.version,areaKey:input.area,
+      idempotent:data.idempotent===true,slotHeld:false,bookingReady:false,checkoutReady:false,
+      note:'Contact recorded. No appointment time is held, no payment is collected.'});
+  }catch(e){return llCm3C4Fail(res,e,'contact intake')}
+});
+
+app.post('/lltouch/campaigns/hold/status',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
+  res.set('Cache-Control','no-store');
+  if(!LL_CM_03C4_CONTACT_ENABLED)return res.status(403).json({ok:false,error:'CONTACT_INTAKE_DISABLED'});
+  if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))return res.status(403).json({ok:false,error:'Request not allowed'});
+  const key=String(req.body?.campaignKey||''),id=String(req.body?.hold_id||''),nonce=String(req.body?.client_nonce||'');
+  if(!LL_CM_DISPLAY_KEY.test(key)||!LL_CM_03C4_UUID.test(id)||!LL_CM_03C4_UUID.test(nonce))
+    return res.status(422).json({ok:false,error:'Invalid hold token'});
+  try{
+    const {data,error}=await academySupabase.rpc('lltouch_cm_universal_contact_status',{
+      p_campaign_key:key,p_hold_id:id,p_client_nonce:nonce
+    });
+    if(error)throw error;
+    return res.json({ok:true,state:data.state,deadline:data.expiresAt,
+      treatmentAreaKey:data.treatmentAreaKey,slotHeld:data.slotHeld===true,
+      providerKey:data.providerKey||null,bookingReady:false,checkoutReady:false});
+  }catch(e){return llCm3C4Fail(res,e,'contact status')}
+});
+
+// Stage 03C-4 prepares the final exclusive hold; Stripe will be a later, separate gate.
+app.post('/lltouch/campaigns/hold/choose-slot',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
+  res.set('Cache-Control','no-store');
+  if(!LL_CM_03C4_CONTACT_ENABLED||!LL_CM_03C4_SLOT_ENABLED)
+    return res.status(403).json({ok:false,error:'UNIVERSAL_SLOT_HOLD_DISABLED'});
+  if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))return res.status(403).json({ok:false,error:'Request not allowed'});
+  const key=String(req.body?.campaignKey||''),id=String(req.body?.hold_id||''),
+    nonce=String(req.body?.client_nonce||''),provider=String(req.body?.professional_key||''),
+    date=String(req.body?.date||''),time=String(req.body?.time||'');
+  if(!LL_CM_DISPLAY_KEY.test(key)||!LL_CM_03C4_UUID.test(id)||!LL_CM_03C4_UUID.test(nonce)||
+    !LL_CM_CAMPAIGN_PROVIDER_KEYS.includes(provider)||!llCmValidateAuditDate(date)||
+    !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))
+    return res.status(422).json({ok:false,error:'Invalid time or hold token'});
+  try{
+    // Read the existing hold using BOTH hold ID and customer nonce: no PII in response.
+    const {data:h,error:holdError}=await academySupabase.from('lltouch_cm_universal_holds')
+      .select('campaign_version,treatment_area_key,quote_snapshot,expires_at,state,provider_key,appointment_start,appointment_end')
+      .eq('id',id).eq('campaign_key',key).eq('client_nonce',nonce).maybeSingle();
+    if(holdError)throw holdError;
+    if(!h||h.quote_snapshot?.mode!=='universal-contact-no-checkout'||
+       h.state!=='held'||Date.parse(h.expires_at)<=Date.now())
+      return res.status(409).json({ok:false,error:'UNIVERSAL_HOLD_EXPIRED_OR_INVALID'});
+    const {campaign,contract}=await llCm3C4Campaign(key);
+    if(campaign.version!==h.campaign_version)throw Error('UNIVERSAL_CAMPAIGN_VERSION_CHANGED');
+    const area=llCm3C4SelectArea(contract,h.treatment_area_key);
+    const window=llTouchAppointmentWindow(date,time,30);
+    if(!window)throw Error('INVALID_UNIVERSAL_SLOT');
+    // A repeat request for the SAME existing slot is idempotent. The slot will
+    // already be excluded from live availability due to our own atomic hold.
+    if(h.appointment_start){
+      if(h.provider_key===provider && Date.parse(h.appointment_start)===window.start.getTime() &&
+         Date.parse(h.appointment_end)===window.end.getTime())
+        return res.json({ok:true,hold_id:id,deadline:h.expires_at,slotHeld:true,
+          idempotent:true,professional:provider,date,time,bookingReady:false,checkoutReady:false,
+          message:'Existing temporary Supabase hold. No booking or payment.'});
+      return res.status(409).json({ok:false,error:'UNIVERSAL_SLOT_ALREADY_SELECTED'});
+    }
+    if(!isVagaroConfigured()||!isGoogleCalendarConfigured())throw Error('Calendar providers unavailable');
+    const listing=await llCmReadVagaroCatalog(),laser=llCmLaserOfferServiceAudit(listing.rows);
+    if(!laser.auditReady||!laser.idMatches||!laser.serviceId||
+       !laser.providers.every(p=>p.issue==='OK')||
+       laser.providers.some(p=>p.durationMinutes!==30))
+      throw Error('Universal Laser Offer service is not ready');
+    const candidates=await llCm3C3VerifiedSlots({date,area:VAGARO_SERVICE_MAP.laser.byServiceName[area.key],
+      laser,now:Date.now()});
+    const chosen=candidates.find(p=>p.key===provider);
+    if(!chosen?.availableTimes.includes(time))
+      return res.status(409).json({ok:false,error:'UNIVERSAL_SLOT_UNAVAILABLE'});
+    const {data,error}=await academySupabase.rpc('lltouch_cm_universal_lock_time',{
+      p_campaign_key:key,p_hold_id:id,p_client_nonce:nonce,p_provider_key:provider,
+      p_treatment_area_key:area.key,p_start:window.start.toISOString(),p_end:window.end.toISOString()
+    });
+    if(error)throw error;
+    return res.json({ok:true,hold_id:data.holdId,deadline:data.expiresAt,
+      slotHeld:data.slotHeld===true,idempotent:data.idempotent===true,
+      professional:provider,date,time,bookingReady:false,checkoutReady:false,
+      message:'Temporary Supabase hold only. No calendar booking or deposit was created.'});
+  }catch(e){return llCm3C4Fail(res,e,'slot hold')}
+});
+
+// Admin QA: no customer data, no mutations. Also detects missing DB SQL 35.
+app.get('/lltouch/campaigns/admin/api/reuse/intake-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'Invalid campaign key'});
+  try{
+    const {campaign,contract}=await llCm3C4Campaign(key);
+    const {data:db,error:dbError}=await academySupabase.rpc('lltouch_cm_universal_03c4_readiness');
+    if(dbError)throw dbError;
+    return res.json({ok:true,readOnly:true,campaignKey:key,campaignVersion:campaign.version,
+      serviceStrategy:contract.serviceStrategy,providers:contract.providers,
+      contactIntakeEnabled:LL_CM_03C4_CONTACT_ENABLED,slotHoldEnabled:LL_CM_03C4_SLOT_ENABLED,
+      bookingReady:false,checkoutReady:false,paymentEnabled:false,
+      dbFunctionsPresent:db?.functionsPresent===true,dbOverlapGuardPresent:db?.overlapGuardPresent===true,
+      note:'No public intake, checkout or booking is activated by this diagnostic.'});
+  }catch(e){return llCm3C4Fail(res,e,'admin readiness')}
+});
+// END CAMPAIGN STUDIO 03C-4
+
+
 // END STAGE 03B-2E2. NO LIVE STRIPE, HOLD UPDATE, OR BOOKING WAS ADDED.
 // END STAGE 03B-2E1. NO LIVE STRIPE ROUTE OR HOLD UPDATE WAS ADDED.
 
