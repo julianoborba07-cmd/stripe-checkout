@@ -5019,6 +5019,45 @@ async function llOfferSweepExpired() {
   } catch(e) {console.error('Offer checkout sweep failed:',String(e?.message||e));}
   finally{llOfferSweeping=false;}
 }
+// ============================================================================
+// CAMPAIGN STUDIO | 03C-1 | REUSE EXISTING BOOKING INFRASTRUCTURE
+// Single source: published Supabase campaign; no browser-defined prices or services.
+// READ ONLY. No Stripe charge, hold, appointment, Google event or Vagaro mutation.
+// Future public transactions must verify campaign status/version/terms server-side
+// and reuse the LL Touch appointment-confirmation path after paid verification.
+// ============================================================================
+function llCmBookingReuseContract(c){
+  const raw=c?.marketing?.campaignMeta?.serviceTerms;
+  const terms=raw && !Array.isArray(raw) && typeof raw==='object' ? raw : {};
+  const item=c?.site_item || {};
+  const isLaser=/laser|hair removal/i.test(String(c?.service_title||'')) &&
+    item.type==='manual' && terms.singleAreaForAllSessions===true;
+  const areas=isLaser ? Object.entries(VAGARO_SERVICE_MAP.laser.byServiceName||{})
+    .filter(([key,a])=>/^[a-z0-9-]{2,80}$/.test(key) && a?.title)
+    .map(([key,a])=>({key,title:String(a.title).slice(0,120)})) : [];
+  // Users always choose both LL Touch providers; we never invent availability.
+  const providers=LL_CM_CAMPAIGN_PROVIDER_KEYS.map(key=>({
+    key,name:LLTOUCH_PROFESSIONALS[key].name
+  }));
+  const mappedService=(!isLaser && item.type!=='manual')
+    ? resolveVagaroServiceFromSiteItem(item) : null;
+  const serviceStrategy=isLaser?'single-laser-offer':
+    mappedService?.serviceId?'existing-mapped-vagaro-service':'requires-service-mapping';
+  return {
+    contractVersion:1,source:'supabase-published-campaign',
+    serviceStrategy,serviceTitle:String(c?.service_title||'').slice(0,160),
+    providers,treatmentAreas:areas,
+    areaPolicy:isLaser?String(terms.areaPolicy||''):null,
+    sessions:Number.isSafeInteger(terms.sessions)?terms.sessions:null,
+    singleAreaForAllSessions:terms.singleAreaForAllSessions===true,
+    catalogIsClinicalApproval:false,
+    // This contract advertises options, NOT guaranteed booking availability.
+    availabilityRequiresVagaroAndGoogle:true,
+    bookingReady:false,checkoutReady:false
+  };
+}
+// ============================================================================
+
 // LL Touch Campaign Manager / Stage 02A (read-only, published campaigns only).
 // This endpoint does not enable the public /offer checkout or change prices.
 
@@ -5034,7 +5073,7 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
   const unavailable = {ok:true,enabled:false,campaignKey:null,bookingReady:false,offer:null};
   try {
     const {data:rows,error}=await academySupabase.from('lltouch_campaigns')
-      .select('id,campaign_key,version,status,service_title,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
+      .select('id,campaign_key,version,status,service_title,site_item,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
       .eq('status','published').limit(2);
     if(error)throw error;
     if(!rows?.length)return res.json(unavailable);
@@ -5061,10 +5100,12 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
     if(!desktop||!mobile)throw new Error('Missing approved hero imagery');
     const features=Array.isArray(m.features)?m.features.slice(0,6).map(x=>({title:safe(x?.title,100),description:safe(x?.description,480)})).filter(x=>x.title&&x.description):[];
     const faqs=Array.isArray(m.faq)?m.faq.slice(0,6).map(x=>({question:safe(x?.question,180),answer:safe(x?.answer,900)})).filter(x=>x.question&&x.answer):[];
+    const bookingContract=llCmBookingReuseContract(c);
     const rawTerms=m.campaignMeta?.serviceTerms;
     const terms=rawTerms&&typeof rawTerms==='object'&&!Array.isArray(rawTerms)?rawTerms:{};
     return res.json({ok:true,enabled:true,campaignKey:c.campaign_key,
       campaignVersion:c.version,bookingReady:false,displayOnly:true,bookingModes:{suggested:false,preferred:false},
+      providers:bookingContract.providers,
       note:'Stage 03B-1: public visual display only; payment, hold and scheduling remain disabled.',
       offer:{title:safe(c.service_title,160),originalCents:c.regular_price_cents,
         priceCents:c.price_cents,depositCents:c.deposit_cents,holdMinutes:c.hold_minutes,
@@ -5077,6 +5118,8 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
           sectionTitle:safe(m.sectionTitle,180),sectionBody:safe(m.sectionBody,1500),
           whatToExpect:safe(m.whatToExpect,1100),whoItsFor:safe(m.whoItsFor,1100),
           disclaimer:safe(m.disclaimer,500),ctaText:safe(m.ctaText,90),features,faq:faqs},
+        treatmentAreas:bookingContract.treatmentAreas,
+        bookingServiceStrategy:bookingContract.serviceStrategy,
         serviceTerms:{sessions:Number.isSafeInteger(terms.sessions)?terms.sessions:null,
           singleAreaForAllSessions:terms.singleAreaForAllSessions===true,
           eligibleAreasVerified:terms.eligibleAreasVerified===true,
@@ -7809,6 +7852,64 @@ app.get('/lltouch/campaigns/admin/api/transactions/stripe-test-webhook-status/:k
   }catch(e){
     console.error('Campaign Studio TEST webhook readback failed:',String(e?.code||e?.message||e));
     return res.status(503).json({ok:false,error:'Não foi possível consultar a auditoria de webhook.'});
+  }
+});
+
+// Stage 03C-1: explain how a campaign will reuse the EXISTING booking engine.
+// This is an inspectable bridge, not a new payment or booking implementation.
+app.get('/lltouch/campaigns/admin/api/integration-bridge/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))
+    return res.status(422).json({ok:false,error:'Identificador inválido.'});
+  try{
+    const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+      .select('campaign_key,version,status,service_title,site_item,marketing,regular_price_cents,price_cents,deposit_cents,hold_minutes,timezone,offer_starts_at,offer_ends_at,currency')
+      .eq('campaign_key',key).maybeSingle();
+    if(error)throw error;
+    if(!c)return res.status(404).json({ok:false,error:'Campanha não encontrada.'});
+    const contract=llCmBookingReuseContract(c);
+    const people=LL_CM_CAMPAIGN_PROVIDER_KEYS.map(k=>({key:k,
+      vagaroConfigured:Boolean(LLTOUCH_PROFESSIONALS[k].providerId),
+      googleCalendarConfigured:Boolean(LLTOUCH_PROFESSIONALS[k].calendarId)}));
+    const checks={
+      bothProfessionalsConfigured:people.every(p=>p.vagaroConfigured&&p.googleCalendarConfigured),
+      vagaroConfigured:isVagaroConfigured(),googleCalendarConfigured:isGoogleCalendarConfigured(),
+      singleLaserOfferIdPinned:contract.serviceStrategy!=='single-laser-offer' || Boolean(VAGARO_LASER_OFFER_SERVICE_ID),
+      campaignPublished:c.status==='published',
+      campaignInWindow:Number.isFinite(Date.parse(c.offer_starts_at)) &&
+        Number.isFinite(Date.parse(c.offer_ends_at)) &&
+        Date.now()>=Date.parse(c.offer_starts_at) && Date.now()<Date.parse(c.offer_ends_at),
+      commercialValid:c.currency==='usd' && c.timezone==='America/New_York' &&
+        Number.isSafeInteger(c.price_cents) && c.price_cents>0 &&
+        Number.isSafeInteger(c.regular_price_cents) && c.regular_price_cents>=c.price_cents &&
+        Number.isSafeInteger(c.deposit_cents) && c.deposit_cents>=0 && c.deposit_cents<=c.price_cents,
+      areasCatalogued:contract.serviceStrategy!=='single-laser-offer' || contract.treatmentAreas.length>0,
+    };
+    return res.json({ok:true,readOnly:true,transactionActivation:false,
+      key:c.campaign_key,version:c.version,status:c.status,
+      quote:{priceCents:c.price_cents,regularPriceCents:c.regular_price_cents,
+        depositCents:c.deposit_cents,holdMinutes:c.hold_minutes},
+      contract,professionals:people,checks,
+      reusedInfrastructure:{
+        availability:'searchVagaroAvailability + llTouchBusyEventsForCalendar',
+        pricing:'Supabase published campaign; snapshot required at checkout',
+        hold:'lltouch_cm_universal_holds (separate from old HydraFacial claims)',
+        payment:'Stripe live integration already exists; universal binding NOT enabled',
+        paidBooking:'llOfferConfirmPaidAppointment -> llTouchHandleAppointmentConfirmation',
+        googleCalendar:'Existing paid appointment Google BUSY event; Vagaro Personal Task sync',
+        leadRecovery:'Existing GoHighLevel/Meta queues, must bind campaign key'
+      },
+      pending:['Universal public hold/dates/checkout/receipt server handlers',
+        'Atomic campaign version and frozen price binding',
+        'Expiry vs Stripe Checkout reconciliation',
+        'Adapt buildBookingOptionsFromSession to resolve universal Laser Offer without altering legacy area services',
+        'Real test of booking and rollback using existing handler'],
+      warning:'Diagnostic only: DOES NOT enable booking or payment. Never reuse legacy HydroFacial campaign key/claim rows for a different offer.'});
+  }catch(e){
+    console.error('Campaign Studio reuse-bridge inspection failed:',String(e?.message||e).slice(0,160));
+    return res.status(503).json({ok:false,error:'Não foi possível revisar a integração da campanha.'});
   }
 });
 
