@@ -7913,6 +7913,152 @@ app.get('/lltouch/campaigns/admin/api/integration-bridge/:key',
   }
 });
 
+// ============================================================================
+// CAMPAIGN STUDIO | 03C-3 | SHARED VERIFIED-SLOTS BRIDGE — READ ONLY
+// A narrow administrative bridge to the ALREADY IMPLEMENTED LL Touch engine.
+// Pilot: single 'Laser Offer' service; the area is independent campaign data.
+// Never writes holds, creates Stripe sessions, calendar events or appointments.
+// Neither this route nor its results enable the universal customer checkout.
+// ============================================================================
+function llCm3C3Overlaps(window,row,startKey,endKey){
+  const a=Date.parse(row?.[startKey]||'');
+  const b=Date.parse(row?.[endKey]||'');
+  // Corrupt/unparseable blocking records are NOT treated as harmless.
+  if(!Number.isFinite(a)||!Number.isFinite(b)||b<=a)throw Error('Invalid occupied window in database');
+  return window.start.getTime()<b && window.end.getTime()>a;
+}
+function llCm3C3IsBlockingHold(h,now){
+  if(!h||!['held','checkout','paid','processing','confirmed','review'].includes(h.state))return false;
+  if(h.state!=='held')return true;
+  const expires=Date.parse(h.expires_at||'');
+  // Unknown expiry must fail closed.
+  return !Number.isFinite(expires)||expires>now;
+}
+function llCm3C3DeduplicateTimes(vagaro,date){
+  const slots=new Set();
+  for(const day of vagaro?.data||[]){
+    if(normalizeAcademyDateValue(day.appointmentDate,date)!==date)continue;
+    for(const raw of day.timeSlot||[]){
+      const time=normalizeAcademyTime(raw);
+      if(time&&/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))slots.add(time);
+    }
+  }
+  return [...slots].sort();
+}
+async function llCm3C3ReadOccupiedWindows(providerKey,dayStart,dayEnd){
+  const [holds,appointments]=await Promise.all([
+    academySupabase.from('lltouch_cm_universal_holds')
+      .select('state,expires_at,appointment_start,appointment_end')
+      .eq('provider_key',providerKey)
+      .in('state',['held','checkout','paid','processing','confirmed','review'])
+      .lt('appointment_start',dayEnd).gt('appointment_end',dayStart).limit(501),
+    // This is the EXISTING Google->Vagaro booking engine's SQL ledger.
+    academySupabase.from('lltouch_appointments')
+      .select('status,starts_at,ends_at,provider_id')
+      .eq('provider_id',LLTOUCH_PROFESSIONALS[providerKey].providerId)
+      .in('status',['pending','confirmed'])
+      .lt('starts_at',dayEnd).gt('ends_at',dayStart).limit(501)
+  ]);
+  if(holds.error)throw holds.error;
+  if(appointments.error)throw appointments.error;
+  if((holds.data||[]).length>=501||(appointments.data||[]).length>=501)
+    throw Error('Too many occupied intervals; availability query closed safely');
+  return {holds:holds.data||[],appointments:appointments.data||[]};
+}
+async function llCm3C3VerifiedSlots({date,area,laser,now}){
+  const dateStart=zonedAcademyDateToUtc(date,'00:00','America/New_York');
+  const tomorrow=academyAddDaysISO(date,1);
+  const dateEnd=zonedAcademyDateToUtc(tomorrow,'00:00','America/New_York');
+  if(!dateStart||!dateEnd||!Number.isFinite(dateStart.getTime())||
+     !Number.isFinite(dateEnd.getTime())||dateEnd<=dateStart)
+    throw Error('Invalid clinic timezone window');
+  const dateStartIso=dateStart.toISOString(),dateEndIso=dateEnd.toISOString();
+  // ALL providers must succeed. A partial failure is never advertised as free slots.
+  return await Promise.all(LL_CM_CAMPAIGN_PROVIDER_KEYS.map(async key=>{
+    const pro=LLTOUCH_PROFESSIONALS[key];
+    const entry=laser.providers.find(p=>p.key===key);
+    const duration=entry?.durationMinutes;
+    if(entry?.issue!=='OK'||!pro?.calendarId||!pro?.providerId||
+       !Number.isSafeInteger(duration)||duration<area.durationMinutes)
+      throw Error('Laser Offer/provider duration or calendar not approved');
+    const [vagaro,googleBusy,ledger]=await Promise.all([
+      searchVagaroAvailability({date,serviceId:laser.serviceId,serviceProviderId:pro.providerId}),
+      llTouchBusyEventsForCalendar(date,pro.calendarId,true),
+      llCm3C3ReadOccupiedWindows(key,dateStartIso,dateEndIso)
+    ]);
+    const candidates=llCm3C3DeduplicateTimes(vagaro,date);
+    if(candidates.length>288)throw Error('Unexpected Vagaro slot count');
+    const availableTimes=[];
+    const excluded={tooSoon:0,google:0,supabase:0,invalidWindow:0};
+    for(const time of candidates){
+      const window=llTouchAppointmentWindow(date,time,duration);
+      if(!window){excluded.invalidWindow++;continue}
+      if(window.start.getTime()<=now+10*60000){excluded.tooSoon++;continue}
+      if(googleBusy.some(event=>llTouchCalendarIntervalOverlaps(window,event))){excluded.google++;continue}
+      if(ledger.holds.some(h=>llCm3C3IsBlockingHold(h,now)&&
+          llCm3C3Overlaps(window,h,'appointment_start','appointment_end')) ||
+         ledger.appointments.some(a=>llCm3C3Overlaps(window,a,'starts_at','ends_at'))){
+        excluded.supabase++;continue;
+      }
+      availableTimes.push(time);
+    }
+    return {key,name:pro.name,date,durationMinutes:duration,
+      availableTimes,candidateCount:candidates.length,availableCount:availableTimes.length,
+      excluded};
+  }));
+}
+app.get('/lltouch/campaigns/admin/api/reuse/verified-slots/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_REMOTE_AUDIT_LIMITER,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');
+  res.set('X-Robots-Tag','noindex,nofollow');
+  const key=String(req.params.key||''),date=String(req.query.date||''),
+    areaKey=String(req.query.areaKey||'');
+  if(!LL_CM_DISPLAY_KEY.test(key)||!llCmValidateAuditDate(date)||
+     !Object.prototype.hasOwnProperty.call(VAGARO_SERVICE_MAP.laser.byServiceName||{},areaKey))
+    return res.status(422).json({ok:false,error:'Campanha, data ou área inválida (máximo 14 dias).'});
+  try{
+    const guard=await llCmReadOnlyCampaign(key);
+    const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+      .select('campaign_key,status,version,service_title,site_item,marketing,offer_starts_at,offer_ends_at')
+      .eq('campaign_key',key).maybeSingle();
+    if(error)throw error;
+    const now=Date.now();
+    if(!c||!guard||guard.version!==c.version||c.status!=='published'||
+       c.marketing?.campaignMeta?.releaseMode!=='display-only'||
+       c.marketing?.campaignMeta?.checkoutReady!==false||
+       c.marketing?.campaignMeta?.bookingReady!==false||
+       !Number.isFinite(Date.parse(c.offer_starts_at))||
+       !Number.isFinite(Date.parse(c.offer_ends_at))||
+       now<Date.parse(c.offer_starts_at)||now>=Date.parse(c.offer_ends_at))
+      return res.status(409).json({ok:false,error:'Campanha não está na janela visual auditável.'});
+    const contract=llCmBookingReuseContract(c);
+    if(contract.serviceStrategy!=='single-laser-offer'||
+       contract.sessions!==3||contract.singleAreaForAllSessions!==true||
+       contract.areaPolicy!=='any-area-same-area'||
+       !contract.treatmentAreas.some(a=>a.key===areaKey))
+      return res.status(422).json({ok:false,error:'Contrato da campanha não habilitado para auditoria de laser.'});
+    if(!isVagaroConfigured()||!isGoogleCalendarConfigured())
+      return res.status(503).json({ok:false,error:'Integrações de calendário indisponíveis.'});
+    const rows=await llCmReadVagaroCatalog();
+    const laser=llCmLaserOfferServiceAudit(rows.rows);
+    if(!laser.auditReady||!laser.idMatches||!laser.serviceId||
+       !laser.providers.every(p=>p.issue==='OK'))
+      return res.status(409).json({ok:false,error:'Serviço Laser Offer ou alguma das duas profissionais não está validada.'});
+    const area=VAGARO_SERVICE_MAP.laser.byServiceName[areaKey];
+    if(!Number.isSafeInteger(area.durationMinutes)||area.durationMinutes<10||
+       laser.providers.some(p=>p.durationMinutes<area.durationMinutes))
+      return res.status(409).json({ok:false,error:'Duração da área excede o Laser Offer. Revisão clínica necessária.'});
+    const providers=await llCm3C3VerifiedSlots({date,area,laser,now});
+    if(providers.length!==2||providers.some(p=>p.key!=='ludimilla'&&p.key!=='carol'))
+      throw Error('Expected two professionals');
+    return res.json({ok:true,readOnly:true,bookingReady:false,checkoutReady:false,
+      campaignKey:key,campaignVersion:c.version,date,areaKey,areaTitle:area.title,
+      serviceName:'Laser Offer',timeZone:'America/New_York',
+      providers,disclaimer:'Slots are a read-only availability snapshot. They are NOT held or guaranteed until a new server verification and atomic hold. No customer booking is enabled.'});
+  }catch(e){return llCmAuditSafeError(e,res,'Campaign Studio 03C-3 verified slots bridge');}
+});
+// END CAMPAIGN STUDIO 03C-3 VERIFIED-SLOTS BRIDGE
+
 // END STAGE 03B-2E2. NO LIVE STRIPE, HOLD UPDATE, OR BOOKING WAS ADDED.
 // END STAGE 03B-2E1. NO LIVE STRIPE ROUTE OR HOLD UPDATE WAS ADDED.
 
