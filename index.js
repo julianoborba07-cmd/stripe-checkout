@@ -5073,7 +5073,7 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
   const unavailable = {ok:true,enabled:false,campaignKey:null,bookingReady:false,offer:null};
   try {
     const {data:rows,error}=await academySupabase.from('lltouch_campaigns')
-      .select('id,campaign_key,version,status,service_title,site_item,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
+      .select('id,campaign_key,version,status,service_title,site_item,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
       .eq('status','published').limit(2);
     if(error)throw error;
     if(!rows?.length)return res.json(unavailable);
@@ -5101,10 +5101,23 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
     const features=Array.isArray(m.features)?m.features.slice(0,6).map(x=>({title:safe(x?.title,100),description:safe(x?.description,480)})).filter(x=>x.title&&x.description):[];
     const faqs=Array.isArray(m.faq)?m.faq.slice(0,6).map(x=>({question:safe(x?.question,180),answer:safe(x?.answer,900)})).filter(x=>x.question&&x.answer):[];
     const bookingContract=llCmBookingReuseContract(c);
+    // 03C-5: explicitly opt-in contact-only pilot. This is NOT booking readiness.
+    // Only areas that already have a 30-minute clinical reference are selectable.
+    const contactEligibleAreas=bookingContract.serviceStrategy==='single-laser-offer'
+      && bookingContract.sessions===3 && bookingContract.singleAreaForAllSessions===true
+      && Boolean(VAGARO_LASER_OFFER_SERVICE_ID)
+      ? bookingContract.treatmentAreas.filter(a=>VAGARO_SERVICE_MAP.laser.byServiceName?.[a.key]?.durationMinutes===30)
+      : [];
+    let contactIntakeReady=false;
+    if(LL_CM_03C4_CONTACT_ENABLED && LL_CM_03C5_PILOT_ENABLED && contactEligibleAreas.length){
+      try{llCmHoldPreviewTerms(c);contactIntakeReady=true;}catch{contactIntakeReady=false;}
+    }
     const rawTerms=m.campaignMeta?.serviceTerms;
     const terms=rawTerms&&typeof rawTerms==='object'&&!Array.isArray(rawTerms)?rawTerms:{};
     return res.json({ok:true,enabled:true,campaignKey:c.campaign_key,
-      campaignVersion:c.version,bookingReady:false,displayOnly:true,bookingModes:{suggested:false,preferred:false},
+      campaignVersion:c.version,bookingReady:false,checkoutReady:false,displayOnly:true,
+      contactIntakeReady,contactOnlyPilot:contactIntakeReady,
+      bookingModes:{suggested:false,preferred:false},
       providers:bookingContract.providers,
       note:'Stage 03B-1: public visual display only; payment, hold and scheduling remain disabled.',
       offer:{title:safe(c.service_title,160),originalCents:c.regular_price_cents,
@@ -5119,6 +5132,7 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
           whatToExpect:safe(m.whatToExpect,1100),whoItsFor:safe(m.whoItsFor,1100),
           disclaimer:safe(m.disclaimer,500),ctaText:safe(m.ctaText,90),features,faq:faqs},
         treatmentAreas:bookingContract.treatmentAreas,
+        intakeEligibleAreas:contactIntakeReady?contactEligibleAreas:[],
         bookingServiceStrategy:bookingContract.serviceStrategy,
         serviceTerms:{sessions:Number.isSafeInteger(terms.sessions)?terms.sessions:null,
           singleAreaForAllSessions:terms.singleAreaForAllSessions===true,
@@ -8067,6 +8081,9 @@ app.get('/lltouch/campaigns/admin/api/reuse/verified-slots/:key',
 // ============================================================================
 const LL_CM_03C4_CONTACT_ENABLED=process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_ENABLED==='true';
 const LL_CM_03C4_SLOT_ENABLED=process.env.LLTOUCH_CM_UNIVERSAL_SLOT_ENABLED==='true';
+// Second explicit opt-in: a contact-only QA pilot must never activate on an
+// unrelated flag change. Do NOT enable these in production for ordinary users.
+const LL_CM_03C5_PILOT_ENABLED=process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_PILOT_ENABLED==='true';
 const LL_CM_03C4_INTAKE_LIMITER=rateLimit({
   windowMs:15*60*1000,max:8,standardHeaders:'draft-7',legacyHeaders:false,
   message:{ok:false,error:'Too many requests. Please try again later.'}
@@ -8125,7 +8142,8 @@ function llCm3C4ContactInput(body){
 // Only creates a 10-minute contact/window record with NO provider and NO slot.
 app.post('/lltouch/campaigns/hold',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
   res.set('Cache-Control','no-store');
-  if(!LL_CM_03C4_CONTACT_ENABLED)return res.status(403).json({ok:false,error:'CONTACT_INTAKE_DISABLED'});
+  if(!LL_CM_03C4_CONTACT_ENABLED||!LL_CM_03C5_PILOT_ENABLED)
+    return res.status(403).json({ok:false,error:'CONTACT_INTAKE_DISABLED'});
   if(!llCm3C4PublicOrigin(req))return res.status(403).json({ok:false,error:'Origin not allowed'});
   if(!llCm3C4Body(req))return res.status(415).json({ok:false,error:'Expected compact JSON'});
   try{
@@ -8157,7 +8175,8 @@ app.post('/lltouch/campaigns/hold',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
 
 app.post('/lltouch/campaigns/hold/status',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
   res.set('Cache-Control','no-store');
-  if(!LL_CM_03C4_CONTACT_ENABLED)return res.status(403).json({ok:false,error:'CONTACT_INTAKE_DISABLED'});
+  if(!LL_CM_03C4_CONTACT_ENABLED||!LL_CM_03C5_PILOT_ENABLED)
+    return res.status(403).json({ok:false,error:'CONTACT_INTAKE_DISABLED'});
   if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))return res.status(403).json({ok:false,error:'Request not allowed'});
   const key=String(req.body?.campaignKey||''),id=String(req.body?.hold_id||''),nonce=String(req.body?.client_nonce||'');
   if(!LL_CM_DISPLAY_KEY.test(key)||!LL_CM_03C4_UUID.test(id)||!LL_CM_03C4_UUID.test(nonce))
@@ -8176,8 +8195,9 @@ app.post('/lltouch/campaigns/hold/status',LL_CM_03C4_INTAKE_LIMITER,async(req,re
 // Stage 03C-4 prepares the final exclusive hold; Stripe will be a later, separate gate.
 app.post('/lltouch/campaigns/hold/choose-slot',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
   res.set('Cache-Control','no-store');
-  if(!LL_CM_03C4_CONTACT_ENABLED||!LL_CM_03C4_SLOT_ENABLED)
-    return res.status(403).json({ok:false,error:'UNIVERSAL_SLOT_HOLD_DISABLED'});
+  // Stage 03C-5 is contact-only. Hard lock is separate from both existing flags.
+  const slotHardLocked03C5=true;
+  if(slotHardLocked03C5)return res.status(403).json({ok:false,error:'UNIVERSAL_SLOT_HOLD_DISABLED_03C5'});
   if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))return res.status(403).json({ok:false,error:'Request not allowed'});
   const key=String(req.body?.campaignKey||''),id=String(req.body?.hold_id||''),
     nonce=String(req.body?.client_nonce||''),provider=String(req.body?.professional_key||''),
@@ -8245,7 +8265,10 @@ app.get('/lltouch/campaigns/admin/api/reuse/intake-readiness/:key',
     if(dbError)throw dbError;
     return res.json({ok:true,readOnly:true,campaignKey:key,campaignVersion:campaign.version,
       serviceStrategy:contract.serviceStrategy,providers:contract.providers,
-      contactIntakeEnabled:LL_CM_03C4_CONTACT_ENABLED,slotHoldEnabled:LL_CM_03C4_SLOT_ENABLED,
+      contactIntakeEnabled:LL_CM_03C4_CONTACT_ENABLED,
+      contactPilotEnabled:LL_CM_03C5_PILOT_ENABLED,
+      contactIntakeReady:LL_CM_03C4_CONTACT_ENABLED && LL_CM_03C5_PILOT_ENABLED,
+      slotHoldEnabled:false,
       bookingReady:false,checkoutReady:false,paymentEnabled:false,
       dbFunctionsPresent:db?.functionsPresent===true,dbOverlapGuardPresent:db?.overlapGuardPresent===true,
       note:'No public intake, checkout or booking is activated by this diagnostic.'});
