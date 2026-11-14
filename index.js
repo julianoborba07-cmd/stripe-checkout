@@ -5101,29 +5101,18 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
     const features=Array.isArray(m.features)?m.features.slice(0,6).map(x=>({title:safe(x?.title,100),description:safe(x?.description,480)})).filter(x=>x.title&&x.description):[];
     const faqs=Array.isArray(m.faq)?m.faq.slice(0,6).map(x=>({question:safe(x?.question,180),answer:safe(x?.answer,900)})).filter(x=>x.question&&x.answer):[];
     const bookingContract=llCmBookingReuseContract(c);
-    // 03C-5: explicitly opt-in contact-only pilot. This is NOT booking readiness.
-    // Only areas that already have a 30-minute clinical reference are selectable.
-    const contactEligibleAreas=bookingContract.serviceStrategy==='single-laser-offer'
-      && bookingContract.sessions===3 && bookingContract.singleAreaForAllSessions===true
-      && Boolean(VAGARO_LASER_OFFER_SERVICE_ID)
-      // Contact-only: these are REQUESTABLE areas, NOT clinically approved slots.
-      // The legacy area map uses 15/20/25-min estimates; comparing it with the
-      // 30-min generic Laser Offer blocked every contact even when the pilot was on.
-      ? bookingContract.treatmentAreas.filter(a=>Object.prototype.hasOwnProperty.call(
-          VAGARO_SERVICE_MAP.laser.byServiceName||{},a.key))
-      : [];
-    let contactIntakeReady=false;
-    if(LL_CM_03C4_CONTACT_ENABLED && LL_CM_03C5_PILOT_ENABLED && contactEligibleAreas.length){
-      try{llCmHoldPreviewTerms(c);contactIntakeReady=true;}catch{contactIntakeReady=false;}
-    }
+    // 03C-8: customer contact never requires a treatment-area choice.
+    // Stay display-only, even if both legacy environment flags are enabled.
+    const contactIntakeReady=false;
+    const initialContactRequiresArea=false;
     const rawTerms=m.campaignMeta?.serviceTerms;
     const terms=rawTerms&&typeof rawTerms==='object'&&!Array.isArray(rawTerms)?rawTerms:{};
     return res.json({ok:true,enabled:true,campaignKey:c.campaign_key,
       campaignVersion:c.version,bookingReady:false,checkoutReady:false,displayOnly:true,
-      contactIntakeReady,contactOnlyPilot:contactIntakeReady,
+      contactIntakeReady,contactOnlyPilot:contactIntakeReady,initialContactRequiresArea,
       bookingModes:{suggested:false,preferred:false},
       providers:bookingContract.providers,
-      note:'Stage 03C-5A: display-only by default. Lead-only pilot is gated; payments, slot holds and bookings remain disabled.',
+      note:'Stage 03C-8: contact requires no area. Private admin QA only; public intake, holds and payment are locked.',
       offer:{title:safe(c.service_title,160),originalCents:c.regular_price_cents,
         priceCents:c.price_cents,depositCents:c.deposit_cents,holdMinutes:c.hold_minutes,
         offerLabel:safe(c.offer_label,160),startsAt:c.offer_starts_at,endsAt:c.offer_ends_at,
@@ -5136,7 +5125,7 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
           whatToExpect:safe(m.whatToExpect,1100),whoItsFor:safe(m.whoItsFor,1100),
           disclaimer:safe(m.disclaimer,500),ctaText:safe(m.ctaText,90),features,faq:faqs},
         treatmentAreas:bookingContract.treatmentAreas,
-        intakeEligibleAreas:contactIntakeReady?contactEligibleAreas:[],
+        intakeEligibleAreas:[], // no area selection during initial lead intake
         bookingServiceStrategy:bookingContract.serviceStrategy,
         serviceTerms:{sessions:Number.isSafeInteger(terms.sessions)?terms.sessions:null,
           singleAreaForAllSessions:terms.singleAreaForAllSessions===true,
@@ -8088,6 +8077,8 @@ const LL_CM_03C4_SLOT_ENABLED=process.env.LLTOUCH_CM_UNIVERSAL_SLOT_ENABLED==='t
 // Second explicit opt-in: a contact-only QA pilot must never activate on an
 // unrelated flag change. Do NOT enable these in production for ordinary users.
 const LL_CM_03C5_PILOT_ENABLED=process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_PILOT_ENABLED==='true';
+// 03C-8: public traffic remains blocked until an authenticated pilot is designed.
+const LL_CM_03C8_PUBLIC_CONTACT_HARD_LOCK=true;
 const LL_CM_03C4_INTAKE_LIMITER=rateLimit({
   windowMs:15*60*1000,max:8,standardHeaders:'draft-7',legacyHeaders:false,
   message:{ok:false,error:'Too many requests. Please try again later.'}
@@ -8131,33 +8122,23 @@ function llCm3C4SelectArea(contract,key){
     throw Error('UNIVERSAL_AREA_REQUIRES_REVIEW');
   return area;
 }
-// Only for collecting an interest/contact. This must NOT be reused by
-// choose-slot, checkout or paid booking: those require independent clinical
-// duration approval and fresh Vagaro + Google Calendar availability checks.
-function llCm3C5SelectContactArea(contract,key){
-  const area=contract.treatmentAreas.find(a=>a.key===key);
-  const stored=Object.prototype.hasOwnProperty.call(VAGARO_SERVICE_MAP.laser.byServiceName||{},key)
-    ? VAGARO_SERVICE_MAP.laser.byServiceName[key] : null;
-  if(!area||!stored||!Number.isFinite(stored.durationMinutes)||stored.durationMinutes<=0
-     ||!VAGARO_LASER_OFFER_SERVICE_ID)
-    throw Error('UNIVERSAL_AREA_REQUIRES_REVIEW');
-  return area;
-}
 function llCm3C4ContactInput(body){
   const name=cleanLeadField(body?.name,120),email=String(body?.email||'').trim().toLowerCase(),
-    phone=cleanLeadField(body?.phone,40),area=String(body?.requested_area||''),
+    phone=cleanLeadField(body?.phone,40),
     nonce=String(body?.client_nonce||'');
   if(name.length<3||!isValidEmail(email)||email.length>254||
      phone.length<7||phone.replace(/\D/g,'').length<10||phone.replace(/\D/g,'').length>15||
      !LL_CM_03C4_UUID.test(nonce)||body?.consent!==true||
      typeof body?.sms_marketing_consent!=='boolean'||
-     !/^[a-z0-9-]{2,80}$/.test(area))throw Error('INVALID_UNIVERSAL_CONTACT');
-  return {name,email,phone,area,nonce,sms:body.sms_marketing_consent};
+     (body?.requested_area!=null && body.requested_area!==''))throw Error('INVALID_UNIVERSAL_CONTACT');
+  return {name,email,phone,nonce,sms:body.sms_marketing_consent};
 }
 // Future customer form entry. DISABLED by default, even for published campaigns.
 // Only creates a 10-minute contact/window record with NO provider and NO slot.
 app.post('/lltouch/campaigns/hold',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
   res.set('Cache-Control','no-store');
+  if(LL_CM_03C8_PUBLIC_CONTACT_HARD_LOCK)
+    return res.status(403).json({ok:false,error:'CONTACT_INTAKE_PRIVATE_QA_ONLY'});
   if(!LL_CM_03C4_CONTACT_ENABLED||!LL_CM_03C5_PILOT_ENABLED)
     return res.status(403).json({ok:false,error:'CONTACT_INTAKE_DISABLED'});
   if(!llCm3C4PublicOrigin(req))return res.status(403).json({ok:false,error:'Origin not allowed'});
@@ -8165,25 +8146,24 @@ app.post('/lltouch/campaigns/hold',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
   try{
     const input=llCm3C4ContactInput(req.body);
     const key=String(req.body?.campaignKey||''),version=req.body?.campaignVersion;
-    const {campaign,quote,contract}=await llCm3C4Campaign(key);
+    const {campaign,quote}=await llCm3C4Campaign(key);
     if(version!==campaign.version)throw Error('UNIVERSAL_CAMPAIGN_VERSION_CHANGED');
-    llCm3C5SelectContactArea(contract,input.area);
     const snapshot={mode:'universal-contact-no-checkout',campaignKey:key,campaignVersion:campaign.version,
       serviceName:'Laser Offer',serviceId:String(VAGARO_LASER_OFFER_SERVICE_ID),
-      areaKey:input.area,areaPolicy:'any-area-same-area',sessions:3,durationMinutes:30,
+      areaKey:null,areaPolicy:'any-area-same-area',sessions:3,durationMinutes:30,
       priceCents:quote.priceCents,regularPriceCents:quote.regularPriceCents,
       depositCents:quote.depositCents,holdMinutes:10,currency:'usd'};
     const {data,error}=await academySupabase.rpc('lltouch_cm_universal_begin_contact',{
       p_campaign_key:key,p_campaign_version:campaign.version,p_client_nonce:input.nonce,
       p_customer_name:input.name,p_customer_email:input.email,p_customer_phone:input.phone,
       p_contact_consent:true,p_sms_marketing_consent:input.sms,
-      p_treatment_area_key:input.area,p_quote_snapshot:snapshot
+      p_treatment_area_key:null,p_quote_snapshot:snapshot
     });
     if(error)throw error;
     if(!data?.ok||!LL_CM_03C4_UUID.test(data.holdId)||!Number.isFinite(Date.parse(data.expiresAt)))
       throw Error('Unexpected contact acknowledgement');
     return res.json({ok:true,hold_id:data.holdId,deadline:data.expiresAt,
-      campaignKey:key,campaignVersion:campaign.version,areaKey:input.area,
+      campaignKey:key,campaignVersion:campaign.version,areaKey:null,
       idempotent:data.idempotent===true,slotHeld:false,bookingReady:false,checkoutReady:false,
       note:'Contact recorded. No appointment time is held, no payment is collected.'});
   }catch(e){return llCm3C4Fail(res,e,'contact intake')}
@@ -8191,6 +8171,8 @@ app.post('/lltouch/campaigns/hold',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
 
 app.post('/lltouch/campaigns/hold/status',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
   res.set('Cache-Control','no-store');
+  if(LL_CM_03C8_PUBLIC_CONTACT_HARD_LOCK)
+    return res.status(403).json({ok:false,error:'CONTACT_INTAKE_PRIVATE_QA_ONLY'});
   if(!LL_CM_03C4_CONTACT_ENABLED||!LL_CM_03C5_PILOT_ENABLED)
     return res.status(403).json({ok:false,error:'CONTACT_INTAKE_DISABLED'});
   if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))return res.status(403).json({ok:false,error:'Request not allowed'});
@@ -8287,8 +8269,9 @@ app.get('/lltouch/campaigns/admin/api/reuse/intake-readiness/:key',
       contactIntakeEnabled:LL_CM_03C4_CONTACT_ENABLED,
       contactPilotEnabled:LL_CM_03C5_PILOT_ENABLED,
       contactAreaOptionsForLeadOnly,
-      clinicalBookingAreasApproved:false,
-      contactIntakeReady:LL_CM_03C4_CONTACT_ENABLED && LL_CM_03C5_PILOT_ENABLED && contactAreaOptionsForLeadOnly>0,
+      clinicalBookingAreasApproved:false,initialContactRequiresArea:false,
+      areaSelectionStage:'after-contact; not yet enabled',
+      contactIntakeReady:false, // 03C-8 hard lock; no public form even if flags changed
       slotHoldEnabled:false,
       bookingReady:false,checkoutReady:false,paymentEnabled:false,
       dbFunctionsPresent:db?.functionsPresent===true,dbOverlapGuardPresent:db?.overlapGuardPresent===true,
@@ -8330,6 +8313,41 @@ app.get('/lltouch/campaigns/admin/api/reuse/contact-http-qa/:key',
       note:'Authenticated admin QA only. Test contact was rolled back in the same database transaction.'});
   }catch(e){return llCmAuditSafeError(e,res,'Campaign Studio 03C-7 admin HTTP QA');}
 });
+
+// 03C-8 | ADMIN HTTP QA: synthetic contact with NO treatment area.
+// RPC SQL39 rolls back all test writes. Public lead and checkout remain hard-locked.
+app.get('/lltouch/campaigns/admin/api/reuse/contact-no-area-qa/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_REMOTE_AUDIT_LIMITER,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');
+  res.set('X-Robots-Tag','noindex,nofollow');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))
+    return res.status(422).json({ok:false,error:'Invalid campaign key'});
+  if(LL_CM_03C4_CONTACT_ENABLED||LL_CM_03C5_PILOT_ENABLED||LL_CM_03C4_SLOT_ENABLED)
+    return res.status(409).json({ok:false,error:'Disable public contact, pilot and slot flags for private QA.'});
+  try{
+    const campaign=await llCmReadOnlyCampaign(key);
+    if(campaign.version!==5||campaign.marketing?.campaignMeta?.bookingReady!==false||
+       campaign.marketing?.campaignMeta?.checkoutReady!==false)
+      return res.status(409).json({ok:false,error:'Campaign is not in display-only QA state.'});
+    const {data,error}=await academySupabase.rpc('lltouch_cm_admin_http_contact_qa_03c8',{
+      p_campaign_key:key
+    });
+    if(error)throw error;
+    if(data?.ok!==true||data.noAreaAccepted!==true||data.contactAccepted!==true||
+       data.idempotentNoTtlReset!==true||data.statusRead!==true||
+       data.invalidNonceRejected!==true||data.rollbackVerified!==true||data.noSlotHeld!==true)
+      throw new Error('Unexpected no-area admin QA result');
+    return res.json({ok:true,readOnlyResult:true,transientTestWritesRolledBack:true,
+      campaignKey:key,initialContactRequiresArea:false,noAreaAccepted:true,
+      idempotentNoTtlReset:true,statusRead:true,invalidNonceRejected:true,
+      rollbackVerified:true,noSlotHeld:true,paymentEnabled:false,
+      bookingReady:false,checkoutReady:false,
+      note:'Private admin QA: initial contact had no area, no slot, and no payment.'});
+  }catch(e){return llCmAuditSafeError(e,res,'Campaign Studio 03C-8 no-area admin QA');}
+});
+// END CAMPAIGN STUDIO 03C-8
+
 // END CAMPAIGN STUDIO 03C-7
 
 // END CAMPAIGN STUDIO 03C-4
