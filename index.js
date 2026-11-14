@@ -5106,7 +5106,11 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
     const contactEligibleAreas=bookingContract.serviceStrategy==='single-laser-offer'
       && bookingContract.sessions===3 && bookingContract.singleAreaForAllSessions===true
       && Boolean(VAGARO_LASER_OFFER_SERVICE_ID)
-      ? bookingContract.treatmentAreas.filter(a=>VAGARO_SERVICE_MAP.laser.byServiceName?.[a.key]?.durationMinutes===30)
+      // Contact-only: these are REQUESTABLE areas, NOT clinically approved slots.
+      // The legacy area map uses 15/20/25-min estimates; comparing it with the
+      // 30-min generic Laser Offer blocked every contact even when the pilot was on.
+      ? bookingContract.treatmentAreas.filter(a=>Object.prototype.hasOwnProperty.call(
+          VAGARO_SERVICE_MAP.laser.byServiceName||{},a.key))
       : [];
     let contactIntakeReady=false;
     if(LL_CM_03C4_CONTACT_ENABLED && LL_CM_03C5_PILOT_ENABLED && contactEligibleAreas.length){
@@ -5119,7 +5123,7 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
       contactIntakeReady,contactOnlyPilot:contactIntakeReady,
       bookingModes:{suggested:false,preferred:false},
       providers:bookingContract.providers,
-      note:'Stage 03B-1: public visual display only; payment, hold and scheduling remain disabled.',
+      note:'Stage 03C-5A: display-only by default. Lead-only pilot is gated; payments, slot holds and bookings remain disabled.',
       offer:{title:safe(c.service_title,160),originalCents:c.regular_price_cents,
         priceCents:c.price_cents,depositCents:c.deposit_cents,holdMinutes:c.hold_minutes,
         offerLabel:safe(c.offer_label,160),startsAt:c.offer_starts_at,endsAt:c.offer_ends_at,
@@ -8127,6 +8131,18 @@ function llCm3C4SelectArea(contract,key){
     throw Error('UNIVERSAL_AREA_REQUIRES_REVIEW');
   return area;
 }
+// Only for collecting an interest/contact. This must NOT be reused by
+// choose-slot, checkout or paid booking: those require independent clinical
+// duration approval and fresh Vagaro + Google Calendar availability checks.
+function llCm3C5SelectContactArea(contract,key){
+  const area=contract.treatmentAreas.find(a=>a.key===key);
+  const stored=Object.prototype.hasOwnProperty.call(VAGARO_SERVICE_MAP.laser.byServiceName||{},key)
+    ? VAGARO_SERVICE_MAP.laser.byServiceName[key] : null;
+  if(!area||!stored||!Number.isFinite(stored.durationMinutes)||stored.durationMinutes<=0
+     ||!VAGARO_LASER_OFFER_SERVICE_ID)
+    throw Error('UNIVERSAL_AREA_REQUIRES_REVIEW');
+  return area;
+}
 function llCm3C4ContactInput(body){
   const name=cleanLeadField(body?.name,120),email=String(body?.email||'').trim().toLowerCase(),
     phone=cleanLeadField(body?.phone,40),area=String(body?.requested_area||''),
@@ -8151,7 +8167,7 @@ app.post('/lltouch/campaigns/hold',LL_CM_03C4_INTAKE_LIMITER,async(req,res)=>{
     const key=String(req.body?.campaignKey||''),version=req.body?.campaignVersion;
     const {campaign,quote,contract}=await llCm3C4Campaign(key);
     if(version!==campaign.version)throw Error('UNIVERSAL_CAMPAIGN_VERSION_CHANGED');
-    llCm3C4SelectArea(contract,input.area);
+    llCm3C5SelectContactArea(contract,input.area);
     const snapshot={mode:'universal-contact-no-checkout',campaignKey:key,campaignVersion:campaign.version,
       serviceName:'Laser Offer',serviceId:String(VAGARO_LASER_OFFER_SERVICE_ID),
       areaKey:input.area,areaPolicy:'any-area-same-area',sessions:3,durationMinutes:30,
@@ -8263,11 +8279,16 @@ app.get('/lltouch/campaigns/admin/api/reuse/intake-readiness/:key',
     const {campaign,contract}=await llCm3C4Campaign(key);
     const {data:db,error:dbError}=await academySupabase.rpc('lltouch_cm_universal_03c4_readiness');
     if(dbError)throw dbError;
+    // Audit of lead-only choices; this does not authorize ANY appointments.
+    const contactAreaOptionsForLeadOnly=contract.treatmentAreas.filter(a=>
+      Object.prototype.hasOwnProperty.call(VAGARO_SERVICE_MAP.laser.byServiceName||{},a.key)).length;
     return res.json({ok:true,readOnly:true,campaignKey:key,campaignVersion:campaign.version,
       serviceStrategy:contract.serviceStrategy,providers:contract.providers,
       contactIntakeEnabled:LL_CM_03C4_CONTACT_ENABLED,
       contactPilotEnabled:LL_CM_03C5_PILOT_ENABLED,
-      contactIntakeReady:LL_CM_03C4_CONTACT_ENABLED && LL_CM_03C5_PILOT_ENABLED,
+      contactAreaOptionsForLeadOnly,
+      clinicalBookingAreasApproved:false,
+      contactIntakeReady:LL_CM_03C4_CONTACT_ENABLED && LL_CM_03C5_PILOT_ENABLED && contactAreaOptionsForLeadOnly>0,
       slotHoldEnabled:false,
       bookingReady:false,checkoutReady:false,paymentEnabled:false,
       dbFunctionsPresent:db?.functionsPresent===true,dbOverlapGuardPresent:db?.overlapGuardPresent===true,
