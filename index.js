@@ -8295,6 +8295,43 @@ app.get('/lltouch/campaigns/admin/api/reuse/intake-readiness/:key',
       note:'No public intake, checkout or booking is activated by this diagnostic.'});
   }catch(e){return llCm3C4Fail(res,e,'admin readiness')}
 });
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-7 | ADMIN HTTP -> SUPABASE RPC QA
+// Admin Basic Auth, no public flag toggle; DB 38 rolls back synthetic contact.
+// NO Stripe payment, GHL contact, slot hold or external calendar side effects.
+// ============================================================================
+app.get('/lltouch/campaigns/admin/api/reuse/contact-http-qa/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_REMOTE_AUDIT_LIMITER,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');
+  res.set('X-Robots-Tag','noindex,nofollow');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))
+    return res.status(422).json({ok:false,error:'Invalid campaign key'});
+  // Refuse to run if anyone enabled public contact, pilot or time locking.
+  if(LL_CM_03C4_CONTACT_ENABLED||LL_CM_03C5_PILOT_ENABLED||LL_CM_03C4_SLOT_ENABLED)
+    return res.status(409).json({ok:false,error:'Disable public contact, pilot and slot features before admin QA.'});
+  try{
+    const campaign=await llCmReadOnlyCampaign(key);
+    if(campaign.version!==5||campaign.marketing?.campaignMeta?.bookingReady!==false||
+       campaign.marketing?.campaignMeta?.checkoutReady!==false)
+      return res.status(409).json({ok:false,error:'Campaign not in safe display-only QA state.'});
+    const {data,error}=await academySupabase.rpc('lltouch_cm_admin_http_contact_qa_03c7',{
+      p_campaign_key:key
+    });
+    if(error)throw error;
+    if(data?.ok!==true||data.rollbackVerified!==true||data.invalidNonceRejected!==true||
+       data.idempotentNoTtlReset!==true||data.noSlotHeld!==true)
+      throw new Error('Unexpected admin QA result');
+    return res.json({ok:true,readOnlyResult:true,transientTestWritesRolledBack:true,
+      campaignKey:key,contactAccepted:data.contactAccepted===true,
+      idempotentNoTtlReset:true,statusRead:data.statusRead===true,
+      invalidNonceRejected:true,rollbackVerified:true,noSlotHeld:true,
+      paymentEnabled:false,bookingReady:false,checkoutReady:false,
+      note:'Authenticated admin QA only. Test contact was rolled back in the same database transaction.'});
+  }catch(e){return llCmAuditSafeError(e,res,'Campaign Studio 03C-7 admin HTTP QA');}
+});
+// END CAMPAIGN STUDIO 03C-7
+
 // END CAMPAIGN STUDIO 03C-4
 
 
