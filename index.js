@@ -8346,6 +8346,82 @@ app.get('/lltouch/campaigns/admin/api/reuse/contact-no-area-qa/:key',
       note:'Private admin QA: initial contact had no area, no slot, and no payment.'});
   }catch(e){return llCmAuditSafeError(e,res,'Campaign Studio 03C-8 no-area admin QA');}
 });
+
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-9 | PRIVATE BROWSER CONTACT PILOT
+// Accessible only after existing Basic Auth on the Render admin origin.
+// Public /offer and /offer-reserve remain hard-locked; this form cannot book,
+// charge, schedule, or notify anyone. SQL 41 rolls back every synthetic record.
+// ============================================================================
+const LL_CM_03C9_PRIVATE_FORM_HTML = "<!doctype html>\n<html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>LL Touch | Campaign Studio — Piloto Privado</title>\n<style>\n:root{color-scheme:light;--ink:#26372e;--cream:#f6f4ef;--line:#d7d9d1;--muted:#59665e}\n*{box-sizing:border-box}body{margin:0;background:var(--cream);font:16px/1.55 system-ui,-apple-system,Segoe UI,Arial,sans-serif;color:var(--ink)}\nheader{background:#fffefa;border-bottom:1px solid var(--line);padding:19px 22px;font-weight:700;letter-spacing:.055em}\nmain{max-width:880px;margin:32px auto;padding:0 18px}h1{font:400 clamp(30px,5vw,46px)/1.16 Georgia,serif;margin:8px 0 15px}\nh2{font:400 27px Georgia,serif}.eyebrow{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.16em;color:#7e725a}\np{margin:0 0 16px}small{color:var(--muted)}.card{background:#fff;border:1px solid var(--line);padding:clamp(20px,4vw,32px);margin:20px 0}\nlabel{display:block;font-weight:650;margin:13px 0 0}input[type=text],input[type=email],input[type=tel]{display:block;width:100%;margin-top:6px;min-height:47px;border:1px solid #b4beb5;padding:10px 12px;font:inherit}\n.check{display:flex;gap:10px;align-items:flex-start;font-weight:500}.check input{margin-top:6px}.check span{flex:1}\nbutton{border:0;background:var(--ink);color:white;font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:15px 22px;min-height:50px;cursor:pointer;width:100%}\nbutton:disabled{opacity:.5;cursor:default}.muted{color:var(--muted)}.note{border:1px solid #cabf9d;background:#f8f5eb;padding:12px 14px;font-size:14px}\n.error{color:#a02a26;font-weight:600}.ok{color:#285a37;font-weight:700}.hidden{display:none!important}dl{display:grid;grid-template-columns:1fr auto;gap:8px 20px}dd{margin:0;font-weight:700}\n</style></head><body>\n<header>LL TOUCH · CAMPAIGN STUDIO · ADMIN QA</header>\n<main>\n<p class=\"eyebrow\">Etapa 03C-9 · Acesso restrito</p><h1>Piloto privado do formulário</h1>\n<p>Este teste envia dados <strong>fictícios</strong> ao backend, verifica o Supabase e desfaz os registros na mesma transação. Não publica o formulário e não utiliza Stripe, Vagaro, Google Calendar ou GoHighLevel.</p>\n<p class=\"note\">O formulário público da <code>/offer</code> continua oculto. Esta tela de administração valida o mesmo contrato de contato, mas ainda <strong>não</strong> é um teste visual completo das duas páginas Webflow.</p>\n<div class=\"card\" id=\"step1\">\n <p class=\"eyebrow\">Passo 1 — Contato fictício</p>\n <form id=\"qaForm\" novalidate>\n  <label>Nome completo *<input name=\"name\" type=\"text\" value=\"Campaign Studio QA\" maxlength=\"120\" required autocomplete=\"off\"></label>\n  <label>E-mail *<input name=\"email\" type=\"email\" value=\"campaign-qa@example.invalid\" maxlength=\"254\" required autocomplete=\"off\"></label>\n  <label>Telefone *<input name=\"phone\" type=\"tel\" value=\"7815550100\" required autocomplete=\"off\"></label>\n  <label class=\"check\"><input name=\"consent\" type=\"checkbox\" required><span>Confirmo que estes são dados fictícios e autorizo a execução deste teste administrativo.</span></label>\n  <label class=\"check\"><input name=\"sms\" type=\"checkbox\" disabled><span>SMS promocional desativado no piloto.</span></label>\n  <p class=\"muted\" style=\"font-size:13px\">Nenhuma área de laser é solicitada. Use somente os valores de teste sugeridos, nunca dados de clientes.</p>\n  <button id=\"go\" type=\"submit\">Testar registro e recuperação</button>\n  <p id=\"message\" role=\"status\" aria-live=\"polite\"></p>\n </form>\n</div>\n<div class=\"card hidden\" id=\"step2\" aria-live=\"polite\">\n <p class=\"eyebrow\">Passo 2 — Resultado administrativo</p>\n <h2>Contato validado sem área</h2>\n <p class=\"ok\">A comunicação do navegador com o Render e o Supabase foi validada. Todos os dados fictícios foram revertidos.</p>\n <dl id=\"results\"></dl>\n <p class=\"note\">Não existe agendamento, pagamento ou contato persistente. O próximo teste do fluxo real do Webflow será realizado separadamente.</p>\n</div>\n<small>Campanha: <code>__KEY__</code> · Acesso protegido por credenciais do Campaign Studio</small>\n</main>\n<script nonce=\"__NONCE__\">\n'use strict';\nconst campaignKey='__KEY__';\nconst form=document.getElementById('qaForm'),go=document.getElementById('go'),msg=document.getElementById('message');\nform.addEventListener('submit',async ev=>{\n ev.preventDefault();msg.textContent='';\n const name=form.elements.name.value.trim(),email=form.elements.email.value.trim().toLowerCase(),phone=form.elements.phone.value.trim();\n if(!form.elements.consent.checked){msg.className='error';msg.textContent='Confirme a utilização de dados fictícios.';return;}\n if(!/^Campaign Studio QA( [a-zA-Z0-9-]{1,20})?$/.test(name)||!/^campaign-qa(\\+[a-z0-9-]{1,20})?@example\\.invalid$/i.test(email)||phone.replace(/\\D/g,'')!=='7815550100'){\n  msg.className='error';msg.textContent='Use somente os valores fictícios sugeridos.';return;\n }\n go.disabled=true;go.textContent='Validando…';\n try{\n  const response=await fetch('/lltouch/campaigns/admin/api/pilot/contact-no-area/'+encodeURIComponent(campaignKey),{\n   method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',credentials:'same-origin',\n   body:JSON.stringify({name,email,phone,consent:true,sms_marketing_consent:false,client_nonce:crypto.randomUUID()})\n  });\n  const data=await response.json();\n  if(!response.ok||data.ok!==true||data.rollbackVerified!==true||data.noAreaAccepted!==true)throw Error(data.error||'Falha na validação');\n  const fields=[['Contato aceito',data.contactAccepted],['Sem área selecionada',data.noAreaAccepted],['Idempotência',data.idempotentNoTtlReset],\n    ['Status recuperado',data.statusRead],['Nonce inválido bloqueado',data.invalidNonceRejected],['Rollback verificado',data.rollbackVerified],\n    ['Nenhum horário ocupado',data.noSlotHeld],['Nenhum pagamento',data.noPayment],['Nenhuma reserva',data.noBooking]];\n  const dl=document.getElementById('results');dl.replaceChildren();\n  for(const [label,value] of fields){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value===true?'PASS':'FALHA';dl.append(dt,dd)}\n  document.getElementById('step2').classList.remove('hidden');document.getElementById('step2').scrollIntoView({behavior:'smooth'});\n }catch(e){msg.className='error';msg.textContent=e.message||'Erro no teste';}\n finally{go.disabled=false;go.textContent='Testar novamente';}\n});\n</script></body></html>";
+app.get('/lltouch/campaigns/admin/pilot/contact-no-area/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).send('Invalid campaign key');
+  if(LL_CM_03C4_CONTACT_ENABLED||LL_CM_03C5_PILOT_ENABLED||LL_CM_03C4_SLOT_ENABLED)
+    return res.status(409).send('Disable public contact and slot flags before QA.');
+  try{
+    const c=await llCmReadOnlyCampaign(key);
+    if(c.marketing?.campaignMeta?.releaseMode!=='display-only'||
+       c.marketing?.campaignMeta?.bookingReady!==false||
+       c.marketing?.campaignMeta?.checkoutReady!==false)
+      return res.status(409).send('Campaign is not in safe display-only state.');
+    const nonce=crypto.randomBytes(18).toString('base64');
+    res.set('Content-Security-Policy',`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`);
+    res.set('Referrer-Policy','no-referrer');
+    res.set('X-Frame-Options','DENY');
+    res.set('Cache-Control','private, no-store');
+    return res.type('html').send(LL_CM_03C9_PRIVATE_FORM_HTML
+      .replaceAll('__KEY__',key).replace('__NONCE__',nonce));
+  }catch(e){return llCmAuditSafeError(e,res,'Campaign Studio private browser pilot page');}
+});
+app.post('/lltouch/campaigns/admin/api/pilot/contact-no-area/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_REMOTE_AUDIT_LIMITER,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'Invalid campaign key'});
+  if(LL_CM_03C4_CONTACT_ENABLED||LL_CM_03C5_PILOT_ENABLED||LL_CM_03C4_SLOT_ENABLED)
+    return res.status(409).json({ok:false,error:'Disable public contact and slot flags before private QA.'});
+  if(!llCmAdminSameOrigin(req)||!llCm3C4Body(req))
+    return res.status(403).json({ok:false,error:'Invalid request origin or JSON body'});
+  const body=req.body||{};
+  // Server-side allowlist: this QA accepts no treatment area, appointment, or customer identifier.
+  const allowed=['name','email','phone','consent','sms_marketing_consent','client_nonce'];
+  if(Object.keys(body).some(k=>!allowed.includes(k)))
+    return res.status(422).json({ok:false,error:'Unexpected test input'});
+  const name=String(body.name||'').trim(),email=String(body.email||'').trim().toLowerCase(),phone=String(body.phone||'').trim();
+  if(!/^Campaign Studio QA( [A-Za-z0-9-]{1,20})?$/.test(name)||
+     !/^campaign-qa(\+[a-z0-9-]{1,20})?@example\.invalid$/.test(email)||
+     phone.replace(/\D/g,'')!=='7815550100'||
+     body.consent!==true||body.sms_marketing_consent!==false||
+     !LL_CM_03C4_UUID.test(String(body.client_nonce||'')))
+    return res.status(422).json({ok:false,error:'Only synthetic QA values are accepted.'});
+  try{
+    const c=await llCmReadOnlyCampaign(key);
+    if(c.marketing?.campaignMeta?.releaseMode!=='display-only'||
+       c.marketing?.campaignMeta?.bookingReady!==false||
+       c.marketing?.campaignMeta?.checkoutReady!==false)
+      return res.status(409).json({ok:false,error:'Campaign is not in safe display-only state.'});
+    const {data,error}=await academySupabase.rpc('lltouch_cm_admin_form_pilot_03c9',{
+      p_campaign_key:key,p_campaign_version:c.version,p_client_nonce:body.client_nonce,
+      p_customer_name:name,p_customer_email:email,p_customer_phone:phone,
+      p_contact_consent:true,p_sms_marketing_consent:false
+    });
+    if(error)throw error;
+    const required=['contactAccepted','noAreaAccepted','idempotentNoTtlReset','statusRead',
+      'invalidNonceRejected','rollbackVerified','noSlotHeld','noPayment','noBooking','syntheticDataOnly'];
+    if(data?.ok!==true||required.some(field=>data[field]!==true))
+      throw Error('Private QA assertion failed.');
+    return res.json({ok:true,qaOnly:true,transientTestWritesRolledBack:true,
+      campaignKey:key,contactAccepted:true,noAreaAccepted:true,
+      idempotentNoTtlReset:true,statusRead:true,invalidNonceRejected:true,
+      rollbackVerified:true,noSlotHeld:true,noPayment:true,noBooking:true,
+      bookingReady:false,checkoutReady:false,
+      note:'Synthetic contact tested and rolled back; no area, booking, or payment.'});
+  }catch(e){return llCmAuditSafeError(e,res,'Campaign Studio 03C-9 private browser pilot');}
+});
+// END CAMPAIGN STUDIO 03C-9
+
 // END CAMPAIGN STUDIO 03C-8
 
 // END CAMPAIGN STUDIO 03C-7
