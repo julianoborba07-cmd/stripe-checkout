@@ -8420,6 +8420,203 @@ app.post('/lltouch/campaigns/admin/api/pilot/contact-no-area/:key',
       note:'Synthetic contact tested and rolled back; no area, booking, or payment.'});
   }catch(e){return llCmAuditSafeError(e,res,'Campaign Studio 03C-9 private browser pilot');}
 });
+
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-10 | REAL WEBFLOW CONTACT PATH - PRIVATE QA
+// Admin issues a short-lived, HMAC-signed browser pass. The pass is supplied
+// in the URL FRAGMENT (never sent to Webflow) and stored in sessionStorage.
+// Only FIXED SYNTHETIC data is accepted; no real customer input/PII.
+// Public /hold, /hold/status, /choose-slot, checkout, booking and GHL untouched.
+// Explicit, independent feature gate; FALSE BY DEFAULT.
+// ============================================================================
+const LL_CM_03C10_QA_ENABLED = process.env.LLTOUCH_CM_WEBFLOW_QA_ENABLED === 'true';
+const LL_CM_03C10_SCOPE = 'real-webflow-contact-synthetic-03c10';
+const LL_CM_03C10_RATE = rateLimit({windowMs:15*60*1000,max:12,
+  standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'QA rate limit reached.'}});
+function llCm3C10Key(){
+  // Domain-separated from Basic authentication; never discloses the password.
+  const pass=String(process.env.LLTOUCH_CM_ADMIN_PASSWORD||'');
+  if(pass.length<20)return null;
+  return crypto.createHmac('sha256',pass).update('lltouch-cm-webflow-contact-qa-03c10-v1').digest();
+}
+function llCm3C10Sign(payload){
+  const key=llCm3C10Key();if(!key)throw Error('Private QA credential unavailable');
+  const raw=Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const mac=crypto.createHmac('sha256',key).update(raw).digest('base64url');
+  return raw+'.'+mac;
+}
+function llCm3C10Check(token){
+  if(!LL_CM_03C10_QA_ENABLED||typeof token!=='string'||token.length>1500)return null;
+  const key=llCm3C10Key();if(!key)return null;
+  const match=/^([A-Za-z0-9_-]{20,1300})\.([A-Za-z0-9_-]{43})$/.exec(token);
+  if(!match)return null;
+  const expected=crypto.createHmac('sha256',key).update(match[1]).digest();
+  let actual;try{actual=Buffer.from(match[2],'base64url')}catch{return null}
+  if(actual.length!==expected.length||!crypto.timingSafeEqual(actual,expected))return null;
+  try{
+    const c=JSON.parse(Buffer.from(match[1],'base64url').toString('utf8'));
+    const now=Date.now();
+    if(c.scope!==LL_CM_03C10_SCOPE||c.version!==1||
+      !LL_CM_DISPLAY_KEY.test(c.campaignKey)||!Number.isSafeInteger(c.campaignVersion)||
+      !LL_CM_03C4_UUID.test(c.nonce)||!Number.isSafeInteger(c.iat)||
+      !Number.isSafeInteger(c.exp)||c.iat>now+10000||c.exp<now||
+      c.exp-c.iat>12*60*1000||c.exp<=c.iat)return null;
+    return c;
+  }catch{return null}
+}
+function llCm3C10Profile(c){
+  return {name:'Campaign Studio QA',
+    email:'campaign-qa+'+c.nonce.replaceAll('-','').slice(0,12)+'@example.invalid',
+    phone:'7815550100',nonce:c.nonce};
+}
+function llCm3C10SafeRequest(req){
+  if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))return null;
+  return llCm3C10Check(String(req.get('x-ll-cm-qa')||''));
+}
+async function llCm3C10Campaign(c){
+  // False even if unrelated contact flags are accidentally enabled.
+  if(!LL_CM_03C10_QA_ENABLED||LL_CM_03C4_CONTACT_ENABLED||
+      LL_CM_03C5_PILOT_ENABLED||LL_CM_03C4_SLOT_ENABLED)throw Error('QA isolated-mode gate is not satisfied');
+  const {campaign,quote,contract}=await llCm3C4Campaign(c.campaignKey);
+  const m=campaign.marketing?.campaignMeta||{};
+  const now=Date.now();
+  if(campaign.version!==c.campaignVersion||campaign.status!=='published'||
+     m.releaseMode!=='display-only'||m.bookingReady!==false||m.checkoutReady!==false||
+     now<Date.parse(campaign.offer_starts_at)||now>=Date.parse(campaign.offer_ends_at)||
+     contract.serviceStrategy!=='single-laser-offer')throw Error('QA campaign outside safe published window');
+  return {campaign,quote};
+}
+function llCm3C10Json(req,res,next){
+  res.set('Cache-Control','no-store');res.set('X-Robots-Tag','noindex,nofollow');
+  res.set('Referrer-Policy','no-referrer');
+  const token=llCm3C10SafeRequest(req);
+  if(!token)return res.status(403).json({ok:false,error:'Private Webflow QA pass invalid or disabled.'});
+  req.llCm3C10=token;next();
+}
+// Launch REAL /offer only from existing authenticated Campaign Studio backend.
+// The fragment is not sent in HTTP requests to Webflow or Render logs.
+app.get('/lltouch/campaigns/admin/pilot/webflow-start/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');res.set('Referrer-Policy','no-referrer');
+  if(!LL_CM_03C10_QA_ENABLED)return res.status(403).send('Enable LLTOUCH_CM_WEBFLOW_QA_ENABLED=true for a short admin QA session.');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).send('Invalid campaign key');
+  try{
+    const c=await llCmReadOnlyCampaign(key);
+    const issued=Date.now();
+    const p={scope:LL_CM_03C10_SCOPE,version:1,campaignKey:key,campaignVersion:c.version,
+      nonce:crypto.randomUUID(),iat:issued,exp:issued+12*60*1000};
+    await llCm3C10Campaign(p);
+    return res.redirect(303,'https://lltouch.com/offer#cmPilot='+llCm3C10Sign(p));
+  }catch(e){console.error('03C-10 QA pass issue:',String(e?.message||e).slice(0,130));
+    return res.status(409).send('Private QA unavailable for this campaign/window.');}
+});
+app.get('/lltouch/campaigns/admin/api/pilot/webflow-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false});
+  try{
+    const {campaign}=await llCm3C4Campaign(key);
+    return res.json({ok:true,readOnly:true,campaignKey:key,campaignVersion:campaign.version,
+      qaEnabled:LL_CM_03C10_QA_ENABLED,publicContactEnabled:false,
+      publicHoldEnabled:false,bookingReady:false,checkoutReady:false,
+      pilotData:'synthetic-only',pilotMode:'real-webflow-pages',
+      note:'Only authenticated admin can issue time-limited test link.'});
+  }catch(e){return llCm3C4Fail(res,e,'webflow QA readiness')}
+});
+app.post('/lltouch/campaigns/pilot/03c10/context',
+  LL_CM_03C10_RATE,llCm3C10Json,async(req,res)=>{
+  try{
+    const c=req.llCm3C10;
+    if(String(req.body?.campaignKey||'')!==c.campaignKey)return res.status(403).json({ok:false,error:'Campaign mismatch'});
+    await llCm3C10Campaign(c);
+    return res.json({ok:true,authorized:true,qaOnly:true,
+      campaignKey:c.campaignKey,campaignVersion:c.campaignVersion,
+      profile:llCm3C10Profile(c),expiresAt:new Date(c.exp).toISOString(),
+      noPayment:true,noBooking:true});
+  }catch(e){return res.status(409).json({ok:false,error:'QA campaign not eligible.'});}
+});
+app.post('/lltouch/campaigns/pilot/03c10/contact',
+  LL_CM_03C10_RATE,llCm3C10Json,async(req,res)=>{
+  try{
+    const c=req.llCm3C10,b=req.body||{},p=llCm3C10Profile(c);
+    const allowed=['campaignKey','campaignVersion','name','email','phone','consent','sms_marketing_consent','client_nonce'];
+    if(Object.keys(b).some(x=>!allowed.includes(x))||
+       b.campaignKey!==c.campaignKey||b.campaignVersion!==c.campaignVersion||
+       b.name!==p.name||b.email!==p.email||b.phone!==p.phone||
+       b.client_nonce!==p.nonce||b.consent!==true||b.sms_marketing_consent!==false)
+      return res.status(422).json({ok:false,error:'Only prefilled fictional QA data accepted.'});
+    llCm3C4ContactInput(b);
+    const {campaign,quote}=await llCm3C10Campaign(c);
+    const snapshot={mode:'universal-contact-no-checkout',campaignKey:c.campaignKey,
+      campaignVersion:campaign.version,serviceName:'Laser Offer',
+      serviceId:String(VAGARO_LASER_OFFER_SERVICE_ID),areaKey:null,
+      areaPolicy:'any-area-same-area',sessions:3,durationMinutes:30,
+      priceCents:quote.priceCents,regularPriceCents:quote.regularPriceCents,
+      depositCents:quote.depositCents,holdMinutes:10,currency:'usd',pilotOnly:'03C10'};
+    const {data,error}=await academySupabase.rpc('lltouch_cm_universal_begin_contact',{
+      p_campaign_key:c.campaignKey,p_campaign_version:c.campaignVersion,
+      p_client_nonce:c.nonce,p_customer_name:p.name,p_customer_email:p.email,
+      p_customer_phone:p.phone,p_contact_consent:true,p_sms_marketing_consent:false,
+      p_treatment_area_key:null,p_quote_snapshot:snapshot
+    });
+    if(error)throw error;
+    if(data?.ok!==true||!LL_CM_03C4_UUID.test(String(data.holdId||''))||
+      !Number.isFinite(Date.parse(data.expiresAt))||data.slotHeld!==false)
+      throw Error('QA contact RPC did not verify');
+    return res.json({ok:true,qaOnly:true,hold_id:data.holdId,deadline:data.expiresAt,
+      idempotent:data.idempotent===true,campaignKey:c.campaignKey,
+      campaignVersion:c.campaignVersion,noAreaSelected:true,slotHeld:false,
+      bookingReady:false,checkoutReady:false,paymentEnabled:false});
+  }catch(e){console.error('03C-10 private synthetic contact failed:',String(e?.message||e).slice(0,140));
+    return res.status(409).json({ok:false,error:'Private contact QA failed; do not use real customer information.'});}
+});
+app.post('/lltouch/campaigns/pilot/03c10/verify-and-clean',
+  LL_CM_03C10_RATE,llCm3C10Json,async(req,res)=>{
+  try{
+    const c=req.llCm3C10,p=llCm3C10Profile(c);
+    if(req.body?.campaignKey!==c.campaignKey||
+       !LL_CM_03C4_UUID.test(String(req.body?.hold_id||''))||
+       Object.keys(req.body||{}).some(x=>!['campaignKey','hold_id'].includes(x)))
+      return res.status(422).json({ok:false,error:'Invalid QA contact reference'});
+    await llCm3C10Campaign(c);
+    const id=String(req.body.hold_id);
+    const {data:h,error:readError}=await academySupabase.from('lltouch_cm_universal_holds')
+      .select('state,expires_at,treatment_area_key,provider_key,appointment_start,appointment_end,stripe_session_id,quote_snapshot')
+      .eq('id',id).eq('campaign_key',c.campaignKey).eq('client_nonce',c.nonce)
+      .eq('customer_email',p.email).maybeSingle();
+    if(readError)throw readError;
+    if(!h||h.quote_snapshot?.pilotOnly!=='03C10'||
+       h.quote_snapshot?.mode!=='universal-contact-no-checkout'||
+       h.treatment_area_key!==null||h.provider_key!==null||
+       h.appointment_start!==null||h.appointment_end!==null||
+       h.stripe_session_id!==null||h.state!=='held')
+      return res.status(409).json({ok:false,error:'QA row did not match safe cleanup rules'});
+    const {data:status,error:statusError}=await academySupabase.rpc('lltouch_cm_universal_contact_status',{
+      p_campaign_key:c.campaignKey,p_hold_id:id,p_client_nonce:c.nonce});
+    if(statusError)throw statusError;
+    if(status?.ok!==true||status.slotHeld!==false||status.treatmentAreaKey!==null)
+      throw Error('QA status validation failed');
+    const {data:removed,error:delError}=await academySupabase.from('lltouch_cm_universal_holds')
+      .delete().eq('id',id).eq('campaign_key',c.campaignKey).eq('client_nonce',c.nonce)
+      .eq('customer_email',p.email).eq('state','held')
+      .is('provider_key',null).is('treatment_area_key',null)
+      .is('appointment_start',null).is('appointment_end',null).is('stripe_session_id',null)
+      .eq('quote_snapshot->>pilotOnly','03C10').select('id');
+    if(delError)throw delError;
+    if(!Array.isArray(removed)||removed.length!==1||removed[0].id!==id)
+      throw Error('QA synthetic row cleanup was not confirmed');
+    return res.json({ok:true,qaOnly:true,statusRead:true,contactAccepted:true,
+      noAreaAccepted:true,cleanupVerified:true,noSlotHeld:true,noPayment:true,
+      noBooking:true,bookingReady:false,checkoutReady:false,
+      note:'Real Webflow form journey verified. Fictional contact deleted.'});
+  }catch(e){console.error('03C-10 private QA verify/cleanup failed:',String(e?.message||e).slice(0,140));
+    return res.status(409).json({ok:false,error:'Private QA verification or cleanup failed; check QA records before retrying.'});}
+});
+// END CAMPAIGN STUDIO 03C-10
+
 // END CAMPAIGN STUDIO 03C-9
 
 // END CAMPAIGN STUDIO 03C-8
