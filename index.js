@@ -8615,6 +8615,112 @@ app.post('/lltouch/campaigns/pilot/03c10/verify-and-clean',
   }catch(e){console.error('03C-10 private QA verify/cleanup failed:',String(e?.message||e).slice(0,140));
     return res.status(409).json({ok:false,error:'Private QA verification or cleanup failed; check QA records before retrying.'});}
 });
+
+// ============================================================================
+// CAMPAIGN STUDIO | 03C-11A | LEADS FOUNDATION / PER-CAMPAIGN SWITCH
+// Depends on SQL 43. No Webflow UI or public lead intake is activated here.
+// Separate persistent leads from 10-minute slot holds; queue GHL events durably.
+// Stage 03C-11A does NOT dispatch remote GHL calls, Meta, SMS, checkout, or booking.
+// ============================================================================
+const LL_CM_03C11_CONFIG_ADMIN_ENABLED = process.env.LLTOUCH_CM_LEAD_CONFIG_ADMIN_ENABLED === 'true';
+const LL_CM_03C11_PUBLIC_HARD_LOCK = true; // removed only after end-to-end 03C-11B tests
+const LL_CM_03C11_GHL_HARD_LOCK = true; // no remote CRM side effects in this stage
+const LL_CM_03C11_LEAD_RATE = rateLimit({
+  windowMs:15*60*1000,max:3,standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'Too many requests.'}
+});
+async function llCm3C11Setting(key){
+  const {data,error}=await academySupabase.from('lltouch_cm_lead_capture_settings')
+    .select('campaign_key,campaign_version,enabled,revision,updated_at')
+    .eq('campaign_key',key).maybeSingle();
+  if(error)throw error;
+  return data||null;
+}
+app.get('/lltouch/campaigns/admin/api/leads/readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'Invalid campaign key.'});
+  try{
+    const {data:c,error:cError}=await academySupabase.from('lltouch_campaigns')
+      .select('campaign_key,version,status,offer_starts_at,offer_ends_at')
+      .eq('campaign_key',key).maybeSingle();
+    if(cError)throw cError;
+    if(!c)return res.status(404).json({ok:false,error:'Campaign not found.'});
+    const s=await llCm3C11Setting(key);
+    return res.json({ok:true,readOnly:true,stage:'03C-11A',campaignKey:key,
+      campaignVersion:c.version,campaignStatus:c.status,
+      campaignWindowOpen:c.status==='published'&&Date.now()>=Date.parse(c.offer_starts_at)&&Date.now()<Date.parse(c.offer_ends_at),
+      perCampaignSettingPresent:!!s,
+      perCampaignEnabled:s?.enabled===true&&s.campaign_version===c.version,
+      settingVersion:s?.campaign_version||null,settingRevision:s?.revision||null,
+      adminConfigurationEnabled:LL_CM_03C11_CONFIG_ADMIN_ENABLED,
+      publicLeadCaptureEnabled:false,ghlDispatchEnabled:false,
+      bookingReady:false,checkoutReady:false,
+      note:'SQL 43 persistent leads + queue. Public POST and GHL dispatch hard-locked until later release.'});
+  }catch(e){console.error('Campaign Studio 03C-11 readiness:',String(e?.message||e).slice(0,100));
+    return res.status(503).json({ok:false,error:'Lead readiness unavailable. Verify SQL 43.'});}
+});
+// Admin endpoint for the FUTURE Campaign Studio lead-capture switch. This stage
+// refuses writes unless a separate explicit admin configuration flag is enabled.
+app.post('/lltouch/campaigns/admin/api/leads/configure/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');
+  if(!LL_CM_03C11_CONFIG_ADMIN_ENABLED)
+    return res.status(403).json({ok:false,error:'Per-campaign lead switch is not released yet.'});
+  if(!llCmAdminSameOrigin(req)||!llCm3C4Body(req))
+    return res.status(403).json({ok:false,error:'Invalid administrative request.'});
+  const key=String(req.params.key||''),v=req.body?.expectedVersion,enabled=req.body?.enabled;
+  if(!LL_CM_DISPLAY_KEY.test(key)||!Number.isSafeInteger(v)||v<1||typeof enabled!=='boolean'||
+     Object.keys(req.body||{}).some(k=>!['expectedVersion','enabled'].includes(k)))
+    return res.status(422).json({ok:false,error:'Invalid campaign configuration.'});
+  try{
+    const {data,error}=await academySupabase.rpc('lltouch_cm_lead_capture_configure',{
+      p_campaign_key:key,p_expected_version:v,p_enabled:enabled
+    });
+    if(error)throw error;
+    return res.json({ok:true,configured:true,...data,publicLeadCaptureEnabled:false,
+      note:'Per-campaign setting saved; public lead intake remains hard-locked.'});
+  }catch(e){console.error('03C-11 configure rejected:',String(e?.message||e).slice(0,100));
+    return res.status(409).json({ok:false,error:'Campaign version/status or database rules rejected the change.'});}
+});
+// The public intake adapter is prepared but hard-locked until the approved
+// /offer embeds and acknowledgement screen use this contract. A Render env
+// variable alone can NEVER activate it in stage 03C-11A.
+app.post('/lltouch/campaigns/leads',LL_CM_03C11_LEAD_RATE,async(req,res)=>{
+  res.set('Cache-Control','no-store');
+  if(LL_CM_03C11_PUBLIC_HARD_LOCK || process.env.LLTOUCH_CM_PUBLIC_LEADS_ENABLED!=='true')
+    return res.status(403).json({ok:false,error:'PUBLIC_LEAD_CAPTURE_NOT_RELEASED'});
+  if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))
+    return res.status(403).json({ok:false,error:'Invalid lead request.'});
+  const allowed=['campaignKey','campaignVersion','name','email','phone','consent',
+    'sms_marketing_consent','client_nonce'];
+  if(Object.keys(req.body||{}).some(k=>!allowed.includes(k)))
+    return res.status(422).json({ok:false,error:'Unexpected lead fields.'});
+  try{
+    const input=llCm3C4ContactInput(req.body);
+    const key=String(req.body.campaignKey||'');
+    const version=req.body.campaignVersion;
+    if(!LL_CM_DISPLAY_KEY.test(key)||!Number.isSafeInteger(version)||version<1)
+      return res.status(422).json({ok:false,error:'Invalid campaign identity.'});
+    const {data,error}=await academySupabase.rpc('lltouch_cm_lead_capture_submit',{
+      p_campaign_key:key,p_campaign_version:version,p_client_nonce:input.nonce,
+      p_customer_name:input.name,p_customer_email:input.email,p_customer_phone:input.phone,
+      p_contact_consent:true,p_sms_marketing_consent:input.sms
+    });
+    if(error)throw error;
+    if(data?.ok!==true||!LL_CM_03C4_UUID.test(String(data.leadId||''))||
+      data.contactOnly!==true||data.bookingReady!==false||data.checkoutReady!==false)
+      throw new Error('Unexpected lead acceptance result');
+    return res.json({ok:true,lead_id:data.leadId,campaignKey:key,campaignVersion:version,
+      idempotent:data.idempotent===true,contactOnly:true,
+      bookingReady:false,checkoutReady:false,
+      message:'Thank you. Your request has been received. No appointment is confirmed.'});
+  }catch(e){console.error('03C-11 lead intake failed:',String(e?.message||e).slice(0,100));
+    return res.status(409).json({ok:false,error:'We could not accept your request. Please try again or contact LL Touch.'});}
+});
+// END CAMPAIGN STUDIO 03C-11A
+
 // END CAMPAIGN STUDIO 03C-10
 
 // END CAMPAIGN STUDIO 03C-9
