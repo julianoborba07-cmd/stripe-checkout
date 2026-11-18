@@ -9011,6 +9011,196 @@ app.post('/lltouch/campaigns/leads',LL_CM_03C11_LEAD_RATE,async(req,res)=>{
   }catch(e){console.error('03C-11 lead intake failed:',String(e?.message||e).slice(0,100));
     return res.status(409).json({ok:false,error:'We could not accept your request. Please try again or contact LL Touch.'});}
 });
+
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11G | PRIVATE PERSISTENT WEBFLOW QA
+// Reuses existing 03C-10 HMAC pass + short TTL, but REQUIRES qaMode=03C11G.
+// Writes only a synthetic fixture via SQL 51 (outbox=disabled). Does NOT invoke
+// real public lead RPC, extend dates, send GHL, hold slots or touch Stripe.
+// Both private flags must be enabled AND every public intake gate be OFF.
+// ============================================================================
+const LL_CM_03C11G_QA_ENABLED=process.env.LLTOUCH_CM_03C11G_PRIVATE_QA_ENABLED==='true';
+const LL_CM_03C11G_MARKER='03C11G';
+const LL_CM_03C11G_RATE=rateLimit({windowMs:15*60*1000,max:12,
+  standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'Private QA rate limit reached.'}});
+function llCm3C11GIsolated(){
+  return LL_CM_03C11G_QA_ENABLED && LL_CM_03C10_QA_ENABLED &&
+    process.env.LLTOUCH_CM_PUBLIC_LEADS_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_03C11E_RELEASE_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_PILOT_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_UNIVERSAL_SLOT_ENABLED!=='true' &&
+    !LL_CM_03C4_CONTACT_ENABLED && !LL_CM_03C5_PILOT_ENABLED &&
+    !LL_CM_03C4_SLOT_ENABLED;
+}
+function llCm3C11GProfile(p){return {
+  name:'Campaign Studio QA 03C11G',
+  email:'qa-03c11g-'+p.nonce.replaceAll('-','')+'@example.invalid',
+  phone:'+1 202-555-0147',nonce:p.nonce
+}}
+async function llCm3C11GCampaign(p){
+  if(!llCm3C11GIsolated()||p.qaMode!==LL_CM_03C11G_MARKER)
+    throw Error('PRIVATE_QA_NOT_ENABLED');
+  const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+    .select('id,campaign_key,version,status,service_title,site_item,marketing,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,timezone,offer_label,offer_starts_at,offer_ends_at')
+    .eq('campaign_key',p.campaignKey).maybeSingle();
+  if(error)throw error;
+  const meta=c?.marketing?.campaignMeta||{};
+  if(!c||c.version!==p.campaignVersion||c.status!=='published'||
+    c.site_item?.type!=='manual'||meta.releaseMode!=='display-only'||
+    meta.bookingReady!==false||meta.checkoutReady!==false||
+    c.timezone!=='America/New_York'||c.currency!=='usd'||
+    !Number.isSafeInteger(c.price_cents)||c.price_cents<=0||
+    !Number.isSafeInteger(c.deposit_cents)||c.deposit_cents<0||
+    c.deposit_cents>c.price_cents||
+    !Number.isFinite(Date.parse(c.offer_starts_at))||
+    !Number.isFinite(Date.parse(c.offer_ends_at))||
+    Date.parse(c.offer_starts_at)>=Date.parse(c.offer_ends_at)||
+    Date.now()>=Date.parse(c.offer_ends_at))throw Error('QA_CAMPAIGN_NOT_ELIGIBLE');
+  const s=await llCm3C11Setting(c.campaign_key);
+  if(s?.enabled===true)throw Error('QA_REQUIRES_CAPTURING_DISABLED');
+  return c;
+}
+function llCm3C11GAuth(req,res,next){
+  res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+  res.set('X-Robots-Tag','noindex,nofollow');
+  if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))
+    return res.status(403).json({ok:false,error:'Invalid private QA request.'});
+  const p=llCm3C10Check(String(req.get('x-ll-cm-qa')||''));
+  if(!p||p.qaMode!==LL_CM_03C11G_MARKER||!llCm3C11GIsolated())
+    return res.status(403).json({ok:false,error:'Private QA token invalid or disabled.'});
+  req.llCm3C11G=p;next();
+}
+app.get('/lltouch/campaigns/admin/pilot/lead-webflow-start/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+  if(!llCm3C11GIsolated())return res.status(403).send('Private QA is disabled.');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).send('Invalid campaign key');
+  try{
+    const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+      .select('campaign_key,version').eq('campaign_key',key).maybeSingle();
+    if(error)throw error;
+    if(!c)return res.status(404).send('Campaign not found');
+    const now=Date.now();
+    const p={scope:LL_CM_03C10_SCOPE,version:1,qaMode:LL_CM_03C11G_MARKER,
+      campaignKey:key,campaignVersion:c.version,nonce:crypto.randomUUID(),
+      iat:now,exp:now+10*60*1000};
+    await llCm3C11GCampaign(p);
+    return res.redirect(303,'https://lltouch.com/offer#cmPilot='+llCm3C10Sign(p));
+  }catch(e){console.error('03C11G private pass:',String(e?.message||e).slice(0,110));
+    return res.status(409).send('Private QA unavailable. Confirm SQL 51 and published campaign conditions.');}
+});
+app.post('/lltouch/campaigns/pilot/03c11g/context',
+  LL_CM_03C11G_RATE,llCm3C11GAuth,async(req,res)=>{
+  try{
+    const p=req.llCm3C11G;
+    if(Object.keys(req.body||{}).some(k=>k!=='campaignKey')||req.body.campaignKey!==p.campaignKey)
+      return res.status(422).json({ok:false,error:'Campaign mismatch'});
+    const c=await llCm3C11GCampaign(p);
+    const {data:media,error}=await academySupabase.from('lltouch_campaign_assets')
+      .select('asset_type,device,position,image_url,alt_text')
+      .eq('campaign_id',c.id).eq('asset_type','hero').order('position',{ascending:true});
+    if(error)throw error;
+    const safeUrl=s=>{try{const u=new URL(s);return u.protocol==='https:'&&!u.username&&!u.password?u.href:''}catch{return ''}};
+    const pick=d=>(media||[]).find(x=>x.position===0&&x.device===d&&safeUrl(x.image_url));
+    const desktop=pick('desktop')||pick('all'),mobile=pick('mobile')||pick('tablet')||desktop;
+    if(!desktop||!mobile)throw Error('QA_HERO_MISSING');
+    const m=c.marketing||{},terms=m.campaignMeta?.serviceTerms||{},str=(s,n=900)=>typeof s==='string'?s.trim().slice(0,n):'';
+    return res.json({ok:true,enabled:true,privateQa:true,qaOnly:true,
+      campaignKey:c.campaign_key,campaignVersion:c.version,contactIntakeReady:true,
+      leadCaptureMode:'private-qa-only',bookingReady:false,checkoutReady:false,
+      profile:llCm3C11GProfile(p),
+      offer:{title:str(c.service_title,160),offerLabel:str(c.offer_label,160),
+        priceCents:c.price_cents,originalCents:c.regular_price_cents,
+        depositCents:c.deposit_cents,startsAt:c.offer_starts_at,endsAt:c.offer_ends_at,
+        hero:{desktop:safeUrl(desktop.image_url),mobile:safeUrl(mobile.image_url),
+          alt:str(desktop.alt_text||c.service_title,160)},
+        marketing:{headline:str(m.headline,170),headlineEm:str(m.headlineEm,170),
+          description:str(m.description,1300),sectionTitle:str(m.sectionTitle,180),
+          featureIntro:str(m.featureIntro,1100),features:(Array.isArray(m.features)?m.features:[]).slice(0,6)
+            .map(x=>({title:str(x.title,100),description:str(x.description,480)})),
+          faq:(Array.isArray(m.faq)?m.faq:[]).slice(0,6)
+            .map(x=>({question:str(x.question,180),answer:str(x.answer,900)}))},
+        serviceTerms:{sessions:Number.isSafeInteger(terms.sessions)?terms.sessions:null,
+          singleAreaForAllSessions:terms.singleAreaForAllSessions===true}}});
+  }catch(e){console.error('03C11G context:',String(e?.message||e).slice(0,100));
+    return res.status(409).json({ok:false,error:'Private QA campaign is unavailable.'});}
+});
+app.post('/lltouch/campaigns/pilot/03c11g/submit',
+  LL_CM_03C11G_RATE,llCm3C11GAuth,async(req,res)=>{
+  try{
+    const p=req.llCm3C11G,b=req.body||{},q=llCm3C11GProfile(p);
+    const allow=['campaignKey','campaignVersion','name','email','phone','consent','sms_marketing_consent','client_nonce'];
+    if(Object.keys(b).some(k=>!allow.includes(k))||
+      b.campaignKey!==p.campaignKey||b.campaignVersion!==p.campaignVersion||
+      b.name!==q.name||b.email!==q.email||b.phone!==q.phone||
+      b.client_nonce!==q.nonce||b.consent!==true||b.sms_marketing_consent!==false)
+      return res.status(422).json({ok:false,error:'Only fixed synthetic QA data accepted.'});
+    await llCm3C11GCampaign(p);
+    const {data,error}=await academySupabase.rpc('lltouch_cm_private_qa_03c11g_submit',{
+      p_campaign_key:p.campaignKey,p_campaign_version:p.campaignVersion,p_client_nonce:p.nonce});
+    if(error)throw error;
+    if(data?.ok!==true||!LL_CM_03C4_UUID.test(String(data.leadId||'')))throw Error('QA_INSERT_INVALID');
+    return res.status(data.idempotent?200:201).json({ok:true,qaOnly:true,
+      leadId:data.leadId,idempotent:data.idempotent===true,
+      persisted:true,ghlDispatched:false,bookingReady:false,checkoutReady:false});
+  }catch(e){console.error('03C11G submit:',String(e?.message||e).slice(0,100));
+    return res.status(409).json({ok:false,error:'Private QA write failed; review SQL fixtures before retry.'});}
+});
+app.post('/lltouch/campaigns/pilot/03c11g/verify-and-clean',
+  LL_CM_03C11G_RATE,llCm3C11GAuth,async(req,res)=>{
+  try{
+    const p=req.llCm3C11G,b=req.body||{};
+    if(Object.keys(b).some(k=>!['campaignKey','leadId'].includes(k))||
+      b.campaignKey!==p.campaignKey||!LL_CM_03C4_UUID.test(String(b.leadId||'')))
+      return res.status(422).json({ok:false,error:'Invalid QA reference.'});
+    const q=llCm3C11GProfile(p);
+    const {data:l,error:le}=await academySupabase.from('lltouch_cm_leads')
+      .select('id,campaign_key,campaign_version,customer_name,customer_email,customer_phone,contact_consent,sms_marketing_consent,consent_version,quote_snapshot')
+      .eq('id',b.leadId).eq('campaign_key',p.campaignKey).eq('client_nonce',p.nonce).maybeSingle();
+    if(le)throw le;
+    const {data:o,error:oe}=await academySupabase.from('lltouch_cm_lead_outbox')
+      .select('state,attempts,ghl_contact_id,sent_at').eq('lead_id',b.leadId).maybeSingle();
+    if(oe)throw oe;
+    if(!l||l.campaign_version!==p.campaignVersion||l.customer_name!==q.name||
+      l.customer_email!==q.email||l.customer_phone!==q.phone||l.contact_consent!==true||
+      l.sms_marketing_consent!==false||l.consent_version!=='lltouch-cm-qa-03c11g'||
+      l.quote_snapshot?.qaOnly!=='03C11G'||l.quote_snapshot?.qaMode!=='private-webflow-persistent'||
+      !o||o.state!=='disabled'||o.attempts!==0||o.sent_at!==null||o.ghl_contact_id!==null)
+      return res.status(409).json({ok:false,error:'QA verification failed; manual review required.'});
+    const {data:removed,error:de}=await academySupabase.rpc('lltouch_cm_private_qa_03c11g_cleanup',{
+      p_campaign_key:p.campaignKey,p_campaign_version:p.campaignVersion,p_client_nonce:p.nonce});
+    if(de)throw de;
+    if(removed?.ok!==true||removed?.removed!==true)
+      throw Error('QA_CLEANUP_NOT_CONFIRMED');
+    return res.json({ok:true,qaOnly:true,stage:'03C-11G',
+      committedPersistenceVerified:true,syntheticLeadRemoved:true,
+      syntheticQueueRemoved:true,noGhlDispatch:true,noBooking:true,noPayment:true,
+      campaignKey:p.campaignKey,campaignVersion:p.campaignVersion});
+  }catch(e){console.error('03C11G verify-clean:',String(e?.message||e).slice(0,100));
+    return res.status(409).json({ok:false,error:'Verification or cleanup failed. Audit SQL 52 before another attempt.'});}
+});
+app.get('/lltouch/campaigns/admin/api/pilot/lead-qa-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');
+  const key=String(req.params.key||'');
+  if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false});
+  try{
+    const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+      .select('campaign_key,status,version,offer_starts_at,offer_ends_at').eq('campaign_key',key).maybeSingle();
+    if(error)throw error;
+    if(!c)return res.status(404).json({ok:false});
+    return res.json({ok:true,stage:'03C-11G',campaignKey:key,campaignVersion:c.version,
+      campaignStatus:c.status,campaignWindowOpen:Date.now()>=Date.parse(c.offer_starts_at)&&Date.now()<Date.parse(c.offer_ends_at),
+      privateQaEnabled:llCm3C11GIsolated(),publicLeadCaptureEnabled:false,
+      ghlDispatchEnabled:false,bookingReady:false,checkoutReady:false,
+      note:'Private, signed, synthetic-only test. Public capture still requires campaign validity and its independent gates.'});
+  }catch{return res.status(503).json({ok:false,error:'Private QA readiness unavailable.'})}
+});
+// END 03C-11G
+
 // END CAMPAIGN STUDIO 03C-11E
 
 // END CAMPAIGN STUDIO 03C-10
