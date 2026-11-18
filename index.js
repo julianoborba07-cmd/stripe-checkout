@@ -13814,6 +13814,76 @@ app.post('/lltouch/campaigns/admin/api/leads/recovery-messages/:key',
 // 03C-11N-B leaves the original 03C-11M workflow contract and all GHL gates unchanged.
 // ============================================================================
 
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11O-B | RECOVERY SAFETY PREFLIGHT
+// ADMIN READ-ONLY. Requires SQL 63 (ledger) and SQL 64 (audit).
+// NO worker, no webhook POST, no GHL contact lookup, no Stripe calls, no SMS.
+// Approval of a message does not imply a payment/opt-out recheck.
+// ============================================================================
+app.get('/lltouch/campaigns/admin/api/leads/recovery-safety/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))
+      return res.status(422).json({ok:false,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data:c,error:ce}=await academySupabase.from('lltouch_campaigns')
+        .select('id,campaign_key,version,status,offer_starts_at,offer_ends_at')
+        .eq('campaign_key',key).maybeSingle();
+      if(ce)throw ce;
+      if(!c)return res.status(404).json({ok:false,error:'CAMPAIGN_NOT_FOUND'});
+      const [{data:approval,error:ae},j,a]=await Promise.all([
+        academySupabase.from('lltouch_cm_recovery_message_approvals')
+          .select('campaign_version,approval_revision,message_version_id')
+          .eq('campaign_id',c.id).maybeSingle(),
+        academySupabase.from('lltouch_cm_recovery_jobs')
+          .select('lead_id',{count:'exact',head:true})
+          .eq('campaign_id',c.id).eq('campaign_version',c.version),
+        academySupabase.from('lltouch_cm_recovery_delivery_attempts')
+          .select('lead_id',{count:'exact',head:true})
+      ]);
+      if(ae||j.error||a.error)throw ae||j.error||a.error;
+      const approved=Boolean(approval && approval.campaign_version===c.version &&
+        approval.message_version_id);
+      const start=Date.parse(c.offer_starts_at||'');
+      const end=Date.parse(c.offer_ends_at||'');
+      const windowOpen=c.status==='published' && Number.isFinite(start) &&
+        Number.isFinite(end) && Date.now()>=start && Date.now()<end;
+      // The checks below are deliberately false until the VERIFIED Stripe
+      // mapping and fresh GHL SMS DND/opt-out lookup are built and audited.
+      // Never infer unpaid from absent Stripe rows or opt-in from a tag.
+      const blockers=[
+        'NO_AUTHORITATIVE_PAYMENT_RECHECK',
+        'NO_FRESH_GHL_SMS_OPTOUT_RECHECK',
+        'NO_RUNTIME_RECOVERY_ELIGIBILITY_WORKER',
+        'WORKFLOW_WAIT_AND_CONTACT_WRITE_STILL_PRESENT',
+        'NO_RECOVERY_WEBHOOK_RELEASE'
+      ];
+      if(!approved)blockers.push('NO_APPROVED_MESSAGE_FOR_CURRENT_CAMPAIGN_VERSION');
+      return res.json({
+        ok:true,readOnly:true,stage:'03C-11O-B',
+        campaignKey:key,campaignVersion:c.version,campaignStatus:c.status,
+        campaignWindowOpen:windowOpen,
+        approvedMessageForCurrentVersion:approved,
+        textApprovalRevision:approved?approval.approval_revision:null,
+        recoveryLedgerSchemaReady:true,
+        recoveryJobs:j.count||0,deliveryReservationsGlobal:a.count||0,
+        uniqueReservationPerLead:true,
+        paymentRecheckOperational:false,ghlSmsOptOutRecheckOperational:false,
+        recoveryWorkerOperational:false,workflowWebhookDispatchEnabled:false,
+        recoverySmsEnabled:false,automaticDispatchEnabled:false,
+        ghlEmergencyStop:process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true',
+        readyForRealRecovery:false,blockers,
+        personalDataReturned:false,noSms:true,noBooking:true,noPayments:true,
+        note:'Read-only safety preflight. No recovery job is scheduled or sent by this endpoint.'
+      });
+    }catch(_e){
+      console.error('Campaign Studio 03C-11O recovery safety preflight unavailable');
+      return res.status(503).json({ok:false,error:'RECOVERY_SAFETY_PREFLIGHT_UNAVAILABLE_VERIFY_SQL63'});
+    }
+  });
+// END 03C-11O-B
+
 // ==============================
 // SERVER START
 // ==============================
