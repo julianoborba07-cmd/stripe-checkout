@@ -13884,6 +13884,132 @@ app.get('/lltouch/campaigns/admin/api/leads/recovery-safety/:key',
   });
 // END 03C-11O-B
 
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11P-A | FRESH GHL SMS DND RECHECK
+// Administrative, read-only check for ONE previously-synced lead. No contact
+// write, no tagging, no workflow webhook, no Stripe call and no SMS.
+// This helper can be reused by a FUTURE server-side recovery worker, but the
+// worker MUST independently recheck payment/consent, window and idempotency.
+// GHL API v3: GET /contacts/{contactId}, contacts.readonly scope.
+// ============================================================================
+const LL_CM_03C11P_DND_RATE=rateLimit({windowMs:15*60*1000,max:6,
+  standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'DND_AUDIT_RATE_LIMITED'}});
+function llCm3C11PCheckSmsDnd(c){
+  if(!c || typeof c!=='object' || Array.isArray(c))
+    return {known:false,clear:false,reason:'INVALID_CONTACT_RESPONSE'};
+  if(c.dnd===true)
+    return {known:true,clear:false,reason:'GLOBAL_DND_ACTIVE'};
+  if(c.dnd!==undefined && c.dnd!==false)
+    return {known:false,clear:false,reason:'UNKNOWN_GLOBAL_DND'};
+  const settings=c.dndSettings;
+  if(settings!==undefined && (!settings || typeof settings!=='object' || Array.isArray(settings)))
+    return {known:false,clear:false,reason:'UNKNOWN_DND_SETTINGS'};
+  const sms=settings?.sms;
+  // HighLevel's v3 GET /contacts schema explicitly documents omitted global
+  // or SMS DND fields as unset. Never infer clear for an unexpected value.
+  if(sms===undefined) return {known:true,clear:true,reason:'SMS_DND_UNSET'};
+  if(!sms || typeof sms!=='object' || Array.isArray(sms))
+    return {known:false,clear:false,reason:'UNKNOWN_SMS_DND'};
+  if(sms.status==='inactive')
+    return {known:true,clear:true,reason:'SMS_DND_INACTIVE'};
+  if(sms.status==='active' || sms.status==='permanent')
+    return {known:true,clear:false,reason:'SMS_DND_ACTIVE'};
+  return {known:false,clear:false,reason:'UNKNOWN_SMS_DND_STATUS'};
+}
+async function llCm3C11PFreshGhlSmsDnd({contactId,leadEmail,leadPhone}){
+  if(!/^[A-Za-z0-9_-]{6,120}$/.test(contactId||''))
+    return {known:false,clear:false,reason:'CONTACT_ID_UNAVAILABLE'};
+  const response=await llGhlRequest('/contacts/'+encodeURIComponent(contactId),'GET');
+  const contact=response?.contact;
+  if(!contact || contact.id!==contactId || contact.locationId!==LL_GHL_LOCATION)
+    return {known:false,clear:false,reason:'CONTACT_IDENTITY_MISMATCH'};
+  // Never accept an opt-out verdict for a different CRM identity.
+  const expectedEmail=String(leadEmail||'').trim().toLowerCase();
+  const receivedEmail=String(contact.email||'').trim().toLowerCase();
+  const expectedPhone=llGhlPhone(leadPhone);
+  const receivedPhone=llGhlPhone(contact.phone);
+  if(!expectedEmail || expectedEmail!==receivedEmail ||
+     !expectedPhone || expectedPhone!==receivedPhone)
+    return {known:false,clear:false,reason:'CONTACT_DETAILS_MISMATCH'};
+  return llCm3C11PCheckSmsDnd(contact);
+}
+app.post('/lltouch/campaigns/admin/api/leads/recovery/ghl-dnd-check/:key',
+  LL_CM_03C11P_DND_RATE,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key) || !llCmAdminSameOrigin(req) ||
+       !llCm3C4Body(req) ||
+       Object.keys(req.body||{}).some(k=>!['leadId','expectedVersion'].includes(k)) ||
+       !LL_CM_03C4_UUID.test(String(req.body?.leadId||'')) ||
+       !Number.isSafeInteger(req.body?.expectedVersion) || req.body.expectedVersion<1)
+      return res.status(422).json({ok:false,error:'INVALID_AUDIT_REQUEST'});
+    try{
+      const [{data:lead,error:le},{data:outbox,error:oe}]=await Promise.all([
+        academySupabase.from('lltouch_cm_leads')
+          .select('id,campaign_key,campaign_version,customer_email,customer_phone,contact_consent,sms_marketing_consent')
+          .eq('id',req.body.leadId).eq('campaign_key',key)
+          .eq('campaign_version',req.body.expectedVersion).maybeSingle(),
+        academySupabase.from('lltouch_cm_lead_outbox')
+          .select('ghl_contact_id,state').eq('lead_id',req.body.leadId).maybeSingle()
+      ]);
+      if(le||oe)throw Error('DB_READ_FAILED');
+      // Deliberately make missing/not-yet-synced lead indistinguishable.
+      if(!lead || !outbox || outbox.state!=='sent' ||
+         !outbox.ghl_contact_id ||
+         lead.contact_consent!==true || lead.sms_marketing_consent!==true)
+        return res.status(409).json({ok:false,readOnly:true,stage:'03C-11P-A',
+          error:'LEAD_NOT_READY_FOR_DND_AUDIT',smsAuthorized:false,noSms:true});
+      const result=await llCm3C11PFreshGhlSmsDnd({
+        contactId:outbox.ghl_contact_id,
+        leadEmail:lead.customer_email,leadPhone:lead.customer_phone
+      });
+      return res.json({ok:true,readOnly:true,stage:'03C-11P-A',
+        campaignKey:key,campaignVersion:lead.campaign_version,
+        contactMatched:!['CONTACT_IDENTITY_MISMATCH','CONTACT_DETAILS_MISMATCH','CONTACT_ID_UNAVAILABLE'].includes(result.reason),
+        smsDndKnown:result.known,smsDndClear:result.clear,dndReason:result.reason,
+        checkedAt:new Date().toISOString(),
+        paymentRechecked:false,recoveryEligible:false,smsAuthorized:false,
+        workerEnabled:false,webhookDispatched:false,noSms:true,noPayments:true,
+        note:'This read-only DND diagnostic cannot authorize recovery. Payment, consent, campaign window, and idempotency require separate fresh checks.'});
+    }catch(e){
+      // Do NOT log provider responses, tokens, lead IDs or customer PII.
+      const msg=String(e?.message||'');
+      const reason=/GHL HTTP (401|403)/.test(msg)?'GHL_READ_AUTH_DENIED':
+        /GHL HTTP 404/.test(msg)?'GHL_CONTACT_NOT_FOUND':
+        /GHL HTTP 429/.test(msg)?'GHL_RATE_LIMITED':'GHL_DND_READ_UNAVAILABLE';
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11P-A',
+        error:reason,smsDndKnown:false,smsDndClear:false,
+        smsAuthorized:false,noSms:true});
+    }
+  });
+// Read-only smoke test for the newly installed capability; does NOT query GHL.
+app.get('/lltouch/campaigns/admin/api/leads/recovery/ghl-dnd-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))
+      return res.status(422).json({ok:false,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+        .select('campaign_key,version,status').eq('campaign_key',key).maybeSingle();
+      if(error)throw error;
+      if(!c)return res.status(404).json({ok:false,error:'CAMPAIGN_NOT_FOUND'});
+      return res.json({ok:true,readOnly:true,stage:'03C-11P-A',
+        campaignKey:key,campaignVersion:c.version,campaignStatus:c.status,
+        ghlTokenConfigured:Boolean(LL_GHL_TOKEN),ghlLocationConfigured:Boolean(LL_GHL_LOCATION),
+        requiredGhlScope:'contacts.readonly',
+        liveOptOutCheckImplemented:true,liveOptOutCheckTestedWithContact:false,
+        paymentRecheckOperational:false,recoveryWorkerOperational:false,
+        workflowWebhookDispatchEnabled:false,recoverySmsEnabled:false,
+        readyForRealRecovery:false,
+        noContactReadPerformed:true,noSms:true,noPayments:true});
+    }catch(_e){return res.status(503).json({ok:false,error:'DND_READINESS_UNAVAILABLE'});}
+  });
+// No worker is scheduled, no GHL webhook and no SMS action is added here.
+// END 03C-11P-A
+
 // ==============================
 // SERVER START
 // ==============================
