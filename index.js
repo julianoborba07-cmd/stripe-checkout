@@ -14010,6 +14010,140 @@ app.get('/lltouch/campaigns/admin/api/leads/recovery/ghl-dnd-readiness/:key',
 // No worker is scheduled, no GHL webhook and no SMS action is added here.
 // END 03C-11P-A
 
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11P-C | STRIPE CHECKOUT PAYMENT READ-ONLY CHECK
+// A live Checkout session counts as verified paid only when its stored binding,
+// campaign version, lead UUID, client_reference_id and Checkout metadata match.
+// Never infer "unpaid" from an empty, expired or incomplete Checkout list.
+// No Checkout create/update/expire, no DB writes, no GHL calls, no workflow, no SMS.
+// ==========================================================================
+const LL_CM_03C11PC_SCOPE='lltouch-cm-universal-checkout-v1';
+const LL_CM_03C11PC_RATE=rateLimit({windowMs:15*60*1000,max:5,
+  standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'STRIPE_PAYMENT_AUDIT_RATE_LIMITED'}});
+function llCm3C11PCCheckCheckout(session,binding,lead,campaign){
+  if(!session || typeof session!=='object' || session.object!=='checkout.session' ||
+    session.id!==binding.stripe_session_id || session.livemode!==true ||
+    session.mode!=='payment' ||
+    session.client_reference_id!==lead.id ||
+    !session.metadata || typeof session.metadata!=='object' ||
+    session.metadata.cm_scope!==LL_CM_03C11PC_SCOPE ||
+    session.metadata.cm_lead_id!==lead.id ||
+    session.metadata.campaign_key!==campaign.campaign_key ||
+    session.metadata.campaign_version!==String(lead.campaign_version) ||
+    session.metadata.payment_kind!==binding.payment_kind ||
+    !['deposit','full'].includes(binding.payment_kind))
+    return {valid:false,verifiedPaid:false,reason:'STRIPE_IDENTITY_MISMATCH'};
+  if(session.status==='complete' && session.payment_status==='paid')
+    return {valid:true,verifiedPaid:true,reason:'VERIFIED_PAID'};
+  // Payment not verified, never "unpaid". Delayed/alternative methods or
+  // other payment channels may exist; this is NOT clearance for recovery.
+  return {valid:true,verifiedPaid:false,reason:'PAYMENT_NOT_VERIFIED'};
+}
+app.get('/lltouch/campaigns/admin/api/leads/recovery/stripe-binding-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))
+      return res.status(422).json({ok:false,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data:campaign,error:ce}=await academySupabase.from('lltouch_campaigns')
+        .select('id,campaign_key,version,status').eq('campaign_key',key).maybeSingle();
+      if(ce)throw ce;
+      if(!campaign)return res.status(404).json({ok:false,error:'CAMPAIGN_NOT_FOUND'});
+      const {count,error:be}=await academySupabase.from('lltouch_cm_lead_stripe_sessions')
+        .select('stripe_session_id',{count:'exact',head:true})
+        .eq('campaign_id',campaign.id).eq('campaign_version',campaign.version);
+      if(be)throw be;
+      return res.json({ok:true,readOnly:true,stage:'03C-11P-C',
+        campaignKey:key,campaignVersion:campaign.version,campaignStatus:campaign.status,
+        stripeBindingSchemaReady:true,linkedCheckoutSessions:count||0,
+        expectedCheckoutScope:LL_CM_03C11PC_SCOPE,
+        liveSessionReadImplemented:true,liveSessionReadTestedWithBinding:false,
+        paymentRecheckOperational:false,
+        noLiveStripeReadPerformed:true,paymentStatusWithoutBinding:'unknown',
+        recoveryWorkerOperational:false,workflowWebhookDispatchEnabled:false,
+        recoverySmsEnabled:false,readyForRealRecovery:false,
+        ghlEmergencyStop:process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true',
+        noSms:true,noCheckoutCreated:true,noPayments:true,personalDataReturned:false,
+        note:'Read-only schema diagnostic. No Stripe API request and no recovery approval.'});
+    }catch(_e){
+      console.error('Campaign Studio 03C-11P-C binding readiness unavailable');
+      return res.status(503).json({ok:false,error:'STRIPE_BINDING_READINESS_UNAVAILABLE'});
+    }
+  });
+// Administrative read-only audit of a single already-bound lead. Calling this
+// endpoint without a binding deliberately does not query Stripe.
+app.post('/lltouch/campaigns/admin/api/leads/recovery/stripe-payment-check/:key',
+  LL_CM_03C11PC_RATE,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key) || !llCmAdminSameOrigin(req) ||
+       !llCm3C4Body(req) ||
+       Object.keys(req.body||{}).some(k=>!['leadId','expectedVersion'].includes(k)) ||
+       !LL_CM_03C4_UUID.test(String(req.body?.leadId||'')) ||
+       !Number.isSafeInteger(req.body?.expectedVersion) || req.body.expectedVersion<1)
+      return res.status(422).json({ok:false,error:'INVALID_PAYMENT_AUDIT_REQUEST'});
+    try{
+      const [{data:lead,error:le},{data:campaign,error:ce}]=await Promise.all([
+        academySupabase.from('lltouch_cm_leads')
+          .select('id,campaign_id,campaign_key,campaign_version')
+          .eq('id',req.body.leadId).eq('campaign_key',key)
+          .eq('campaign_version',req.body.expectedVersion).maybeSingle(),
+        academySupabase.from('lltouch_campaigns')
+          .select('id,campaign_key,version,status').eq('campaign_key',key).maybeSingle()
+      ]);
+      if(le||ce)throw Error('DB_READ_FAILED');
+      if(!lead || !campaign || lead.campaign_id!==campaign.id ||
+         lead.campaign_version!==campaign.version)
+        return res.status(409).json({ok:false,readOnly:true,stage:'03C-11P-C',
+          error:'NO_VALID_CURRENT_CAMPAIGN_LEAD',paymentStatus:'unknown',
+          recoveryAuthorized:false,noSms:true});
+      const {data:bindings,error:be}=await academySupabase
+        .from('lltouch_cm_lead_stripe_sessions')
+        .select('stripe_session_id,lead_id,campaign_id,campaign_version,payment_kind')
+        .eq('lead_id',lead.id).eq('campaign_id',campaign.id)
+        .eq('campaign_version',campaign.version).limit(21);
+      if(be)throw Error('BINDING_READ_FAILED');
+      if(!Array.isArray(bindings) || bindings.length===0)
+        return res.status(409).json({ok:false,readOnly:true,stage:'03C-11P-C',
+          error:'NO_BOUND_CHECKOUT_SESSION',paymentStatus:'unknown',
+          liveStripeReadPerformed:false,recoveryAuthorized:false,noSms:true});
+      if(bindings.length>20)
+        return res.status(409).json({ok:false,readOnly:true,stage:'03C-11P-C',
+          error:'TOO_MANY_BOUND_SESSIONS_FOR_AUDIT',paymentStatus:'unknown',
+          recoveryAuthorized:false,noSms:true});
+      let anyPaid=false;
+      for(const b of bindings){
+        if(!b || !/^cs_live_[A-Za-z0-9_]{12,200}$/.test(b.stripe_session_id||'') ||
+           b.lead_id!==lead.id || b.campaign_id!==campaign.id ||
+           b.campaign_version!==campaign.version)
+          throw Error('STRIPE_BINDING_INCONSISTENT');
+        const session=await stripe.checkout.sessions.retrieve(b.stripe_session_id);
+        const verdict=llCm3C11PCCheckCheckout(session,b,lead,campaign);
+        if(!verdict.valid)throw Error('STRIPE_SESSION_IDENTITY_MISMATCH');
+        if(verdict.verifiedPaid)anyPaid=true;
+      }
+      return res.json({ok:true,readOnly:true,stage:'03C-11P-C',
+        campaignKey:key,campaignVersion:campaign.version,
+        linkedCheckoutSessionsChecked:bindings.length,
+        paymentStatus:anyPaid?'verified_paid':'unknown',
+        verifiedPaymentFound:anyPaid,liveStripeReadPerformed:true,
+        recoveryAuthorized:false,recoverySmsEnabled:false,
+        paymentRecheckOperational:false,readyForRealRecovery:false,
+        personalDataReturned:false,noSms:true,noPayments:true,
+        note:'Verified paid blocks recovery; unknown is never proof of non-payment. Does not authorize a message.'});
+    }catch(_e){
+      // Do not log session IDs, lead IDs, full provider errors or personal data.
+      console.error('Campaign Studio 03C-11P-C payment audit failed closed');
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11P-C',
+        error:'PAYMENT_AUDIT_UNAVAILABLE_OR_IDENTITY_MISMATCH',
+        paymentStatus:'unknown',recoveryAuthorized:false,noSms:true});
+    }
+  });
+// END 03C-11P-C
+
 // ==============================
 // SERVER START
 // ==============================
