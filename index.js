@@ -14144,6 +14144,241 @@ app.post('/lltouch/campaigns/admin/api/leads/recovery/stripe-payment-check/:key'
   });
 // END 03C-11P-C
 
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11P-D | ISOLATED STRIPE CHECKOUT QA
+// Admin-only test-mode contract. Uses synthetic UUIDs, never real lead rows.
+// Never writes lltouch_cm_lead_stripe_sessions (live). Never creates bookings,
+// public checkout, recovery jobs, GHL contacts, or SMS. ALL flags default off.
+// ============================================================================
+const LL_CM_03C11PD_SCOPE='lltouch-cm-universal-checkout-qa-v1';
+const LL_CM_03C11PD_QA_LIMIT=rateLimit({windowMs:60*60*1000,max:3,
+  standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'CHECKOUT_QA_RATE_LIMITED'}});
+const LL_CM_03C11PD_UUID4=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function llCm3C11PdActiveFor(key){
+  return LL_CM_DISPLAY_KEY.test(key) &&
+    process.env.LLTOUCH_CM_STRIPE_03C11PD_QA_ENABLED==='true' &&
+    process.env.LLTOUCH_CM_STRIPE_03C11PD_CAMPAIGN_KEY===key &&
+    llCmStripeSandboxEnabled() &&
+    process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true' &&
+    process.env.LLTOUCH_CM_GHL_SYNC_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_GHL_RELEASE_APPROVED!=='true' &&
+    process.env.LLTOUCH_CM_PUBLIC_LEADS_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_03C11E_RELEASE_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_UNIVERSAL_SLOT_ENABLED!=='true';
+}
+function llCm3C11PdSyntheticLeadId(key,version,nonce){
+  const b=Buffer.from(crypto.createHash('sha256')
+    .update('lltouch-03c11pd-qa-v1:'+key+':'+version+':'+nonce).digest().subarray(0,16));
+  b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80;
+  const h=b.toString('hex');
+  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+}
+function llCm3C11PdAssertTestSession(session,expected){
+  const m=session?.metadata||{};
+  if(!session || session.object!=='checkout.session' || session.livemode!==false ||
+     !/^cs_test_[A-Za-z0-9_]{12,200}$/.test(session.id||'') ||
+     session.mode!=='payment' || session.currency!=='usd' ||
+     session.client_reference_id!==expected.syntheticLeadId ||
+     session.amount_total!==expected.amountCents ||
+     m.cm_test_only!=='true' || m.cm_scope!==LL_CM_03C11PD_SCOPE ||
+     m.cm_lead_id!==expected.syntheticLeadId ||
+     m.campaign_key!==expected.campaignKey ||
+     m.campaign_version!==String(expected.campaignVersion) ||
+     m.payment_kind!==expected.paymentKind ||
+     m.test_request_nonce!==expected.requestNonce ||
+     m.amount_cents!==String(expected.amountCents))
+    throw Object.assign(new Error('CHECKOUT_QA_IDENTITY_MISMATCH'),{status:409});
+  return session;
+}
+function llCm3C11PdCheckoutUrl(session){
+  if(!session?.url)return null;
+  try{
+    const u=new URL(session.url);
+    return u.protocol==='https:' && u.hostname==='checkout.stripe.com' &&
+      !u.username && !u.password ? u.href : null;
+  }catch{return null}
+}
+async function llCm3C11PdCampaign(key,expectedVersion){
+  if(!LL_CM_DISPLAY_KEY.test(key) || !Number.isSafeInteger(expectedVersion) || expectedVersion<1)
+    throw Object.assign(new Error('INVALID_CAMPAIGN_OR_VERSION'),{status:422});
+  const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+    .select('id,campaign_key,version,status,site_item,service_title,currency,price_cents,deposit_cents,timezone,offer_starts_at,offer_ends_at,marketing')
+    .eq('campaign_key',key).maybeSingle();
+  if(error)throw error;
+  if(!c)throw Object.assign(new Error('CAMPAIGN_NOT_FOUND'),{status:404});
+  const m=c.marketing?.campaignMeta||{};
+  const ends=Date.parse(c.offer_ends_at||'');
+  if(c.version!==expectedVersion || c.status!=='published' ||
+     c.site_item?.type!=='manual' || m.releaseMode!=='display-only' ||
+     m.checkoutReady!==false || m.bookingReady!==false ||
+     c.currency!=='usd' || c.timezone!=='America/New_York' ||
+     !Number.isFinite(ends) || ends<=Date.now() ||
+     !Number.isSafeInteger(c.price_cents) || c.price_cents<50 || c.price_cents>200000)
+    throw Object.assign(new Error('CAMPAIGN_NOT_ELIGIBLE_FOR_STRIPE_QA'),{status:409});
+  return c;
+}
+function llCm3C11PdRequest(req){
+  const b=req.body||{};
+  if(Object.keys(b).some(k=>!['expectedVersion','paymentKind','requestNonce','confirmation'].includes(k)) ||
+     !Number.isSafeInteger(b.expectedVersion) || b.expectedVersion<1 ||
+     !['deposit','full'].includes(b.paymentKind) ||
+     !LL_CM_03C11PD_UUID4.test(String(b.requestNonce||'')) ||
+     b.confirmation!=='CRIAR CHECKOUT QA')
+    throw Object.assign(new Error('INVALID_QA_REQUEST'),{status:422});
+  return b;
+}
+function llCm3C11PdRequestOrigin(req){
+  if(!/^application\/json(?:;|$)/i.test(String(req.get('content-type')||'')))return false;
+  const origin=String(req.get('origin')||'');
+  if(!origin)return false;
+  return llCmAdminSameOrigin(req); // require explicit same-site Origin for writes
+}
+function llCm3C11PdError(res,error){
+  const code=[403,404,409,415,422].includes(error?.status)?error.status:503;
+  if(code>=500)console.error('Campaign Studio 03C11PD QA failed closed:',String(error?.code||'INTERNAL'));
+  return res.status(code).json({ok:false,stage:'03C-11P-D',testOnly:true,
+    error:code>=500?'CHECKOUT_QA_UNAVAILABLE_USE_SAME_NONCE_FOR_RETRY':String(error?.message||'QA_REFUSED'),
+    noLiveCheckout:true,noGhl:true,noSms:true});
+}
+function llCm3C11PdMatchStored(row,expect,sessionId=null){
+  return Boolean(row && row.request_nonce===expect.requestNonce &&
+    row.synthetic_lead_id===expect.syntheticLeadId &&
+    row.campaign_id===expect.campaignId &&
+    row.campaign_key===expect.campaignKey &&
+    row.campaign_version===expect.campaignVersion &&
+    row.payment_kind===expect.paymentKind &&
+    row.amount_cents===expect.amountCents &&
+    row.currency==='usd' && row.test_only===true &&
+    row.checkout_scope===LL_CM_03C11PD_SCOPE &&
+    (!sessionId || row.stripe_session_id===sessionId));
+}
+async function llCm3C11PdFindRow(nonce){
+  const {data,error}=await academySupabase.from('lltouch_cm_stripe_checkout_qa_bindings')
+    .select('request_nonce,synthetic_lead_id,campaign_id,campaign_key,campaign_version,payment_kind,amount_cents,currency,checkout_scope,test_only,stripe_session_id')
+    .eq('request_nonce',nonce).maybeSingle();
+  if(error)throw error;
+  return data||null;
+}
+function llCm3C11PdSafeSession(session,idempotent){
+  return {ok:true,stage:'03C-11P-D',testOnly:true,idempotent,
+    checkoutSessionId:session.id,checkoutUrl:llCm3C11PdCheckoutUrl(session),
+    checkoutStatus:session.status,testPaymentStatus:session.payment_status,
+    livemode:false,bookedInVagaro:false,leadCreated:false,
+    liveBindingCreated:false,ghlContactCreated:false,recoveryScheduled:false,
+    noSms:true,noLiveCheckout:true,
+    note:'Stripe TEST ONLY: no real charge, booking, GHL or SMS. Use test card only.'};
+}
+app.get('/lltouch/campaigns/admin/api/transactions/stripe-qa-binding-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data:c,error:ce}=await academySupabase.from('lltouch_campaigns')
+        .select('id,campaign_key,version,status,currency,price_cents,deposit_cents')
+        .eq('campaign_key',key).maybeSingle();
+      if(ce)throw ce;
+      if(!c)return res.status(404).json({ok:false,error:'CAMPAIGN_NOT_FOUND'});
+      const {count,error:qe}=await academySupabase.from('lltouch_cm_stripe_checkout_qa_bindings')
+        .select('request_nonce',{count:'exact',head:true}).eq('campaign_id',c.id);
+      if(qe)throw qe;
+      return res.json({ok:true,readOnly:true,stage:'03C-11P-D',campaignKey:key,
+        campaignVersion:c.version,campaignStatus:c.status,
+        stripeQaBindingSchemaReady:true,qaBoundSessions:count||0,
+        sandboxKeyConfigured:Boolean(llCmStripeSandboxSecret()),
+        qaCreateEnabled:llCm3C11PdActiveFor(key),
+        qaCampaignKeyConfigured:process.env.LLTOUCH_CM_STRIPE_03C11PD_CAMPAIGN_KEY===key,
+        expectedCheckoutScope:LL_CM_03C11PD_SCOPE,
+        syntheticOnly:true,liveCheckoutEnabled:false,publicCheckoutEnabled:false,
+        liveBindingTouched:false,ghlEmergencyStop:process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true',
+        noSms:true,noBooking:true,noLivePayments:true,
+        note:'Read-only. No Stripe request or checkout creation.'});
+    }catch(_e){
+      console.error('Campaign Studio 03C11PD readiness unavailable');
+      return res.status(503).json({ok:false,error:'STRIPE_QA_BINDING_READINESS_UNAVAILABLE'});
+    }
+  });
+app.post('/lltouch/campaigns/admin/api/transactions/stripe-qa-create/:key',
+  LL_CM_03C11PD_QA_LIMIT,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    if(!llCm3C11PdRequestOrigin(req))return res.status(403).json({ok:false,error:'QA_ORIGIN_REJECTED'});
+    if(!llCm3C11PdActiveFor(key))return res.status(403).json({ok:false,error:'QA_NOT_AUTHORIZED'});
+    try{
+      const b=llCm3C11PdRequest(req),c=await llCm3C11PdCampaign(key,b.expectedVersion);
+      const amount=b.paymentKind==='deposit'?c.deposit_cents:c.price_cents;
+      if(!Number.isSafeInteger(amount) || amount<50 || amount>200000 ||
+          (b.paymentKind==='deposit' && amount>=c.price_cents))
+        throw Object.assign(new Error('INVALID_CAMPAIGN_QA_AMOUNT'),{status:409});
+      const expect={requestNonce:b.requestNonce,syntheticLeadId:llCm3C11PdSyntheticLeadId(key,c.version,b.requestNonce),
+        campaignId:c.id,campaignKey:key,campaignVersion:c.version,paymentKind:b.paymentKind,amountCents:amount};
+      const testStripe=llCmStripeSandboxClient();
+      const prior=await llCm3C11PdFindRow(b.requestNonce);
+      if(prior){
+        if(!llCm3C11PdMatchStored(prior,expect))throw Object.assign(new Error('QA_NONCE_ALREADY_USED'),{status:409});
+        const session=llCm3C11PdAssertTestSession(
+          await testStripe.checkout.sessions.retrieve(prior.stripe_session_id),expect);
+        return res.json(llCm3C11PdSafeSession(session,true));
+      }
+      const meta={cm_test_only:'true',cm_scope:LL_CM_03C11PD_SCOPE,
+        cm_lead_id:expect.syntheticLeadId,campaign_key:key,
+        campaign_version:String(c.version),payment_kind:b.paymentKind,
+        test_request_nonce:b.requestNonce,amount_cents:String(amount)};
+      const session=llCm3C11PdAssertTestSession(await testStripe.checkout.sessions.create({
+        mode:'payment',payment_method_types:['card'],client_reference_id:expect.syntheticLeadId,
+        line_items:[{price_data:{currency:'usd',unit_amount:amount,
+          product_data:{name:'LL Touch | QA TEST ONLY | '+String(c.service_title||'Campaign').slice(0,100),
+            description:'TEST MODE ONLY. No service, booking or customer record.'}},quantity:1}],
+        metadata:meta,payment_intent_data:{metadata:meta},
+        success_url:'https://stripe-checkout-1.onrender.com/lltouch/campaigns/stripe-test-return?result=completed',
+        cancel_url:'https://stripe-checkout-1.onrender.com/lltouch/campaigns/stripe-test-return?result=cancelled',
+        expires_at:Math.floor(Date.now()/1000)+35*60
+      },{idempotencyKey:'llcm-03c11pd-'+key+'-'+b.requestNonce}),expect);
+      if(!llCm3C11PdCheckoutUrl(session))throw Object.assign(new Error('UNEXPECTED_STRIPE_TEST_URL'),{status:409});
+      const {error:ie}=await academySupabase.from('lltouch_cm_stripe_checkout_qa_bindings').insert({
+        request_nonce:b.requestNonce,synthetic_lead_id:expect.syntheticLeadId,
+        campaign_id:c.id,campaign_key:key,campaign_version:c.version,
+        payment_kind:b.paymentKind,amount_cents:amount,currency:'usd',
+        stripe_session_id:session.id,checkout_scope:LL_CM_03C11PD_SCOPE,test_only:true
+      });
+      if(ie){
+        // Concurrent retry may have inserted the same record. Never overwrite or delete.
+        const raced=await llCm3C11PdFindRow(b.requestNonce);
+        if(!llCm3C11PdMatchStored(raced,expect,session.id))throw Error('QA_BINDING_PERSISTENCE_FAILED');
+      }
+      return res.status(201).json(llCm3C11PdSafeSession(session,false));
+    }catch(e){return llCm3C11PdError(res,e)}
+  });
+app.post('/lltouch/campaigns/admin/api/transactions/stripe-qa-status/:key',
+  LL_CM_03C11PD_QA_LIMIT,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    if(!llCm3C11PdRequestOrigin(req))return res.status(403).json({ok:false,error:'QA_ORIGIN_REJECTED'});
+    try{
+      const b=req.body||{};
+      if(!LL_CM_DISPLAY_KEY.test(key) ||
+         Object.keys(b).some(k=>!['requestNonce','expectedVersion'].includes(k)) ||
+         !LL_CM_03C11PD_UUID4.test(String(b.requestNonce||'')) ||
+         !Number.isSafeInteger(b.expectedVersion) || b.expectedVersion<1 ||
+         !llCmStripeSandboxSecret())return res.status(422).json({ok:false,error:'INVALID_QA_STATUS_REQUEST'});
+      const row=await llCm3C11PdFindRow(b.requestNonce);
+      if(!row || row.campaign_key!==key || row.campaign_version!==b.expectedVersion)
+        return res.status(404).json({ok:false,error:'QA_BINDING_NOT_FOUND'});
+      const expect={requestNonce:row.request_nonce,syntheticLeadId:row.synthetic_lead_id,
+        campaignId:row.campaign_id,campaignKey:key,campaignVersion:row.campaign_version,
+        paymentKind:row.payment_kind,amountCents:row.amount_cents};
+      if(!llCm3C11PdMatchStored(row,expect))throw Error('QA_BINDING_MISMATCH');
+      const s=llCm3C11PdAssertTestSession(await llCmStripeSandboxClient().checkout.sessions.retrieve(row.stripe_session_id),expect);
+      return res.json({ok:true,stage:'03C-11P-D',readOnly:true,testOnly:true,
+        sessionStatus:s.status,testPaymentStatus:s.payment_status,
+        testPaymentVerified:s.status==='complete'&&s.payment_status==='paid',
+        livePaymentVerified:false,liveBindingCreated:false,
+        recoveryAuthorized:false,noSms:true,noBooking:true});
+    }catch(e){return llCm3C11PdError(res,e)}
+  });
+// END 03C-11P-D
+
 // ==============================
 // SERVER START
 // ==============================
