@@ -14287,10 +14287,13 @@ function llCm3C11PdActiveFor(key){
   return LL_CM_DISPLAY_KEY.test(key) &&
     process.env.LLTOUCH_CM_STRIPE_03C11PD_QA_ENABLED==='true' &&
     process.env.LLTOUCH_CM_STRIPE_03C11PD_CAMPAIGN_KEY===key &&
-    llCmStripeSandboxEnabled() &&
+    // Independent gate: do not wake the older shared Stripe TEST pilots.
+    process.env.LLTOUCH_CM_STRIPE_TEST_ENABLED!=='true' &&
+    Boolean(llCmStripeSandboxSecret()) &&
     process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true' &&
     process.env.LLTOUCH_CM_GHL_SYNC_ENABLED!=='true' &&
     process.env.LLTOUCH_CM_GHL_RELEASE_APPROVED!=='true' &&
+    process.env.LLTOUCH_CM_GHL_03C11L_PILOT_APPROVED!=='true' &&
     process.env.LLTOUCH_CM_PUBLIC_LEADS_ENABLED!=='true' &&
     process.env.LLTOUCH_CM_03C11E_RELEASE_ENABLED!=='true' &&
     process.env.LLTOUCH_CM_UNIVERSAL_SLOT_ENABLED!=='true';
@@ -14687,6 +14690,264 @@ app.get('/lltouch/campaigns/admin/api/transactions/stripe-qa-webhook-readiness/:
     }
   });
 // END 03C-11Q-B READINESS
+
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11Q-C | SYNTHETIC LEAD -> STRIPE QA
+// Separate private test-only funnel; never writes customer lead/outbox, live
+// bindings, production Stripe, GHL, recovery jobs, calendar or Vagaro.
+// Requires SQL 74; default OFF; no public endpoint is added here.
+// ============================================================================
+const LL_CM_03C11QC_QA_LIMIT=rateLimit({windowMs:60*60*1000,max:3,
+  standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'FUNNEL_QA_RATE_LIMITED'}});
+const LL_CM_03C11QC_CONFIRM='CRIAR LEAD E CHECKOUT QA';
+function llCm3C11QcEnabled(key){
+  return LL_CM_DISPLAY_KEY.test(key) &&
+    process.env.LLTOUCH_CM_03C11QC_QA_ENABLED==='true' &&
+    process.env.LLTOUCH_CM_STRIPE_03C11PD_QA_ENABLED!=='true' && // old writer stays off
+    process.env.LLTOUCH_CM_STRIPE_03C11PD_CAMPAIGN_KEY===key &&
+    // Independent gate: do not wake the older shared Stripe TEST pilots.
+    process.env.LLTOUCH_CM_STRIPE_TEST_ENABLED!=='true' &&
+    Boolean(llCmStripeSandboxSecret()) &&
+    process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true' &&
+    process.env.LLTOUCH_CM_GHL_SYNC_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_GHL_RELEASE_APPROVED!=='true' &&
+    process.env.LLTOUCH_CM_GHL_03C11L_PILOT_APPROVED!=='true' &&
+    process.env.LLTOUCH_CM_PUBLIC_LEADS_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_03C11E_RELEASE_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_UNIVERSAL_SLOT_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_PILOT_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_STRIPE_03C11QB_QA_WEBHOOK_ENABLED!=='true';
+}
+function llCm3C11QcRequest(b){
+  if(!b || typeof b!=='object' || Array.isArray(b) ||
+     Object.keys(b).some(k=>!['expectedVersion','paymentKind','requestNonce','confirmation'].includes(k)) ||
+     !Number.isSafeInteger(b.expectedVersion) || b.expectedVersion<1 ||
+     !['deposit','full'].includes(b.paymentKind) ||
+     !LL_CM_03C11PD_UUID4.test(String(b.requestNonce||'')) ||
+     b.confirmation!==LL_CM_03C11QC_CONFIRM)
+    throw Object.assign(new Error('INVALID_FUNNEL_QA_REQUEST'),{status:422});
+  return b;
+}
+function llCm3C11QcFixture(nonce){
+  // Schema-compatible contact data; never stored or sent to Stripe or GHL.
+  const payload={name:'LL Touch Campaign Studio QA',
+    email:'qa-'+nonce.replaceAll('-','')+'@example.invalid',
+    phone:'+1 202 555 0147',client_nonce:nonce,
+    consent:true,sms_marketing_consent:false};
+  const parsed=llCm3C4ContactInput(payload);
+  if(parsed.sms!==false || parsed.nonce!==nonce)
+    throw Object.assign(new Error('INVALID_SYNTHETIC_CONTACT'),{status:409});
+  return true;
+}
+function llCm3C11QcExpected(c,key,b){
+  const amount=b.paymentKind==='deposit'?c.deposit_cents:c.price_cents;
+  if(!Number.isSafeInteger(amount) || amount<50 || amount>200000 ||
+     !Number.isSafeInteger(c.deposit_cents) || c.deposit_cents<0 ||
+     (b.paymentKind==='deposit' && amount>=c.price_cents))
+    throw Object.assign(new Error('INVALID_QA_CAMPAIGN_AMOUNT'),{status:409});
+  return {requestNonce:b.requestNonce,
+    syntheticLeadId:llCm3C11PdSyntheticLeadId(key,c.version,b.requestNonce),
+    campaignId:c.id,campaignKey:key,campaignVersion:c.version,
+    paymentKind:b.paymentKind,amountCents:amount};
+}
+function llCm3C11QcMatchLead(row,expect,c){
+  return Boolean(row && row.request_nonce===expect.requestNonce &&
+    row.synthetic_lead_id===expect.syntheticLeadId &&
+    row.campaign_id===expect.campaignId &&
+    row.campaign_key===expect.campaignKey &&
+    row.campaign_version===expect.campaignVersion &&
+    row.payment_kind===expect.paymentKind &&
+    row.quoted_price_cents===c.price_cents &&
+    row.quoted_deposit_cents===c.deposit_cents &&
+    row.amount_cents===expect.amountCents &&
+    row.currency==='usd' && row.source==='offer-qa' &&
+    row.contact_consent===true && row.sms_marketing_consent===false &&
+    row.test_only===true);
+}
+async function llCm3C11QcFindLead(nonce){
+  const {data,error}=await academySupabase.from('lltouch_cm_funnel_qa_leads')
+    .select('request_nonce,synthetic_lead_id,campaign_id,campaign_key,campaign_version,payment_kind,quoted_price_cents,quoted_deposit_cents,amount_cents,currency,source,contact_consent,sms_marketing_consent,test_only,created_at')
+    .eq('request_nonce',nonce).maybeSingle();
+  if(error)throw error;
+  return data||null;
+}
+app.get('/lltouch/campaigns/admin/api/transactions/funnel-qa-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data:c,error:ce}=await academySupabase.from('lltouch_campaigns')
+        .select('id,campaign_key,version,status,offer_starts_at,offer_ends_at')
+        .eq('campaign_key',key).maybeSingle();
+      if(ce)throw ce;
+      if(!c)return res.status(404).json({ok:false,error:'CAMPAIGN_NOT_FOUND'});
+      const [q,b]=await Promise.all([
+        academySupabase.from('lltouch_cm_funnel_qa_leads')
+          .select('request_nonce',{count:'exact',head:true}).eq('campaign_id',c.id),
+        academySupabase.from('lltouch_cm_stripe_checkout_qa_bindings')
+          .select('request_nonce',{count:'exact',head:true}).eq('campaign_id',c.id)
+      ]);
+      if(q.error||b.error)throw Error('FUNNEL_QA_SCHEMA_UNAVAILABLE');
+      return res.json({ok:true,readOnly:true,stage:'03C-11Q-C',campaignKey:key,
+        campaignVersion:c.version,campaignStatus:c.status,
+        campaignWindowOpen:llCm3C11QaWindowOpen(c,Date.now()),
+        qaSyntheticLeadSchemaReady:true,qaSyntheticLeads:q.count||0,
+        qaCheckoutSessionsAllPilots:b.count||0,
+        qaFunnelCreateEnabled:llCm3C11QcEnabled(key),
+        testStripeKeyConfigured:Boolean(llCmStripeSandboxSecret()),
+        syntheticContactOnly:true,noPersonalDataStored:true,
+        realLeadCaptureEnabled:false,realCheckoutEnabled:false,
+        ghlEmergencyStop:process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true',
+        noGhl:true,noSms:true,noBooking:true,noLivePayments:true,
+        note:'Private synthetic QA funnel only. No production writes or Stripe API call.'});
+    }catch(_e){
+      console.error('Campaign Studio 03C11QC readiness unavailable');
+      return res.status(503).json({ok:false,stage:'03C-11Q-C',readOnly:true,
+        error:'FUNNEL_QA_READINESS_UNAVAILABLE',noLivePayments:true});
+    }
+  });
+app.post('/lltouch/campaigns/admin/api/transactions/funnel-qa-create/:key',
+  LL_CM_03C11QC_QA_LIMIT,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    if(!llCm3C11PdRequestOrigin(req))return res.status(403).json({ok:false,error:'FUNNEL_QA_ORIGIN_REJECTED'});
+    if(!llCm3C11QcEnabled(key))return res.status(403).json({ok:false,error:'FUNNEL_QA_NOT_AUTHORIZED'});
+    try{
+      const b=llCm3C11QcRequest(req.body);
+      llCm3C11QcFixture(b.requestNonce);
+      const c=await llCm3C11PdCampaign(key,b.expectedVersion);
+      const expect=llCm3C11QcExpected(c,key,b);
+      let lead=await llCm3C11QcFindLead(b.requestNonce);
+      if(!lead){
+        // Never claim a legacy QA Checkout belongs to a newly staged lead.
+        if(await llCm3C11PdFindRow(b.requestNonce))
+          throw Object.assign(new Error('NONCE_ALREADY_USED_BY_OTHER_QA'),{status:409});
+        const {error:ie}=await academySupabase.from('lltouch_cm_funnel_qa_leads').insert({
+          request_nonce:expect.requestNonce,synthetic_lead_id:expect.syntheticLeadId,
+          campaign_id:c.id,campaign_key:key,campaign_version:c.version,
+          payment_kind:b.paymentKind,quoted_price_cents:c.price_cents,
+          quoted_deposit_cents:c.deposit_cents,amount_cents:expect.amountCents,
+          currency:'usd',source:'offer-qa',contact_consent:true,
+          sms_marketing_consent:false,test_only:true
+        });
+        if(ie && ie.code!=='23505')throw ie;
+        lead=await llCm3C11QcFindLead(b.requestNonce);
+      }
+      if(!llCm3C11QcMatchLead(lead,expect,c))
+        throw Object.assign(new Error('FUNNEL_QA_NONCE_CONFLICT'),{status:409});
+      let prior=await llCm3C11PdFindRow(b.requestNonce);
+      const testStripe=llCmStripeSandboxClient();
+      if(prior){
+        if(!llCm3C11PdMatchStored(prior,expect))
+          throw Object.assign(new Error('FUNNEL_QA_BINDING_MISMATCH'),{status:409});
+        const existing=llCm3C11PdAssertTestSession(
+          await testStripe.checkout.sessions.retrieve(prior.stripe_session_id),expect);
+        return res.json({ok:true,stage:'03C-11Q-C',testOnly:true,idempotent:true,
+          qaLeadRecorded:true,qaCheckoutBound:true,checkoutSessionId:existing.id,
+          checkoutStatus:existing.status,testPaymentStatus:existing.payment_status,
+          noRealLead:true,noLiveCheckout:true,noGhl:true,noSms:true,noBooking:true});
+      }
+      // A lost Stripe response must not create a fresh session after the Stripe
+      // idempotency retention window. Keep the same nonce for earlier retries.
+      if(!Number.isFinite(Date.parse(lead.created_at)) ||
+         Date.now()-Date.parse(lead.created_at)>20*60*60*1000)
+        throw Object.assign(new Error('FUNNEL_QA_RETRY_WINDOW_CLOSED_MANUAL_REVIEW'),{status:409});
+      const metadata={cm_test_only:'true',cm_scope:LL_CM_03C11PD_SCOPE,
+        cm_lead_id:expect.syntheticLeadId,campaign_key:key,
+        campaign_version:String(c.version),payment_kind:b.paymentKind,
+        test_request_nonce:b.requestNonce,amount_cents:String(expect.amountCents)};
+      const session=llCm3C11PdAssertTestSession(await testStripe.checkout.sessions.create({
+        mode:'payment',payment_method_types:['card'],client_reference_id:expect.syntheticLeadId,
+        line_items:[{price_data:{currency:'usd',unit_amount:expect.amountCents,
+          product_data:{name:'LL Touch | QA TEST ONLY | '+String(c.service_title||'Campaign').slice(0,100),
+            description:'Synthetic QA lead. No real customer or booking.'}},quantity:1}],
+        metadata,payment_intent_data:{metadata},
+        success_url:'https://stripe-checkout-1.onrender.com/lltouch/campaigns/stripe-test-return?result=completed',
+        cancel_url:'https://stripe-checkout-1.onrender.com/lltouch/campaigns/stripe-test-return?result=cancelled',
+        expires_at:Math.floor(Date.now()/1000)+35*60
+      },{idempotencyKey:'llcm-03c11pd-'+key+'-'+b.requestNonce}),expect);
+      if(!llCm3C11PdCheckoutUrl(session))
+        throw Object.assign(new Error('UNEXPECTED_QA_CHECKOUT_URL'),{status:409});
+      const {error:be}=await academySupabase.from('lltouch_cm_stripe_checkout_qa_bindings').insert({
+        request_nonce:expect.requestNonce,synthetic_lead_id:expect.syntheticLeadId,
+        campaign_id:c.id,campaign_key:key,campaign_version:c.version,
+        payment_kind:b.paymentKind,amount_cents:expect.amountCents,currency:'usd',
+        stripe_session_id:session.id,checkout_scope:LL_CM_03C11PD_SCOPE,test_only:true
+      });
+      if(be){
+        prior=await llCm3C11PdFindRow(b.requestNonce);
+        if(!llCm3C11PdMatchStored(prior,expect,session.id))
+          throw Error('FUNNEL_QA_BINDING_PERSISTENCE_FAILED');
+      }
+      return res.status(201).json({ok:true,stage:'03C-11Q-C',testOnly:true,
+        idempotent:false,qaLeadRecorded:true,qaCheckoutBound:true,
+        checkoutSessionId:session.id,checkoutStatus:session.status,
+        testPaymentStatus:session.payment_status,noRealLead:true,
+        noLiveCheckout:true,noGhl:true,noSms:true,noBooking:true,
+        note:'QA-only synthetic lead and Stripe test session. No personal data used.'});
+    }catch(error){
+      const code=[409,422].includes(error?.status)?error.status:503;
+      if(code===503)console.error('Campaign Studio 03C11QC failed closed');
+      return res.status(code).json({ok:false,stage:'03C-11Q-C',testOnly:true,
+        error:code===503?'FUNNEL_QA_UNAVAILABLE_REUSE_SAME_NONCE':String(error.message||'FUNNEL_QA_REJECTED'),
+        noRealLead:true,noLiveCheckout:true,noGhl:true,noSms:true,noBooking:true});
+    }
+  });
+
+// A read-only check of the complete QA chain. Available even when creation is
+// disabled. Never authorizes recovery or a production payment.
+app.post('/lltouch/campaigns/admin/api/transactions/funnel-qa-status/:key',
+  LL_CM_03C11QC_QA_LIMIT,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||''),b=req.body||{};
+    if(!llCm3C11PdRequestOrigin(req))
+      return res.status(403).json({ok:false,error:'FUNNEL_QA_ORIGIN_REJECTED'});
+    if(!LL_CM_DISPLAY_KEY.test(key) ||
+       Object.keys(b).some(k=>!['expectedVersion','requestNonce'].includes(k)) ||
+       !LL_CM_03C11PD_UUID4.test(String(b.requestNonce||'')) ||
+       !Number.isSafeInteger(b.expectedVersion) || b.expectedVersion<1)
+      return res.status(422).json({ok:false,error:'INVALID_FUNNEL_QA_STATUS_REQUEST'});
+    try{
+      const lead=await llCm3C11QcFindLead(b.requestNonce);
+      const binding=await llCm3C11PdFindRow(b.requestNonce);
+      if(!lead || !binding || lead.campaign_key!==key ||
+         lead.campaign_version!==b.expectedVersion ||
+         lead.campaign_id!==binding.campaign_id ||
+         lead.synthetic_lead_id!==binding.synthetic_lead_id ||
+         lead.campaign_version!==binding.campaign_version ||
+         lead.payment_kind!==binding.payment_kind ||
+         lead.amount_cents!==binding.amount_cents ||
+         lead.test_only!==true ||
+         !llCm3C11PdMatchStored(binding,{
+           requestNonce:b.requestNonce,syntheticLeadId:lead.synthetic_lead_id,
+           campaignId:lead.campaign_id,campaignKey:key,
+           campaignVersion:b.expectedVersion,paymentKind:lead.payment_kind,
+           amountCents:lead.amount_cents
+         })) return res.status(409).json({ok:false,readOnly:true,stage:'03C-11Q-C',
+           error:'FUNNEL_QA_LEAD_OR_BINDING_NOT_VERIFIED',noLiveCheckout:true});
+      const expect={requestNonce:b.requestNonce,syntheticLeadId:lead.synthetic_lead_id,
+        campaignId:lead.campaign_id,campaignKey:key,campaignVersion:b.expectedVersion,
+        paymentKind:lead.payment_kind,amountCents:lead.amount_cents};
+      const session=llCm3C11PdAssertTestSession(
+        await llCmStripeSandboxClient().checkout.sessions.retrieve(binding.stripe_session_id),expect);
+      return res.json({ok:true,readOnly:true,stage:'03C-11Q-C',testOnly:true,
+        qaLeadRecorded:true,qaCheckoutBound:true,qaSessionIdentityVerified:true,
+        checkoutStatus:session.status,testPaymentStatus:session.payment_status,
+        livePaymentVerified:false,recoveryAuthorized:false,noRealLead:true,
+        noLiveCheckout:true,noGhl:true,noSms:true,noBooking:true,
+        personalDataReturned:false});
+    }catch(_e){
+      console.error('Campaign Studio 03C11QC status failed closed');
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11Q-C',
+        error:'FUNNEL_QA_STATUS_UNAVAILABLE',noLiveCheckout:true,
+        recoveryAuthorized:false,noSms:true});
+    }
+  });
+
+// END 03C-11Q-C
 
 // ==============================
 // SERVER START
