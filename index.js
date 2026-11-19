@@ -14949,6 +14949,103 @@ app.post('/lltouch/campaigns/admin/api/transactions/funnel-qa-status/:key',
 
 // END 03C-11Q-C
 
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11Q-D-A | OFFER LEAD BRIDGE PREFLIGHT
+// READ-ONLY, ADMIN-ONLY. The real /lltouch/campaigns/leads POST and the
+// Webflow /offer frontend already exist in earlier stages; DO NOT duplicate
+// lead inserts, GHL outbox, payment, hold, or booking logic here.
+// Never verifies the ACTUAL deployed Webflow page. That needs a browser test.
+// Requires the SQL 43 lead tables already installed, no new migration.
+// ============================================================================
+function llCm3C11QdCaptureAssessment(c,s){
+  const meta=c?.marketing?.campaignMeta||{};
+  const flags={
+    releaseFlag:process.env.LLTOUCH_CM_03C11E_RELEASE_ENABLED==='true',
+    publicLeadFlag:process.env.LLTOUCH_CM_PUBLIC_LEADS_ENABLED==='true',
+    webflowQaFlag:process.env.LLTOUCH_CM_WEBFLOW_QA_ENABLED==='true',
+    universalContactFlag:process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_ENABLED==='true',
+    universalContactPilotFlag:process.env.LLTOUCH_CM_UNIVERSAL_CONTACT_PILOT_ENABLED==='true',
+    universalSlotFlag:process.env.LLTOUCH_CM_UNIVERSAL_SLOT_ENABLED==='true',
+    ghlEmergencyStop:process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true',
+    ghlSyncFlag:process.env.LLTOUCH_CM_GHL_SYNC_ENABLED==='true'
+  };
+  const checks={
+    published:c?.status==='published',
+    currentWindow:llCm3C11QaWindowOpen(c,Date.now()),
+    manualCampaign:c?.site_item?.type==='manual',
+    contactOnlyReleaseMode:meta.releaseMode==='display-only',
+    checkoutNotApproved:meta.checkoutReady===false,
+    bookingNotApproved:meta.bookingReady===false,
+    perCampaignSwitchCurrent:s?.enabled===true&&s?.campaign_version===c?.version,
+    releaseFlag:flags.releaseFlag,
+    publicLeadFlag:flags.publicLeadFlag,
+    otherPublicPilotsOff:!flags.webflowQaFlag&&!flags.universalContactFlag&&
+      !flags.universalContactPilotFlag&&!flags.universalSlotFlag,
+    ghlEmergencyStop:flags.ghlEmergencyStop,
+    ghlSyncDisabled:!flags.ghlSyncFlag
+  };
+  const blockers=Object.entries(checks).filter(([,passed])=>!passed).map(([code])=>code);
+  const backendReady=llCm3C11PublicGate()&&llCm3C11SafeCampaign(c)&&
+    checks.perCampaignSwitchCurrent;
+  return {checks,flags,blockers,backendReady};
+}
+app.get('/lltouch/campaigns/admin/api/leads/offer-bridge-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    res.set('Referrer-Policy','no-referrer');
+    res.set('X-Robots-Tag','noindex, nofollow');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))
+      return res.status(422).json({ok:false,readOnly:true,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data:c,error:ce}=await academySupabase.from('lltouch_campaigns')
+        .select('id,campaign_key,version,status,site_item,marketing,offer_starts_at,offer_ends_at')
+        .eq('campaign_key',key).maybeSingle();
+      if(ce)throw ce;
+      if(!c)return res.status(404).json({ok:false,readOnly:true,error:'CAMPAIGN_NOT_FOUND'});
+      const [s,l,o]=await Promise.all([
+        llCm3C11Setting(key),
+        academySupabase.from('lltouch_cm_leads')
+          .select('id',{count:'exact',head:true}).eq('campaign_id',c.id),
+        academySupabase.from('lltouch_cm_lead_outbox')
+          .select('lead_id',{count:'exact',head:true}).eq('campaign_key',key)
+      ]);
+      if(l.error||o.error)throw Error('LEAD_TABLE_READINESS_UNAVAILABLE');
+      const a=llCm3C11QdCaptureAssessment(c,s);
+      return res.json({
+        ok:true,readOnly:true,stage:'03C-11Q-D-A',
+        campaignKey:key,campaignVersion:c.version,campaignStatus:c.status,
+        campaignWindowOpen:a.checks.currentWindow,
+        leadTablesReady:true,existingLeads:l.count||0,existingOutboxRecords:o.count||0,
+        perCampaignSettingPresent:!!s,
+        perCampaignEnabled:a.checks.perCampaignSwitchCurrent,
+        releaseGates:a.flags,contractChecks:a.checks,blockers:a.blockers,
+        realLeadPostRouteImplemented:true,
+        realLeadPostRoute:'/lltouch/campaigns/leads',
+        offerPageContextRoute:'/lltouch/campaigns/active-page',
+        backendCaptureReady:a.backendReady,
+        // Backend cannot inspect the live Webflow deployment via this endpoint.
+        webflowLiveFormVerified:false,webflowLiveFormStatus:'NOT_TESTED',
+        webflowExpectedFormId:'ll-offer-lead',
+        expectedJsonFields:['campaignKey','campaignVersion','name','email','phone',
+          'consent','sms_marketing_consent','client_nonce','website'],
+        expectedFormFields:['name','email','phone','consent','sms_marketing_consent','website'],
+        captureAllowedForPublicUsers:a.backendReady,
+        checkoutCreated:false,realCheckoutEnabled:false,ghlDispatched:false,
+        smsSent:false,bookingCreated:false,personalDataReturned:false,
+        productionReleaseApproved:false,
+        note:'Read-only bridge preflight. This does not inspect deployed Webflow, submit leads, enable flags, send to GHL, create checkout, booking, or SMS.'
+      });
+    }catch(e){
+      console.error('Campaign Studio 03C11QD-A preflight unavailable:',String(e?.message||e).slice(0,80));
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11Q-D-A',
+        error:'OFFER_BRIDGE_PREFLIGHT_UNAVAILABLE',
+        productionReleaseApproved:false,checkoutCreated:false,ghlDispatched:false,
+        smsSent:false,bookingCreated:false,personalDataReturned:false});
+    }
+  });
+// END 03C-11Q-D-A
+
 // ==============================
 // SERVER START
 // ==============================
