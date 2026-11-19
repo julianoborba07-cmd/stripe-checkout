@@ -149,6 +149,109 @@ app.use(cors({
 }));
 
 // ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11Q-B | SIGNED STRIPE CHECKOUT QA WEBHOOK
+// A *new*, isolated Stripe TEST MODE event inbox; does not change /webhook or
+// /lltouch/campaigns/stripe-test-webhook. No real lead, checkout, GHL, SMS,
+// booking, recovery, or payment side effects. Defaults disabled.
+// Register BEFORE express.json() so Stripe's signed raw bytes are preserved.
+// ============================================================================
+const LL_CM_03C11QB_EVENTS=new Set([
+  'checkout.session.completed',
+  'checkout.session.async_payment_succeeded',
+  'checkout.session.async_payment_failed',
+  'checkout.session.expired'
+]);
+function llCm3C11QbSecret(){
+  const v=String(process.env.LLTOUCH_CM_STRIPE_03C11QB_QA_WEBHOOK_SECRET||'').trim();
+  return /^whsec_[A-Za-z0-9]{12,}$/.test(v)?v:null;
+}
+function llCm3C11QbEnabled(){
+  return process.env.LLTOUCH_CM_STRIPE_03C11QB_QA_WEBHOOK_ENABLED==='true' &&
+    Boolean(llCm3C11QbSecret()) && Boolean(llCmStripeSandboxSecret()) &&
+    process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true' &&
+    process.env.LLTOUCH_CM_GHL_SYNC_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_PUBLIC_LEADS_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_03C11E_RELEASE_ENABLED!=='true';
+}
+function llCm3C11QbEventEnvelope(event){
+  const s=event?.data?.object;
+  if(!LL_CM_03C11QB_EVENTS.has(event?.type) ||
+     event?.livemode!==false || s?.livemode!==false ||
+     s?.object!=='checkout.session' ||
+     !/^cs_test_[A-Za-z0-9_]{12,200}$/.test(String(s?.id||'')) ||
+     s?.metadata?.cm_test_only!=='true' ||
+     s?.metadata?.cm_scope!=='lltouch-cm-universal-checkout-qa-v1')return null;
+  if(!/^evt_[A-Za-z0-9_]{8,200}$/.test(String(event.id||'')) ||
+     !Number.isSafeInteger(event.created) || event.created<1)
+    throw Error('INVALID_QA_EVENT_ENVELOPE');
+  return {eventId:event.id,sessionId:s.id,eventType:event.type,
+    createdAt:new Date(event.created*1000).toISOString()};
+}
+app.post('/lltouch/campaigns/stripe-qa-webhook-v2',
+  express.raw({type:'application/json',limit:'128kb'}),async(req,res)=>{
+    res.set('Cache-Control','no-store');
+    if(!llCm3C11QbEnabled())
+      return res.status(503).json({received:false,error:'STRIPE_QA_WEBHOOK_DISABLED'});
+    let event,env;
+    try{
+      if(!Buffer.isBuffer(req.body) || !req.body.length || !req.get('stripe-signature'))
+        throw Error('INVALID_RAW_STRIPE_EVENT');
+      event=llCmStripeSandboxClient().webhooks.constructEvent(
+        req.body,req.get('stripe-signature'),llCm3C11QbSecret());
+    }catch(_e){
+      return res.status(400).json({received:false,error:'INVALID_STRIPE_SIGNATURE'});
+    }
+    try{env=llCm3C11QbEventEnvelope(event)}
+    catch(_e){return res.status(400).json({received:false,error:'INVALID_QA_EVENT'});}
+    if(!env)return res.status(200).json({received:true,ignored:true,testOnly:true});
+    try{
+      const {data:b,error:be}=await academySupabase.from('lltouch_cm_stripe_checkout_qa_bindings')
+        .select('request_nonce,synthetic_lead_id,campaign_id,campaign_key,campaign_version,payment_kind,amount_cents,currency,checkout_scope,test_only,stripe_session_id')
+        .eq('stripe_session_id',env.sessionId).maybeSingle();
+      if(be)throw be;
+      // Event could arrive before create's binding commit; retry rather than
+      // acknowledging it and losing the only audit copy.
+      if(!b)throw Error('QA_WEBHOOK_BINDING_NOT_YET_AVAILABLE');
+      const expected={requestNonce:b.request_nonce,syntheticLeadId:b.synthetic_lead_id,
+        campaignId:b.campaign_id,campaignKey:b.campaign_key,
+        campaignVersion:b.campaign_version,paymentKind:b.payment_kind,
+        amountCents:b.amount_cents};
+      if(!llCm3C11PdMatchStored(b,expected,env.sessionId))throw Error('QA_WEBHOOK_BINDING_MISMATCH');
+      const session=llCm3C11PdAssertTestSession(
+        await llCmStripeSandboxClient().checkout.sessions.retrieve(env.sessionId),expected);
+      if(!['open','complete','expired'].includes(session.status) ||
+         !['paid','unpaid','no_payment_required'].includes(session.payment_status))
+        throw Error('QA_WEBHOOK_UNKNOWN_SESSION_STATE');
+      const row={stripe_event_id:env.eventId,request_nonce:b.request_nonce,
+        stripe_session_id:session.id,campaign_id:b.campaign_id,
+        campaign_version:b.campaign_version,checkout_scope:b.checkout_scope,
+        event_type:env.eventType,event_created_at:env.createdAt,
+        session_status:session.status,payment_status:session.payment_status,
+        payment_verified:session.status==='complete'&&session.payment_status==='paid',
+        livemode:false};
+      const {error:ie}=await academySupabase.from('lltouch_cm_stripe_qa_webhook_events').insert(row);
+      if(ie){
+        if(ie.code==='23505'){
+          const {data:old,error:oe}=await academySupabase.from('lltouch_cm_stripe_qa_webhook_events')
+            .select('stripe_event_id,stripe_session_id,request_nonce,event_type')
+            .eq('stripe_event_id',env.eventId).maybeSingle();
+          if(!oe && old && old.stripe_session_id===session.id &&
+             old.request_nonce===b.request_nonce && old.event_type===env.eventType)
+            return res.status(200).json({received:true,duplicate:true,testOnly:true});
+        }
+        throw ie;
+      }
+      return res.status(200).json({received:true,recorded:true,testOnly:true,
+        noSms:true,noBooking:true,noLivePayment:true});
+    }catch(_e){
+      // Stripe retries on non-2xx. Never log customer data, secrets or payloads.
+      console.error('Campaign Studio 03C11QB QA webhook failed closed');
+      return res.status(503).json({received:false,error:'STRIPE_QA_WEBHOOK_AUDIT_UNAVAILABLE'});
+    }
+  });
+// END 03C-11Q-B ISOLATED WEBHOOK
+
+// ============================================================================
 // LL TOUCH CAMPAIGN STUDIO | 03B-2E2 | STRIPE SANDBOX SIGNED WEBHOOK
 // IMPORTANT: separate endpoint from /webhook production. RAW body is mandatory.
 // No hold, booking, refund, outbox, or CRM effects. Only a private QA ledger.
@@ -14519,6 +14622,46 @@ app.post('/lltouch/campaigns/admin/api/transactions/live-checkout-lead-preflight
     }
   });
 // END 03C-11Q-A
+
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11Q-B | QA WEBHOOK READINESS (READ ONLY)
+// No Stripe request. No external webhook destination is created.
+// ============================================================================
+app.get('/lltouch/campaigns/admin/api/transactions/stripe-qa-webhook-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data:c,error:ce}=await academySupabase.from('lltouch_campaigns')
+        .select('id,campaign_key,version,status').eq('campaign_key',key).maybeSingle();
+      if(ce)throw ce;
+      if(!c)return res.status(404).json({ok:false,error:'CAMPAIGN_NOT_FOUND'});
+      const [events,bindings]=await Promise.all([
+        academySupabase.from('lltouch_cm_stripe_qa_webhook_events')
+          .select('stripe_event_id',{count:'exact',head:true}).eq('campaign_id',c.id),
+        academySupabase.from('lltouch_cm_stripe_checkout_qa_bindings')
+          .select('request_nonce',{count:'exact',head:true}).eq('campaign_id',c.id)
+      ]);
+      if(events.error||bindings.error)throw Error('QA_WEBHOOK_SCHEMA_UNAVAILABLE');
+      return res.json({ok:true,stage:'03C-11Q-B',readOnly:true,campaignKey:key,
+        campaignVersion:c.version,campaignStatus:c.status,
+        webhookEventLedgerReady:true,qaBoundSessions:bindings.count||0,
+        qaWebhookEvents:events.count||0,qaWebhookSecretConfigured:Boolean(llCm3C11QbSecret()),
+        testStripeKeyConfigured:Boolean(llCmStripeSandboxSecret()),
+        qaWebhookEnabled:llCm3C11QbEnabled(),
+        signedWebhookEventRecorded:(events.count||0)>0, // only true after a signed event was recorded
+        qaOnly:true,publicCheckoutEnabled:false,liveCheckoutEnabled:false,
+        liveWebhookChanged:false,ghlEmergencyStop:process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true',
+        noLivePayments:true,noSms:true,noBooking:true,
+        note:'Read-only readiness. No Stripe API call, webhook delivery or payment performed.'});
+    }catch(_e){
+      console.error('Campaign Studio 03C11QB readiness unavailable');
+      return res.status(503).json({ok:false,stage:'03C-11Q-B',readOnly:true,
+        error:'QA_WEBHOOK_READINESS_UNAVAILABLE',noLivePayments:true,noSms:true});
+    }
+  });
+// END 03C-11Q-B READINESS
 
 // ==============================
 // SERVER START
