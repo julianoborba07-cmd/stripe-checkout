@@ -187,6 +187,30 @@ function llCm3C11QbEventEnvelope(event){
   return {eventId:event.id,sessionId:s.id,eventType:event.type,
     createdAt:new Date(event.created*1000).toISOString()};
 }
+// Diagnostic classification only. Do not log secrets, signatures, bodies or PII.
+function llCm3C11QbLogSignatureRejection(error,req){
+  const rawIsBuffer=Buffer.isBuffer(req.body);
+  const rawPresent=rawIsBuffer && req.body.length>0;
+  const header=String(req.get('stripe-signature')||'');
+  const timestampMatch=header.match(/(?:^|,)\s*t=(\d{8,12})(?=,|$)/);
+  const hasV1=/(?:^|,)\s*v1=[a-f0-9]{64}(?=,|$)/i.test(header);
+  const t=timestampMatch?Number(timestampMatch[1]):null;
+  const clockSkewOver5m=t!==null?Math.abs(Math.floor(Date.now()/1000)-t)>300:null;
+  const msg=String(error?.message||'').toLowerCase();
+  let reason='UNKNOWN_STRIPE_VERIFICATION_ERROR';
+  if(!rawPresent)reason='RAW_BODY_UNAVAILABLE';
+  else if(!header)reason='STRIPE_SIGNATURE_HEADER_MISSING';
+  else if(!timestampMatch || !hasV1)reason='STRIPE_SIGNATURE_HEADER_MALFORMED';
+  else if(msg.includes('timestamp outside the tolerance zone'))reason='STRIPE_SIGNATURE_TIMESTAMP_OUTSIDE_TOLERANCE';
+  else if(msg.includes('no signatures found matching'))reason='STRIPE_SIGNATURE_HMAC_MISMATCH';
+  else if(msg.includes('invalid_raw_stripe_event'))reason='RAW_BODY_OR_HEADER_INVALID';
+  else if(msg.includes('webhook payload'))reason='INVALID_RAW_PAYLOAD';
+  console.warn('LL Touch Campaign Studio QA webhook verification diagnostic',{
+    stage:'03C-11Q-B-DIAG',reason,rawIsBuffer,rawPresent,
+    signatureHeaderPresent:Boolean(header),signatureTimestampPresent:Boolean(timestampMatch),
+    signatureV1Present:hasV1,clockSkewOver5m
+  });
+}
 app.post('/lltouch/campaigns/stripe-qa-webhook-v2',
   express.raw({type:'application/json',limit:'128kb'}),async(req,res)=>{
     res.set('Cache-Control','no-store');
@@ -198,7 +222,8 @@ app.post('/lltouch/campaigns/stripe-qa-webhook-v2',
         throw Error('INVALID_RAW_STRIPE_EVENT');
       event=llCmStripeSandboxClient().webhooks.constructEvent(
         req.body,req.get('stripe-signature'),llCm3C11QbSecret());
-    }catch(_e){
+    }catch(e){
+      llCm3C11QbLogSignatureRejection(e,req);
       return res.status(400).json({received:false,error:'INVALID_STRIPE_SIGNATURE'});
     }
     try{env=llCm3C11QbEventEnvelope(event)}
