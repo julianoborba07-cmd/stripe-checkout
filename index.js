@@ -14379,6 +14379,147 @@ app.post('/lltouch/campaigns/admin/api/transactions/stripe-qa-status/:key',
   });
 // END 03C-11P-D
 
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11Q-A | LIVE LEAD / CHECKOUT PREFLIGHT
+// READ ONLY. No production checkout route, no Stripe call, no session binding,
+// no lead/ledger mutation, no booking, GHL, webhook or SMS.
+// This stage deliberately does not define a release switch for live checkout.
+// The Q-B implementation must add an explicit approval, atomic reservation RPC,
+// one-session-per-nonce reconciliation and signed webhook processing separately.
+// ============================================================================
+const LL_CM_03C11QA_LIMIT=rateLimit({windowMs:15*60*1000,max:12,
+  standardHeaders:'draft-7',legacyHeaders:false,
+  message:{ok:false,error:'LIVE_CHECKOUT_PREFLIGHT_RATE_LIMITED'}});
+function llCm3C11QaWindowOpen(c,now){
+  const start=Date.parse(c?.offer_starts_at||'');
+  const end=Date.parse(c?.offer_ends_at||'');
+  return Number.isFinite(start) && Number.isFinite(end) &&
+    start<end && now>=start && now<end;
+}
+function llCm3C11QaEvaluate(c,l,paymentKind,existingBindings,existingIntents,now){
+  const blockers=[];
+  if(!c || c.status!=='published')blockers.push('CAMPAIGN_NOT_PUBLISHED');
+  if(!c || c.site_item?.type!=='manual')blockers.push('CAMPAIGN_MODE_NOT_SUPPORTED');
+  if(!c || c.currency!=='usd')blockers.push('CURRENCY_NOT_SUPPORTED');
+  if(!c || !llCm3C11QaWindowOpen(c,now))blockers.push('CAMPAIGN_WINDOW_CLOSED');
+  if(c?.marketing?.campaignMeta?.checkoutReady!==true)
+    blockers.push('CAMPAIGN_CHECKOUT_NOT_APPROVED');
+  if(c?.marketing?.campaignMeta?.bookingReady!==true)
+    blockers.push('CAMPAIGN_BOOKING_NOT_APPROVED');
+  if(!l || l.campaign_id!==c?.id || l.campaign_key!==c?.campaign_key ||
+    l.campaign_version!==c?.version || l.contact_consent!==true)
+    blockers.push('LEAD_IDENTITY_OR_CONSENT_MISMATCH');
+  const quote=l?.quote_snapshot;
+  if(!quote || typeof quote!=='object' || Array.isArray(quote) ||
+     quote.priceCents!==c?.price_cents ||
+     quote.depositCents!==c?.deposit_cents ||
+     quote.currency!==c?.currency ||
+     quote.sourceCampaignVersion!==c?.version)
+    blockers.push('LEAD_QUOTE_VERSION_MISMATCH');
+  const amount=paymentKind==='deposit'?c?.deposit_cents:c?.price_cents;
+  if(!['deposit','full'].includes(paymentKind) || !Number.isSafeInteger(amount) ||
+    amount<50 || amount>200000 ||
+    (paymentKind==='deposit' && amount>=c?.price_cents))
+    blockers.push('INVALID_PAYMENT_KIND_OR_AMOUNT');
+  if(existingBindings>0)blockers.push('EXISTING_LIVE_CHECKOUT_REQUIRES_RECONCILIATION');
+  if(existingIntents>0)blockers.push('EXISTING_CHECKOUT_REQUEST_REQUIRES_RECONCILIATION');
+  return {structuralChecksPassed:blockers.length===0,blockers,
+    quoteMatched:!blockers.includes('LEAD_QUOTE_VERSION_MISMATCH'),
+    amountCents:Number.isSafeInteger(amount)?amount:null};
+}
+app.get('/lltouch/campaigns/admin/api/transactions/live-checkout-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data:c,error:ce}=await academySupabase.from('lltouch_campaigns')
+        .select('id,campaign_key,version,status,offer_starts_at,offer_ends_at,marketing')
+        .eq('campaign_key',key).maybeSingle();
+      if(ce)throw ce;
+      if(!c)return res.status(404).json({ok:false,error:'CAMPAIGN_NOT_FOUND'});
+      const [i,l,b]=await Promise.all([
+        academySupabase.from('lltouch_cm_checkout_issue_ledger')
+          .select('request_nonce',{count:'exact',head:true}).eq('campaign_id',c.id),
+        academySupabase.from('lltouch_cm_leads')
+          .select('id',{count:'exact',head:true}).eq('campaign_id',c.id),
+        academySupabase.from('lltouch_cm_lead_stripe_sessions')
+          .select('stripe_session_id',{count:'exact',head:true}).eq('campaign_id',c.id)
+      ]);
+      if(i.error||l.error||b.error)throw Error('SCHEMA_QUERY_UNAVAILABLE');
+      return res.json({ok:true,readOnly:true,stage:'03C-11Q-A',campaignKey:key,
+        campaignVersion:c.version,campaignStatus:c.status,
+        campaignWindowOpen:llCm3C11QaWindowOpen(c,Date.now()),
+        campaignCheckoutApproved:c.marketing?.campaignMeta?.checkoutReady===true,
+        checkoutIssueLedgerSchemaReady:true,checkoutIssueRequests:i.count||0,
+        leadsRecorded:l.count||0,liveBoundSessions:b.count||0,
+        realCheckoutCreationImplemented:false,realCheckoutCreationEnabled:false,
+        stripeApiReadPerformed:false,checkoutCreated:false,checkoutBindingCreated:false,
+        webhookReconciliationOperational:false,ghlEmergencyStop:process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true',
+        recoveryAuthorized:false,noSms:true,noBooking:true,noPayments:true,
+        note:'Read-only live Checkout preflight. No live Checkout creation endpoint is provided in this stage.'});
+    }catch(_e){
+      console.error('Campaign Studio 03C11QA readiness unavailable');
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11Q-A',
+        error:'CHECKOUT_LEDGER_READINESS_UNAVAILABLE',checkoutCreated:false,noPayments:true});
+    }
+  });
+app.post('/lltouch/campaigns/admin/api/transactions/live-checkout-lead-preflight/:key',
+  LL_CM_03C11QA_LIMIT,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+    const key=String(req.params.key||'');
+    const b=req.body;
+    if(!LL_CM_DISPLAY_KEY.test(key) || !llCmAdminSameOrigin(req) ||
+       !llCm3C4Body(req) || !b || typeof b!=='object' || Array.isArray(b) ||
+       Object.keys(b).some(k=>!['leadId','expectedVersion','paymentKind'].includes(k)) ||
+       !LL_CM_03C4_UUID.test(String(b.leadId||'')) ||
+       !Number.isSafeInteger(b.expectedVersion) || b.expectedVersion<1 ||
+       !['deposit','full'].includes(b.paymentKind))
+      return res.status(422).json({ok:false,readOnly:true,stage:'03C-11Q-A',
+        error:'INVALID_LEAD_PREFLIGHT_REQUEST',checkoutAuthorized:false,noPayments:true});
+    try{
+      const [cr,lr]=await Promise.all([
+        academySupabase.from('lltouch_campaigns')
+          .select('id,campaign_key,version,status,site_item,marketing,currency,price_cents,deposit_cents,offer_starts_at,offer_ends_at')
+          .eq('campaign_key',key).maybeSingle(),
+        academySupabase.from('lltouch_cm_leads')
+          .select('id,campaign_id,campaign_key,campaign_version,contact_consent,quote_snapshot')
+          .eq('id',b.leadId).eq('campaign_key',key)
+          .eq('campaign_version',b.expectedVersion).maybeSingle()
+      ]);
+      if(cr.error||lr.error)throw Error('CAMPAIGN_LEAD_QUERY_FAILED');
+      const c=cr.data,l=lr.data;
+      if(!c || !l || c.version!==b.expectedVersion)
+        return res.status(409).json({ok:false,readOnly:true,stage:'03C-11Q-A',
+          error:'NO_VALID_CURRENT_CAMPAIGN_LEAD',checkoutAuthorized:false,
+          paymentStatus:'unknown',noPayments:true});
+      const [br,ir]=await Promise.all([
+        academySupabase.from('lltouch_cm_lead_stripe_sessions')
+          .select('stripe_session_id',{head:true,count:'exact'}).eq('lead_id',l.id),
+        academySupabase.from('lltouch_cm_checkout_issue_ledger')
+          .select('request_nonce',{head:true,count:'exact'}).eq('lead_id',l.id)
+      ]);
+      if(br.error||ir.error)throw Error('BINDING_OR_LEDGER_QUERY_FAILED');
+      const verdict=llCm3C11QaEvaluate(c,l,b.paymentKind,br.count||0,ir.count||0,Date.now());
+      return res.json({ok:true,readOnly:true,stage:'03C-11Q-A',campaignKey:key,
+        campaignVersion:c.version,paymentKind:b.paymentKind,
+        quoteMatched:verdict.quoteMatched,
+        structuralChecksPassed:verdict.structuralChecksPassed,
+        blockers:verdict.blockers,amountCents:verdict.amountCents,
+        existingLiveBindings:br.count||0,existingCheckoutRequests:ir.count||0,
+        checkoutAuthorized:false,liveCheckoutCreated:false,liveStripeReadPerformed:false,
+        paymentStatus:'unknown',recoveryAuthorized:false,noSms:true,noBooking:true,noPayments:true,
+        personalDataReturned:false,
+        note:'Administrative analysis only: no session created, reserved or authorized.'});
+    }catch(_e){
+      console.error('Campaign Studio 03C11QA lead preflight unavailable');
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11Q-A',
+        error:'LIVE_CHECKOUT_LEAD_PREFLIGHT_UNAVAILABLE',checkoutAuthorized:false,
+        paymentStatus:'unknown',noPayments:true});
+    }
+  });
+// END 03C-11Q-A
+
 // ==============================
 // SERVER START
 // ==============================
