@@ -13485,7 +13485,9 @@ function llCm3C11LTagForCampaign(c){
 // ============================================================================
 // LL TOUCH CAMPAIGN STUDIO | 03C-11J | GHL UNIVERSAL OUTBOX CONNECTOR
 // This is NOT the legacy HydraFacial GHL outbox or its recurring worker.
-// No automatic/scheduled dispatch. One manual, authenticated, campaign-scoped
+// This manual connector alone has no automatic dispatch. The separate
+// 03C-11R-B worker is default OFF and uses independent release gates.
+// One manual, authenticated, campaign-scoped
 // job only when THREE separate server gates are explicitly configured.
 // Never send SMS, WhatsApp, recovery webhooks, calendar events or payments here.
 // SQL 57 required for claim/ack/retry; all settings disabled by default.
@@ -13539,14 +13541,14 @@ function llCm3C11JContactPayload(job){
   Object.assign(payload,llGhlNameParts(payload.name));
   return payload;
 }
-async function llCm3C11JProcessOne(key,version){
+async function llCm3C11JProcessOne(key,version,authorize=llCm3C11JGhlGate){
   const rows=await llCm3C11JRpc('lltouch_cm_ghl_claim_one',{
     p_campaign_key:key,p_expected_version:version
   });
   const job=Array.isArray(rows)?rows[0]:null;
   if(!job)return {claimed:0,sent:0,failed:0};
   try{
-    if(!llCm3C11JGhlGate(key)||job.campaign_key!==key||job.campaign_version!==version||job.contact_consent!==true)
+    if(!authorize(key)||job.campaign_key!==key||job.campaign_version!==version||job.contact_consent!==true)
       throw new Error('GHL_CAMPAIGN_BLOCKED');
     // Read current authorization one more time before contacting GHL.
     const [s,{data:c,error:e}]=await Promise.all([
@@ -13559,6 +13561,7 @@ async function llCm3C11JProcessOne(key,version){
       throw new Error('GHL_CAMPAIGN_BLOCKED');
     const serviceTag=llCm3C11LTagForCampaign(c);
     if(!serviceTag)throw new Error('GHL_CAMPAIGN_BLOCKED'); // category must be mapped first
+    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
     let contactId=job.ghl_contact_id;
     if(!contactId){
       const upsert=await llGhlRequest('/contacts/upsert','POST',llCm3C11JContactPayload(job));
@@ -13570,10 +13573,13 @@ async function llCm3C11JProcessOne(key,version){
       });
       if(recorded!==true)throw new Error('GHL_DB_ACK_FAILED');
     }
-    // Adding tags can trigger external GHL workflows. Check and disable
-    // contact-created/tag-added automations BEFORE ever enabling dispatch.
+    // Adding tags can trigger external GHL workflows. They must be audited
+    // BEFORE release. Re-check kill-switch between each external side effect.
+    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
     await llGhlAddTag(contactId,'lltouch-cm-lead');
+    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
     await llGhlAddTag(contactId,serviceTag);
+    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
     const finished=await llCm3C11JRpc('lltouch_cm_ghl_finish',{
       p_lead_id:job.lead_id,p_lease_token:job.lease_token
     });
@@ -15045,6 +15051,152 @@ app.get('/lltouch/campaigns/admin/api/leads/offer-bridge-readiness/:key',
     }
   });
 // END 03C-11Q-D-A
+
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11R-B | AUTOMATIC GHL OUTBOX DISPATCH
+// Default OFF. Independent from legacy HydraFacial worker and 10-minute SMS.
+// SQL 78 required. Candidate discovery never returns name/email/phone.
+// Authorized campaign-scoped claim and replay-safe upsert reuse 03C-11J.
+// NO recovery webhook, SMS, booking or Stripe operation in this worker.
+// IMPORTANT: Render instance must stay online for in-process timers to run.
+// ============================================================================
+const LL_CM_RB_STAGES=['pilot','approved'];
+function llCm3C11RbMode(){
+  const value=String(process.env.LLTOUCH_CM_GHL_AUTO_MODE||'').trim();
+  return LL_CM_RB_STAGES.includes(value)?value:null;
+}
+function llCm3C11RbPilotKey(){
+  const key=String(process.env.LLTOUCH_CM_GHL_AUTO_PILOT_CAMPAIGN_KEY||'').trim();
+  return LL_CM_DISPLAY_KEY.test(key)?key:null;
+}
+function llCm3C11RbGlobalGate(){
+  return process.env.LLTOUCH_CM_GHL_AUTO_WORKER_ENABLED==='true' &&
+    process.env.LLTOUCH_CM_GHL_AUTO_RELEASE_APPROVED==='true' &&
+    process.env.LLTOUCH_CM_GHL_AUTO_WORKFLOW_SAFETY_APPROVED==='true' &&
+    process.env.LLTOUCH_CM_GHL_SYNC_ENABLED==='true' &&
+    process.env.LLTOUCH_CM_GHL_RELEASE_APPROVED==='true' &&
+    process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='false' &&
+    !LL_CM_03C11_GHL_HARD_LOCK_OVERRIDE &&
+    process.env.LLTOUCH_CM_GHL_03C11L_PILOT_APPROVED!=='true' &&
+    process.env.LLTOUCH_CM_WEBFLOW_QA_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_03C11G_PRIVATE_QA_ENABLED!=='true' &&
+    !!LL_GHL_TOKEN && !!LL_GHL_LOCATION &&
+    llCm3C11RbMode()!==null &&
+    (llCm3C11RbMode()==='approved'||llCm3C11RbPilotKey()!==null);
+}
+function llCm3C11RbGate(key){
+  if(!llCm3C11RbGlobalGate() || !LL_CM_DISPLAY_KEY.test(key))return false;
+  if(llCm3C11RbMode()==='pilot')return key===llCm3C11RbPilotKey();
+  return llCm3C11RbMode()==='approved';
+}
+// Hard cap: one GHL job per tick in pilot; at most three in approved mode.
+function llCm3C11RbMaxPerTick(){return llCm3C11RbMode()==='pilot'?1:
+    llCm3C11RbMode()==='approved'?3:0;}
+let llCm3C11RbBusy=false;
+const llCm3C11RbStats={runs:0,claimed:0,sent:0,failed:0,lastTickAt:null,lastErrorCode:null};
+async function llCm3C11RbTick(){
+  if(!llCm3C11RbGlobalGate()||llCm3C11RbBusy)return;
+  llCm3C11RbBusy=true;
+  llCm3C11RbStats.runs++;
+  llCm3C11RbStats.lastTickAt=new Date().toISOString();
+  try{
+    const scope=llCm3C11RbMode();
+    const {data,error}=await academySupabase.rpc('lltouch_cm_ghl_auto_candidates',{
+      p_limit:20,p_campaign_key:scope==='pilot'?llCm3C11RbPilotKey():null
+    });
+    if(error)throw new Error('AUTO_CANDIDATE_RPC_UNAVAILABLE');
+    if(!Array.isArray(data))throw new Error('AUTO_INVALID_CANDIDATES');
+    const candidates=data.filter(row=>
+      LL_CM_DISPLAY_KEY.test(String(row?.campaign_key||'')) &&
+      Number.isSafeInteger(row?.campaign_version) && row.campaign_version>=1 &&
+      llCm3C11RbGate(row.campaign_key));
+    if(!candidates.length)return;
+    for(let i=0;i<llCm3C11RbMaxPerTick();i++){
+      if(!llCm3C11RbGlobalGate())break;
+      const row=candidates[i%candidates.length];
+      const result=await llCm3C11JProcessOne(row.campaign_key,row.campaign_version,llCm3C11RbGate);
+      llCm3C11RbStats.claimed+=result.claimed||0;
+      llCm3C11RbStats.sent+=result.sent||0;
+      llCm3C11RbStats.failed+=result.failed||0;
+      if(result.errorCode)llCm3C11RbStats.lastErrorCode=result.errorCode;
+      if(!result.claimed)break;
+    }
+  }catch(_e){
+    llCm3C11RbStats.lastErrorCode='AUTO_WORKER_UNAVAILABLE';
+    console.error('Campaign Studio 03C11R-B worker tick unavailable');
+  }finally{llCm3C11RbBusy=false;}
+}
+// Read-only: no private contact information, no GHL request, no claim/retry.
+app.get('/lltouch/campaigns/admin/api/leads/ghl-auto-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    res.set('Referrer-Policy','no-referrer');
+    res.set('X-Robots-Tag','noindex, nofollow');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))
+      return res.status(422).json({ok:false,readOnly:true,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const [candidateResult,campaignResult,setting,pendingResult]=await Promise.all([
+        academySupabase.rpc('lltouch_cm_ghl_auto_candidates',{
+          p_limit:50,p_campaign_key:key}),
+        academySupabase.from('lltouch_campaigns')
+          .select('campaign_key,version,status,offer_starts_at,offer_ends_at')
+          .eq('campaign_key',key).maybeSingle(),
+        llCm3C11Setting(key),
+        academySupabase.from('lltouch_cm_lead_outbox')
+          .select('lead_id',{head:true,count:'exact'})
+          .eq('campaign_key',key).eq('state','pending')
+      ]);
+      if(candidateResult.error||campaignResult.error||pendingResult.error)
+        throw new Error('GHL_AUTO_PREFLIGHT_DB_UNAVAILABLE');
+      const c=campaignResult.data;
+      if(!c)return res.status(404).json({ok:false,readOnly:true,error:'CAMPAIGN_NOT_FOUND'});
+      const candidates=Array.isArray(candidateResult.data)?candidateResult.data:[];
+      const b={
+        workerEnabled:process.env.LLTOUCH_CM_GHL_AUTO_WORKER_ENABLED==='true',
+        autoReleaseApproved:process.env.LLTOUCH_CM_GHL_AUTO_RELEASE_APPROVED==='true',
+        workflowSafetyApproved:process.env.LLTOUCH_CM_GHL_AUTO_WORKFLOW_SAFETY_APPROVED==='true',
+        syncGate:process.env.LLTOUCH_CM_GHL_SYNC_ENABLED==='true',
+        releaseGate:process.env.LLTOUCH_CM_GHL_RELEASE_APPROVED==='true',
+        emergencyStopOff:process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='false' &&
+          !LL_CM_03C11_GHL_HARD_LOCK_OVERRIDE,
+        manualPilotOff:process.env.LLTOUCH_CM_GHL_03C11L_PILOT_APPROVED!=='true',
+        tokenConfigured:!!LL_GHL_TOKEN,locationConfigured:!!LL_GHL_LOCATION,
+        modeValid:llCm3C11RbMode()!==null,
+        pilotScopeValid:llCm3C11RbMode()!=='pilot'||!!llCm3C11RbPilotKey()
+      };
+      return res.json({ok:true,readOnly:true,stage:'03C-11R-B',
+        campaignKey:key,campaignVersion:c.version,campaignStatus:c.status,
+        campaignScheduleState:llCm3C11ScheduleState(c),
+        currentApproval:setting?.enabled===true&&setting.campaign_version===c.version,
+        candidateDiscoverySchemaReady:true,eligibleJobPresent:candidates.length>0,
+        queuedPendingForCampaign:pendingResult.count||0,
+        autoMode:llCm3C11RbMode()||'disabled',
+        pilotKeyMatches:llCm3C11RbPilotKey()===key,
+        autoDispatchEnabled:llCm3C11RbGate(key),
+        dispatchLimitPerTick:llCm3C11RbMaxPerTick(),intervalSeconds:60,
+        gates:b,blockers:Object.keys(b).filter(name=>!b[name]),
+        localWorkerStats:{...llCm3C11RbStats},
+        legacyHydraWorkerUnchanged:true,noRecoveryWebhook:true,noSms:true,
+        noBooking:true,noCheckout:true,noPayment:true,noPersonalDataReturned:true,
+        note:'Read-only preflight. No contacts, tags, GHL call, SMS or claim occurs here.'});
+    }catch(_e){
+      console.error('Campaign Studio 03C11R-B auto-readiness unavailable');
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11R-B',
+        error:'GHL_AUTO_READINESS_UNAVAILABLE',autoDispatchEnabled:false,
+        noSms:true,noBooking:true,noPayment:true,noPersonalDataReturned:true});
+    }
+  });
+// In-process timer: starts only after a full, explicitly approved release.
+// Requires an always-on Render instance; SQL's atomic claim/lease protects
+// against competing instances but does not guarantee a wall-clock SLA.
+if(llCm3C11RbGlobalGate()){
+  const timer=setInterval(()=>{void llCm3C11RbTick();},60*1000);
+  timer.unref?.();
+  const kickoff=setTimeout(()=>{void llCm3C11RbTick();},15*1000);
+  kickoff.unref?.();
+}
+// END 03C-11R-B. Existing manual dispatch endpoint remains unchanged.
 
 // ==============================
 // SERVER START
