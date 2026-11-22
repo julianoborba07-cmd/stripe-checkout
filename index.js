@@ -15069,6 +15069,12 @@ function llCm3C11RbPilotKey(){
   const key=String(process.env.LLTOUCH_CM_GHL_AUTO_PILOT_CAMPAIGN_KEY||'').trim();
   return LL_CM_DISPLAY_KEY.test(key)?key:null;
 }
+// 03C-11R-C: future multi-campaign approved mode has its own OFF-by-default
+// operational sign-off. The previously validated pilot mode is unaffected.
+function llCm3C11RcContinuousApproved(){
+  return llCm3C11RbMode()!=='approved' ||
+    process.env.LLTOUCH_CM_GHL_03C11RC_CONTINUOUS_APPROVED==='true';
+}
 function llCm3C11RbGlobalGate(){
   return process.env.LLTOUCH_CM_GHL_AUTO_WORKER_ENABLED==='true' &&
     process.env.LLTOUCH_CM_GHL_AUTO_RELEASE_APPROVED==='true' &&
@@ -15082,6 +15088,7 @@ function llCm3C11RbGlobalGate(){
     process.env.LLTOUCH_CM_03C11G_PRIVATE_QA_ENABLED!=='true' &&
     !!LL_GHL_TOKEN && !!LL_GHL_LOCATION &&
     llCm3C11RbMode()!==null &&
+    llCm3C11RcContinuousApproved() &&
     (llCm3C11RbMode()==='approved'||llCm3C11RbPilotKey()!==null);
 }
 function llCm3C11RbGate(key){
@@ -15163,7 +15170,8 @@ app.get('/lltouch/campaigns/admin/api/leads/ghl-auto-readiness/:key',
         manualPilotOff:process.env.LLTOUCH_CM_GHL_03C11L_PILOT_APPROVED!=='true',
         tokenConfigured:!!LL_GHL_TOKEN,locationConfigured:!!LL_GHL_LOCATION,
         modeValid:llCm3C11RbMode()!==null,
-        pilotScopeValid:llCm3C11RbMode()!=='pilot'||!!llCm3C11RbPilotKey()
+        pilotScopeValid:llCm3C11RbMode()!=='pilot'||!!llCm3C11RbPilotKey(),
+        continuousModeApproved:llCm3C11RcContinuousApproved()
       };
       return res.json({ok:true,readOnly:true,stage:'03C-11R-B',
         campaignKey:key,campaignVersion:c.version,campaignStatus:c.status,
@@ -15187,6 +15195,104 @@ app.get('/lltouch/campaigns/admin/api/leads/ghl-auto-readiness/:key',
         noSms:true,noBooking:true,noPayment:true,noPersonalDataReturned:true});
     }
   });
+// ============================================================================
+// LL TOUCH CAMPAIGN STUDIO | 03C-11R-C | DURABLE OUTBOX HEALTH
+// READ ONLY. SQL 80 required. No claim, GHL request, SMS, Stripe or calendar.
+// Snapshot is persistent in Supabase; in-memory tick stats are NOT a ledger.
+// This does not establish Render uptime, GHL-side automation safety, or
+// exactly-once delivery to a nontransactional external API.
+// ============================================================================
+app.get('/lltouch/campaigns/admin/api/leads/ghl-resilience-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    res.set('Referrer-Policy','no-referrer');
+    res.set('X-Robots-Tag','noindex, nofollow');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))
+      return res.status(422).json({ok:false,readOnly:true,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const [healthResult,campaignResult,setting]=await Promise.all([
+        academySupabase.rpc('lltouch_cm_ghl_queue_health',{p_campaign_key:key}),
+        academySupabase.from('lltouch_campaigns')
+          .select('campaign_key,version,status,offer_starts_at,offer_ends_at')
+          .eq('campaign_key',key).maybeSingle(),
+        llCm3C11Setting(key)
+      ]);
+      if(healthResult.error||campaignResult.error||!Array.isArray(healthResult.data)
+         ||healthResult.data.length!==1)
+        throw new Error('GHL_RESILIENCE_READINESS_DB_UNAVAILABLE');
+      const c=campaignResult.data;
+      if(!c)return res.status(404).json({ok:false,readOnly:true,error:'CAMPAIGN_NOT_FOUND'});
+      const h=healthResult.data[0];
+      // Supabase bigint may arrive as string. Reject malformed/non-integer data.
+      const count=(field)=>{
+        const raw=h?.[field];
+        const n=Number(raw);
+        if((typeof raw!=='number'&&typeof raw!=='string')||
+           !Number.isSafeInteger(n)||n<0)throw new Error('GHL_RESILIENCE_INVALID_COUNT');
+        return n;
+      };
+      const queue={
+        pending:count('pending_total'),
+        pendingDueByTime:count('pending_due_by_time'),
+        pendingDelayed:count('pending_delayed'),
+        pendingExhausted:count('pending_exhausted'),
+        sending:count('sending_total'),
+        sendingExpiredReclaimable:count('sending_expired_reclaimable'),
+        sendingUnrecoverable:count('sending_unrecoverable'),
+        sent:count('sent_total'),
+        sentMissingContactId:count('sent_missing_contact_id'),
+        failed:count('failed_total'),
+        disabled:count('disabled_total')
+      };
+      const age=(field)=>{
+        if(h?.[field]==null)return null;
+        const n=Number(h[field]);
+        if(!Number.isSafeInteger(n)||n<0)throw new Error('GHL_RESILIENCE_INVALID_AGE');
+        return n;
+      };
+      const schedule=llCm3C11ScheduleState(c);
+      const alerts=[];
+      if(queue.failed>0)alerts.push('FAILED_JOBS');
+      if(queue.pendingExhausted>0)alerts.push('PENDING_ATTEMPTS_EXHAUSTED');
+      if(queue.sendingUnrecoverable>0)alerts.push('SENDING_LEASE_UNRECOVERABLE');
+      if(queue.sendingExpiredReclaimable>0)alerts.push('SENDING_LEASE_EXPIRED');
+      if(queue.sentMissingContactId>0)alerts.push('SENT_WITHOUT_CONTACT_ID');
+      if(schedule!=='active' && (queue.pending>0||queue.sending>0))
+        alerts.push('BACKLOG_OUTSIDE_ACTIVE_CAMPAIGN_WINDOW');
+      return res.json({ok:true,readOnly:true,stage:'03C-11R-C',
+        campaignKey:key,campaignVersion:c.version,campaignStatus:c.status,
+        campaignScheduleState:schedule,
+        currentCampaignApproval:setting?.enabled===true&&setting.campaign_version===c.version,
+        queueHealthRpcReady:true,queue,
+        agesSeconds:{oldestPending:age('oldest_pending_age_seconds'),
+          oldestDue:age('oldest_due_age_seconds')},
+        lastSentAt:h?.last_sent_at||null,lastActivityAt:h?.last_activity_at||null,
+        attentionRequired:alerts.length>0,alerts,
+        runtime:{scheduler:'in-process-timer',intervalSeconds:60,
+          processStatsVolatile:true,renderPlanVerified:false,
+          durableExternalExactlyOnce:false,
+          crossInstanceClaimUsesSql57:true,
+          maxPerTickIsPerInstance:true},
+        mode:llCm3C11RbMode()||'disabled',
+        continuousReleaseGateApproved:
+          process.env.LLTOUCH_CM_GHL_03C11RC_CONTINUOUS_APPROVED==='true',
+        approvedModeReleaseBlocked:llCm3C11RbMode()==='approved' &&
+          !llCm3C11RcContinuousApproved(),
+        automaticDispatchEnabled:llCm3C11RbGate(key),
+        noContactDataReturned:true,noSms:true,noBooking:true,noCheckout:true,
+        note:'Read-only durable queue snapshot. Does not call GHL or alter queue. GHL workflows and Render uptime must be verified separately.'
+      });
+    }catch(_err){
+      console.error('Campaign Studio 03C11R-C resilience readiness unavailable');
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11R-C',
+        error:'GHL_RESILIENCE_READINESS_UNAVAILABLE',
+        automaticDispatchEnabled:false,noContactDataReturned:true,
+        noSms:true,noBooking:true,noCheckout:true});
+    }
+  });
+// END 03C-11R-C.
+
 // In-process timer: starts only after a full, explicitly approved release.
 // Requires an always-on Render instance; SQL's atomic claim/lease protects
 // against competing instances but does not guarantee a wall-clock SLA.
