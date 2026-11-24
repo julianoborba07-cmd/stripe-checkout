@@ -1,0 +1,18 @@
+{
+  "agency_legal_name": "DEMO AGENCY INC",
+  "agency_address": "123 Example Street, Abington, MA",
+  "agency_email": "example-agency@example.org",
+  "client_legal_name": "Alex Demo",
+  "client_business_name": "Ampla Beleza - DEMONSTRAÇÃO",
+  "client_address": "456 Sample Road, Example City, MA",
+  "client_email": "example-client@example.org",
+  "client_signer": "Alex Demo",
+  "client_title": "Owner",
+  "effective_date": "2026-11-24",
+  "service_location": "Abington, MA",
+  "timezone": "America/New_York",
+  "governing_state": "MA",
+  "venue": "Plymouth, MA",
+  "plan": "performance",
+  "deposit_enabled": true
+}

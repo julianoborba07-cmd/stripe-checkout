@@ -1,0 +1,198 @@
+/**
+ * LL Brows Media Kit contract API / secured Node.js Express router / v2 QA.
+ * Mount ONLY after app.use(express.json(...)) in the shared index.js.
+ * No modification to Stripe webhook, Academy, LL Touch or Campaign Studio routes.
+ */
+import express from 'express';
+import crypto from 'node:crypto';
+import { createClient } from '@supabase/supabase-js';
+import rateLimit from 'express-rate-limit';
+import { createContractPdf, ContractInputError } from './generator.js';
+
+const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ALLOWED_ORIGINS=new Set(['https://www.llbrows.com','https://llbrows.com']);
+const ALLOWED_PLANS=new Set(['full','foundation','growth','performance']);
+const ALLOWED_TZ=new Set(['America/New_York','America/Chicago','America/Denver','America/Los_Angeles','America/Sao_Paulo']);
+const s=(v,max=145)=>typeof v==='string'?v.trim().slice(0,max+1):'';
+
+function checkInput(b) {
+  if (!b || typeof b!=='object' || Array.isArray(b)) throw new ContractInputError('Invalid contract request');
+  if (Object.keys(b).some(k=>/ssn|social.?security|tax.?id|\bein\b/i.test(k))) throw new ContractInputError('Sensitive identifiers are not accepted');
+  if (typeof b.client_id!=='string' || !UUID_RE.test(b.client_id)) throw new ContractInputError('Invalid client id');
+  if (!ALLOWED_PLANS.has(b.plan)) throw new ContractInputError('Invalid service plan');
+  const role=s(b.client_title,70), place=s(b.service_location), date=s(b.effective_date,10), tz=s(b.timezone,45);
+  if (role.length<2||role.length>70||place.length<3||place.length>145) throw new ContractInputError('Invalid signer title or service location');
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||date!==b.effective_date) throw new ContractInputError('Invalid effective date');
+  if (!ALLOWED_TZ.has(tz)) throw new ContractInputError('Invalid service timezone');
+  if (typeof b.deposit_enabled!=='boolean') throw new ContractInputError('Invalid deposit setting');
+  return {clientId:b.client_id, plan:b.plan, role, place, date, tz, depositEnabled:b.deposit_enabled,
+    confirmed:b.confirmed_contracting_party===true,
+    previewFingerprint:s(b.confirmed_preview_fingerprint,64)};
+}
+
+function config() {
+  return {
+    url:s(process.env.SUPABASE_URL,250),
+    serviceKey:s(process.env.SUPABASE_SERVICE_ROLE_KEY,2000),
+    agencyLegal:s(process.env.LLMK_AGENCY_LEGAL_NAME),
+    agencyAddress:s(process.env.LLMK_AGENCY_ADDRESS),
+    agencyEmail:s(process.env.LLMK_AGENCY_EMAIL),
+    governingState:s(process.env.LLMK_GOVERNING_STATE,50),
+    venue:s(process.env.LLMK_VENUE),
+    previewEnabled:process.env.LLMK_PREVIEW_ENABLED==='1',
+    liveEnabled:process.env.LLMK_LIVE_ISSUANCE_ENABLED==='1',
+    signingApproved:process.env.LLMK_SIGNATURE_FLOW_APPROVED==='1',
+    legalApproved:process.env.LLMK_LEGAL_EN_PT_APPROVED==='1',
+    uniquePendingIndexVerified:process.env.LLMK_UNIQUE_PENDING_INDEX_VERIFIED==='1'
+  };
+}
+function validConfig(c) {
+  return c.url.startsWith('https://') && Boolean(c.serviceKey) &&
+    Boolean(c.agencyLegal&&c.agencyAddress&&c.agencyEmail&&c.governingState&&c.venue);
+}
+function clientFor(c) {
+  return createClient(c.url,c.serviceKey,{
+    auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false},
+    global:{headers:{'X-Client-Info':'llmk-node-contracts-qa-v2'}}
+  });
+}
+
+async function requireAdmin(req,res,next) {
+  const c=config();
+  if(!validConfig(c)) return res.status(503).json({error:'LLMK_BACKEND_CONFIGURATION_INCOMPLETE'});
+  const authorization=req.headers.authorization||'';
+  const m=/^Bearer\s+([^\s]+)$/.exec(authorization);
+  if(!m) return res.status(401).json({error:'LLMK_SESSION_REQUIRED'});
+  try{
+    const db=clientFor(c);
+    const {data:userData,error:userErr}=await db.auth.getUser(m[1]);
+    if(userErr||!userData?.user?.id) return res.status(401).json({error:'LLMK_INVALID_SESSION'});
+    const {data:admin,error:adminErr}=await db.from('llmk_admins')
+      .select('user_id').eq('user_id',userData.user.id).maybeSingle();
+    if(adminErr) return res.status(503).json({error:'LLMK_ADMIN_VALIDATION_UNAVAILABLE'});
+    if(!admin) return res.status(403).json({error:'LLMK_ADMIN_REQUIRED'});
+    req.llmk={db,adminId:userData.user.id,config:c};
+    next();
+  }catch(_e){
+    console.error('LLMK admin authentication unavailable');
+    return res.status(503).json({error:'LLMK_AUTH_UNAVAILABLE'});
+  }
+}
+
+async function gatherContract(req,params){
+  const {db,config:c}=req.llmk;
+  const {data:row,error}=await db.from('llmk_clients')
+    .select('id,company_name,contact_full_name,business_address,contact_email,preferred_contract_language')
+    .eq('id',params.clientId).maybeSingle();
+  if(error) throw Object.assign(new Error('LLMK_CLIENT_READ_UNAVAILABLE'),{http:503});
+  if(!row) throw Object.assign(new Error('LLMK_CLIENT_NOT_FOUND'),{http:404});
+  const language=s(row.preferred_contract_language||'en',5).toLowerCase();
+  if(!['en','pt','es'].includes(language)) throw Object.assign(new Error('LLMK_CLIENT_LOCALE_INVALID'),{http:409});
+  // The client identity and locale ALWAYS come from Supabase, never browser payload.
+  const data={
+    agency_legal_name:c.agencyLegal, agency_address:c.agencyAddress, agency_email:c.agencyEmail,
+    client_legal_name:s(row.contact_full_name), client_business_name:s(row.company_name),
+    client_address:s(row.business_address), client_email:s(row.contact_email,100),
+    client_signer:s(row.contact_full_name),client_title:params.role,
+    effective_date:params.date,service_location:params.place,timezone:params.tz,
+    governing_state:c.governingState, venue:c.venue,plan:params.plan,deposit_enabled:params.depositEnabled
+  };
+  return {language,data};
+}
+
+function respondError(res,error){
+  if(error instanceof ContractInputError) return res.status(422).json({error:'LLMK_INVALID_CONTRACT_DATA',detail:error.message});
+  const code=error?.http||503;
+  const message=/^LLMK_[A-Z_]+$/.test(error?.message||'')?error.message:'LLMK_CONTRACT_SERVICE_UNAVAILABLE';
+  console.error('LLMK contract request failed:',message);
+  return res.status(code).json({error:message});
+}
+
+export function createLLMKContractsRouter(){
+  const router=express.Router();
+  router.use((req,res,next)=>{
+    res.set('Cache-Control','no-store, private');
+    res.set('X-Content-Type-Options','nosniff');
+    const origin=req.get('origin');
+    if(origin && !ALLOWED_ORIGINS.has(origin)) return res.status(403).json({error:'LLMK_ORIGIN_NOT_ALLOWED'});
+    next();
+  });
+  router.use(rateLimit({windowMs:15*60*1000,max:20,standardHeaders:true,legacyHeaders:false,
+    message:{error:'LLMK_RATE_LIMIT_EXCEEDED'}}));
+  router.use(requireAdmin);
+
+  router.get('/readiness', (_req,res)=>{
+    const c=config();
+    return res.json({ok:true,stage:'llmk-contracts-node-v2',
+      previewEnabled:c.previewEnabled,
+      issueEnabled:c.liveEnabled&&c.signingApproved&&c.legalApproved&&c.uniquePendingIndexVerified,
+      spanishLegalApproved:false,
+      noPayments:true,noBooking:true,noSms:true,studentPortalUnchanged:true,
+      note:'Read-only readiness. Does not render or issue a contract.'});
+  });
+
+  router.post('/preview',async(req,res)=>{
+    const c=req.llmk.config;
+    if(!c.previewEnabled) return res.status(409).json({error:'LLMK_PREVIEW_DISABLED'});
+    try{
+      const p=checkInput(req.body);
+      const {language,data}=await gatherContract(req,p);
+      const pdf=await createContractPdf(data,language,{preview:true});
+      return res.status(200)
+        .set('Content-Type','application/pdf')
+        .set('Content-Disposition','inline; filename="LLMK_QA_preview.pdf"')
+        .set('Access-Control-Expose-Headers','X-Document-SHA256,X-Contract-Language,X-Contract-Fingerprint')
+        .set('X-Document-SHA256',pdf.sha256)
+        .set('X-Contract-Language',pdf.language.toUpperCase())
+        .set('X-Contract-Fingerprint',pdf.fingerprint)
+        .send(pdf.bytes);
+    }catch(e){return respondError(res,e)}
+  });
+
+  router.post('/issue',async(req,res)=>{
+    const c=req.llmk.config;
+    // Multiple independent fail-closed gates, none activated in this QA package.
+    if(!(c.liveEnabled && c.signingApproved && c.legalApproved && c.uniquePendingIndexVerified))
+      return res.status(409).json({error:'LLMK_LIVE_ISSUANCE_DISABLED'});
+    try{
+      const p=checkInput(req.body);
+      if(!p.confirmed) return res.status(422).json({error:'LLMK_ADMIN_CONFIRMATION_REQUIRED'});
+      if(!/^[a-f0-9]{64}$/.test(p.previewFingerprint))
+        return res.status(422).json({error:'LLMK_PREVIEW_FINGERPRINT_REQUIRED'});
+      const {language,data}=await gatherContract(req,p);
+      if(language==='es')return res.status(409).json({error:'LLMK_ES_LEGAL_REVIEW_REQUIRED'});
+      // Preview must match the newly loaded client data and selected terms.
+      // Fingerprint is input/template based, so the QA watermark does not alter it.
+      const pdf=await createContractPdf(data,language,{preview:false});
+      if(pdf.fingerprint!==p.previewFingerprint)
+        return res.status(409).json({error:'LLMK_PREVIEW_STALE_REGENERATE'});
+      const db=req.llmk.db;
+      const {data:existing,error:existingErr}=await db.from('llmk_contracts')
+        .select('id').eq('client_id',p.clientId).eq('status','sent').limit(1);
+      if(existingErr)throw Object.assign(new Error('LLMK_PENDING_CHECK_UNAVAILABLE'),{http:503});
+      if(existing?.length) return res.status(409).json({error:'LLMK_PENDING_CONTRACT_EXISTS'});
+      // Production requires the verified partial UNIQUE index in sql/02_pre_live_hardening.sql.
+      // It closes concurrent duplicate issuance across workers/instances.
+      const path=`${p.clientId}/${crypto.randomUUID()}.pdf`;
+      const {error:storageErr}=await db.storage.from('llmk-contracts')
+        .upload(path,pdf.bytes,{upsert:false,contentType:'application/pdf',cacheControl:'0'});
+      if(storageErr)throw Object.assign(new Error('LLMK_STORAGE_UNAVAILABLE'),{http:503});
+      const row={client_id:p.clientId,contract_version:pdf.templateVersion,
+        contract_language:language,storage_path:path,document_sha256:pdf.sha256,
+        status:'sent',assigned_by:req.llmk.adminId,
+        generation_source:'automated_v2_node',
+        contract_snapshot:{...pdf.snapshot,preview_fingerprint:pdf.fingerprint}};
+      const {data:inserted,error:insertErr}=await db.from('llmk_contracts')
+        .insert(row).select('id').single();
+      if(insertErr){
+        // If the registry insert fails, remove the orphaned PDF.
+        const {error:removeErr}=await db.storage.from('llmk-contracts').remove([path]);
+        if(removeErr) console.error('LLMK orphaned-PDF cleanup requires administrator inspection');
+        if(insertErr.code==='23505') return res.status(409).json({error:'LLMK_PENDING_CONTRACT_EXISTS'});
+        throw Object.assign(new Error('LLMK_CONTRACT_REGISTER_UNAVAILABLE'),{http:503});
+      }
+      return res.status(201).json({id:inserted.id,language,sha256:pdf.sha256,status:'sent'});
+    }catch(e){return respondError(res,e)}
+  });
+  return router;
+}

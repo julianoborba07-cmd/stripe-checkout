@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
+import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
 
 dotenv.config();
 
@@ -15303,6 +15304,10 @@ if(llCm3C11RbGlobalGate()){
   kickoff.unref?.();
 }
 // END 03C-11R-B. Existing manual dispatch endpoint remains unchanged.
+
+// LLMK AUTOMATED CONTRACTS / QA v2 - isolated routes; no Stripe/Vagaro changes.
+// Preview only until independent security, signature and legal sign-off.
+app.use('/llmk/contracts', createLLMKContractsRouter());
 
 // ==============================
 // SERVER START
