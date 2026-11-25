@@ -12,6 +12,7 @@ import { registerSigningV2QaRoutes } from './signing-v2-qa.js';
 import { registerSigningV2QaViewRoute } from './signing-v2-qa-view.js';
 import { registerSigningV2QaOperatorRoutes } from './signing-v2-qa-operators.js';
 import { registerSigningV2QaReviewRoutes } from './signing-v2-qa-review.js';
+import { registerSigningV2QaCompletionRoutes } from './signing-v2-qa-completion.js';
 
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_ORIGINS=new Set(['https://www.llbrows.com','https://llbrows.com']);
@@ -177,6 +178,9 @@ export function createLLMKContractsRouter(){
 
   // Phase C2: QA test-operator assignment, never legal signer binding or consent.
   registerSigningV2QaOperatorRoutes(router);
+
+  // C4: admin-only read-only QA evidence export.
+  registerSigningV2QaCompletionRoutes(router);
 
   router.post('/preview',async(req,res)=>{
     const c=req.llmk.config;
