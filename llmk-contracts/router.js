@@ -12,7 +12,8 @@ import { registerSigningV2QaViewRoute } from './signing-v2-qa-view.js';
 import { registerSigningV2QaOperatorRoutes } from './signing-v2-qa-operators.js';
 import { registerSigningV2QaReviewRoutes } from './signing-v2-qa-review.js';
 import { registerSigningV2QaCompletionRoutes } from './signing-v2-qa-completion.js';
-import { registerSigningV2LiveStagedRoutes } from './signing-v2-live-staged.js';
+import { liveGate, registerSigningV2LiveStagedRoutes } from './signing-v2-live-staged.js';
+import { registerArchiveDownload } from './signing-v2-archive-download.mjs';
 import { registerSigningV2PortalStatus } from './signing-v2-portal-status.js';
 import { registerSigningV2LiveArchiveStagedRoutes } from './signing-v2-live-archive-staged.js';
 
@@ -134,7 +135,9 @@ export function createLLMKContractsRouter(){
   // D1C: staged production routes remain hard-disabled.
   registerSigningV2LiveStagedRoutes(router,{clientFor});
   // D3B/C: authenticated, tenant-scoped, read-only portal status.
-  registerSigningV2PortalStatus(router,{clientFor,config,validConfig});
+  registerSigningV2PortalStatus(router,{clientFor,config,validConfig,isReleased:()=>liveGate(process.env)});
+  // Completed contracts remain downloadable even when issuance/signing is paused.
+  registerArchiveDownload(router,{getDb:()=>{const c=config();if(!validConfig(c))throw Error('LLMK_BACKEND_CONFIGURATION_INCOMPLETE');return clientFor(c);}});
   router.use(requireAdmin);
 
   router.get('/readiness', (_req,res)=>{

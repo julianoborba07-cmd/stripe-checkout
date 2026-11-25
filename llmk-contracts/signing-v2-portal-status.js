@@ -3,7 +3,7 @@ const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]
 const fail=(http,code)=>Object.assign(new Error(code),{http});
 const active=(x,field='verified_at',now=Date.now())=>Boolean(x&&x.revoked_at===null&&Number.isFinite(Date.parse(x[field]))&&Date.parse(x[field])<=now);
 async function query(q){const {data,error}=await q;if(error)throw fail(503,'LLMK_PORTAL_STATUS_UNAVAILABLE');return data;}
-export async function portalStatus(db,userId,requestedId,now=Date.now()){
+export async function portalStatus(db,userId,requestedId,now=Date.now(),released=false){
  if(!UUID.test(userId||''))throw fail(401,'LLMK_INVALID_SESSION');
  const admin=Boolean(await query(db.from('llmk_admins').select('user_id').eq('user_id',userId).maybeSingle()));
  // Never trust the browser role or selected tenant. Non-admins cannot request another ID.
@@ -19,13 +19,15 @@ export async function portalStatus(db,userId,requestedId,now=Date.now()){
   const envelope=await query(db.from('llmk_signing_envelopes_v2').select('id,status,required_party_count').eq('contract_id',c.id).eq('environment','production').maybeSingle());
   if(!envelope||!['live_sent','live_in_progress','live_all_signed','live_complete'].includes(envelope.status))continue;
   const parties=await query(db.from('llmk_signing_parties_v2').select('signer_slot,signer_user_id,status,signed_at').eq('envelope_id',envelope.id).order('signer_slot'));
-  if(!Array.isArray(parties)||parties.length!==3||new Set(parties.map(x=>x.signer_slot)).size!==3||!parties.every(x=>[1,2,3].includes(x.signer_slot)))throw fail(503,'LLMK_PORTAL_STATUS_UNAVAILABLE');
+  if(!Array.isArray(parties)||parties.length!==3||new Set(parties.map(x=>x.signer_slot)).size!==3||!parties.every(x=>[1,2,3].includes(x.signer_slot)&&UUID.test(x.signer_user_id||''))||new Set(parties.map(x=>x.signer_user_id)).size!==3)throw fail(503,'LLMK_PORTAL_STATUS_UNAVAILABLE');
   // An owner must also be the actual bound client signer to see this production record.
   if(!admin&&!parties.some(p=>p.signer_slot===1&&p.signer_user_id===userId))continue;
   const archived=envelope.status==='live_complete'&&Boolean(await query(db.from('llmk_live_archives_v2').select('envelope_id').eq('envelope_id',envelope.id).eq('contract_id',c.id).maybeSingle()));
-  records.push({version:c.contract_version,language:c.contract_language,status:envelope.status,archiveRegistered:archived,parties:parties.map(p=>({slot:p.signer_slot,signed:p.status==='signed'&&Boolean(p.signed_at),isYourSlot:p.signer_user_id===userId}))});
+  const own=parties.find(p=>p.signer_user_id===userId);
+  if(!UUID.test(envelope.id||''))throw fail(503,'LLMK_PORTAL_STATUS_UNAVAILABLE');
+  records.push({envelopeId:envelope.id,canDownload:archived&&Boolean(own),canSign:released===true&&Boolean(own&&own.status==='pending')&&['live_sent','live_in_progress'].includes(envelope.status),canFinalize:released===true&&admin&&envelope.status==='live_all_signed',version:c.contract_version,language:c.contract_language,status:envelope.status,archiveRegistered:archived,parties:parties.map(p=>({slot:p.signer_slot,signed:p.status==='signed'&&Boolean(p.signed_at),isYourSlot:p.signer_user_id===userId}))});
  }
- const output={ok:true,readOnly:true,productionReleased:false,language,records};
+ const output={ok:true,readOnly:true,productionReleased:released===true,language,records};
  if(!admin)return output;
  const [identity,excluded,agency,templates,consents]=await Promise.all([
   query(db.from('llmk_live_client_identity_v2').select('signer_user_id,verified_at,revoked_at').eq('client_id',client.id).maybeSingle()),
@@ -39,14 +41,14 @@ export async function portalStatus(db,userId,requestedId,now=Date.now()){
  output.preflight={excludedFromLive:Boolean(excluded),clientIdentityRegistered:active(identity,'verified_at',now)&&identity.signer_user_id===client.owner_id,agencySlot2Registered:active(a2,'verified_at',now),agencySlot3Registered:active(a3,'verified_at',now),distinctAccounts:Boolean(identity&&a2&&a3&&new Set([identity.signer_user_id,a2.signer_user_id,a3.signer_user_id]).size===3),templateApprovalRecorded:approved.length>0,matchingConsentApprovalRecorded:approved.some(t=>(consents||[]).some(c=>active(c,'approved_at',now)&&c.contract_version===t.contract_version&&c.template_sha256===t.template_sha256)),spanishBlocked:language==='es'};
  return output;
 }
-export function registerSigningV2PortalStatus(router,{clientFor,config,validConfig}){
+export function registerSigningV2PortalStatus(router,{clientFor,config,validConfig,isReleased=()=>false}){
  router.get('/signing-v2/portal-status',async(req,res)=>{
   try{
    const c=config();if(!validConfig(c))throw fail(503,'LLMK_PORTAL_STATUS_UNAVAILABLE');
    const token=/^Bearer\s+([^\s]+)$/.exec(req.headers.authorization||'')?.[1];if(!token)throw fail(401,'LLMK_SESSION_REQUIRED');
    const db=clientFor(c);const {data,error}=await db.auth.getUser(token);
    if(error||!data?.user?.id)throw fail(401,'LLMK_INVALID_SESSION');
-   return res.json(await portalStatus(db,data.user.id,req.query.client_id));
+   return res.json(await portalStatus(db,data.user.id,req.query.client_id,Date.now(),isReleased()===true));
   }catch(e){const http=[401,404,422,503].includes(e?.http)?e.http:503;return res.status(http).json({error:http===503?'LLMK_PORTAL_STATUS_UNAVAILABLE':e.message});}
  });
 }
