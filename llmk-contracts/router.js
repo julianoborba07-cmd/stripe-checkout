@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import rateLimit from 'express-rate-limit';
 import { createContractPdf, ContractInputError } from './generator.js';
+import { registerSigningV2QaRoutes } from './signing-v2-qa.js';
 
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_ORIGINS=new Set(['https://www.llbrows.com','https://llbrows.com']);
@@ -162,6 +163,9 @@ export function createLLMKContractsRouter(){
       readOnly:true
     });
   });
+
+  // QA-only, admin-protected; disabled by default and restricted to one test company.
+  registerSigningV2QaRoutes(router,{checkInput,gatherContract,createContractPdf,respondError});
 
   router.post('/preview',async(req,res)=>{
     const c=req.llmk.config;
