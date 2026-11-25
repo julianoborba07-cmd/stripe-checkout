@@ -4,7 +4,6 @@
  * No modification to Stripe webhook, Academy, LL Touch or Campaign Studio routes.
  */
 import express from 'express';
-import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import rateLimit from 'express-rate-limit';
 import { createContractPdf, ContractInputError } from './generator.js';
@@ -135,7 +134,7 @@ export function createLLMKContractsRouter(){
     const c=config();
     return res.json({ok:true,stage:'llmk-contracts-node-v2',
       previewEnabled:c.previewEnabled,
-      issueEnabled:c.liveEnabled&&c.signingApproved&&c.legalApproved&&c.uniquePendingIndexVerified,
+      issueEnabled:false,legacyIssueRetired:true,
       spanishLegalApproved:false,
       noPayments:true,noBooking:true,noSms:true,studentPortalUnchanged:true,
       note:'Read-only readiness. Does not render or issue a contract.'});
@@ -200,50 +199,10 @@ export function createLLMKContractsRouter(){
     }catch(e){return respondError(res,e)}
   });
 
-  router.post('/issue',async(req,res)=>{
-    const c=req.llmk.config;
-    // Multiple independent fail-closed gates, none activated in this QA package.
-    if(!(c.liveEnabled && c.signingApproved && c.legalApproved && c.uniquePendingIndexVerified))
-      return res.status(409).json({error:'LLMK_LIVE_ISSUANCE_DISABLED'});
-    try{
-      const p=checkInput(req.body);
-      if(!p.confirmed) return res.status(422).json({error:'LLMK_ADMIN_CONFIRMATION_REQUIRED'});
-      if(!/^[a-f0-9]{64}$/.test(p.previewFingerprint))
-        return res.status(422).json({error:'LLMK_PREVIEW_FINGERPRINT_REQUIRED'});
-      const {language,data}=await gatherContract(req,p);
-      if(language==='es')return res.status(409).json({error:'LLMK_ES_LEGAL_REVIEW_REQUIRED'});
-      // Preview must match the newly loaded client data and selected terms.
-      // Fingerprint is input/template based, so the QA watermark does not alter it.
-      const pdf=await createContractPdf(data,language,{preview:false});
-      if(pdf.fingerprint!==p.previewFingerprint)
-        return res.status(409).json({error:'LLMK_PREVIEW_STALE_REGENERATE'});
-      const db=req.llmk.db;
-      const {data:existing,error:existingErr}=await db.from('llmk_contracts')
-        .select('id').eq('client_id',p.clientId).eq('status','sent').limit(1);
-      if(existingErr)throw Object.assign(new Error('LLMK_PENDING_CHECK_UNAVAILABLE'),{http:503});
-      if(existing?.length) return res.status(409).json({error:'LLMK_PENDING_CONTRACT_EXISTS'});
-      // Production requires the verified partial UNIQUE index in sql/02_pre_live_hardening.sql.
-      // It closes concurrent duplicate issuance across workers/instances.
-      const path=`${p.clientId}/${crypto.randomUUID()}.pdf`;
-      const {error:storageErr}=await db.storage.from('llmk-contracts')
-        .upload(path,pdf.bytes,{upsert:false,contentType:'application/pdf',cacheControl:'0'});
-      if(storageErr)throw Object.assign(new Error('LLMK_STORAGE_UNAVAILABLE'),{http:503});
-      const row={client_id:p.clientId,contract_version:pdf.templateVersion,
-        contract_language:language,storage_path:path,document_sha256:pdf.sha256,
-        status:'sent',assigned_by:req.llmk.adminId,
-        generation_source:'automated_v2_node',
-        contract_snapshot:{...pdf.snapshot,preview_fingerprint:pdf.fingerprint}};
-      const {data:inserted,error:insertErr}=await db.from('llmk_contracts')
-        .insert(row).select('id').single();
-      if(insertErr){
-        // If the registry insert fails, remove the orphaned PDF.
-        const {error:removeErr}=await db.storage.from('llmk-contracts').remove([path]);
-        if(removeErr) console.error('LLMK orphaned-PDF cleanup requires administrator inspection');
-        if(insertErr.code==='23505') return res.status(409).json({error:'LLMK_PENDING_CONTRACT_EXISTS'});
-        throw Object.assign(new Error('LLMK_CONTRACT_REGISTER_UNAVAILABLE'),{http:503});
-      }
-      return res.status(201).json({id:inserted.id,language,sha256:pdf.sha256,status:'sent'});
-    }catch(e){return respondError(res,e)}
+  // D1A: legacy issuance never creates a multi-party envelope.
+  // Retire it until the new production-only issuance route is implemented.
+  router.post('/issue',(_req,res)=>{
+    return res.status(409).json({error:'LLMK_LIVE_ISSUANCE_DISABLED'});
   });
   return router;
 }
