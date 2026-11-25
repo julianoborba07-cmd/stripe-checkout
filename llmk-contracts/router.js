@@ -10,6 +10,7 @@ import rateLimit from 'express-rate-limit';
 import { createContractPdf, ContractInputError } from './generator.js';
 import { registerSigningV2QaRoutes } from './signing-v2-qa.js';
 import { registerSigningV2QaViewRoute } from './signing-v2-qa-view.js';
+import { registerSigningV2QaOperatorRoutes } from './signing-v2-qa-operators.js';
 
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_ORIGINS=new Set(['https://www.llbrows.com','https://llbrows.com']);
@@ -170,6 +171,9 @@ export function createLLMKContractsRouter(){
 
   // QA-only, admin-protected; disabled by default and restricted to one test company.
   registerSigningV2QaRoutes(router,{checkInput,gatherContract,createContractPdf,respondError});
+
+  // Phase C2: QA test-operator assignment, never legal signer binding or consent.
+  registerSigningV2QaOperatorRoutes(router);
 
   router.post('/preview',async(req,res)=>{
     const c=req.llmk.config;
