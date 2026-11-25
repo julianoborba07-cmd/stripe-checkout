@@ -131,6 +131,38 @@ export function createLLMKContractsRouter(){
       note:'Read-only readiness. Does not render or issue a contract.'});
   });
 
+  // SIGNATURE V2 / QA: admin-only read-only schema connectivity check.
+  // Inherits no-store, origin filter, rate limit and requireAdmin above.
+  // Does not create contracts, signatures, envelopes or events.
+  router.get('/signing-v2/qa-readiness',async(req,res)=>{
+    const {db,config:c}=req.llmk;
+    if(c.liveEnabled || c.signingApproved) {
+      return res.status(409).json({error:'LLMK_SIGNING_V2_QA_GUARD_NOT_CLOSED'});
+    }
+    const tables=[
+      'llmk_signing_envelopes_v2',
+      'llmk_signing_parties_v2',
+      'llmk_signing_events_v2'
+    ];
+    const checked=[];
+    for(const table of tables){
+      const {error}=await db.from(table).select('id',{head:true,count:'exact'});
+      if(error){
+        console.error('LLMK_SIGNING_V2_QA_TABLE_UNAVAILABLE',table,error.code);
+        return res.status(503).json({error:'LLMK_SIGNING_V2_QA_TABLE_UNAVAILABLE'});
+      }
+      checked.push(table);
+    }
+    return res.status(200).json({
+      ok:true,
+      stage:'llmk-signing-v2-qa-schema',
+      tablesAccessible:checked,
+      signingEnabled:false,
+      liveIssuanceEnabled:false,
+      readOnly:true
+    });
+  });
+
   router.post('/preview',async(req,res)=>{
     const c=req.llmk.config;
     if(!c.previewEnabled) return res.status(409).json({error:'LLMK_PREVIEW_DISABLED'});
