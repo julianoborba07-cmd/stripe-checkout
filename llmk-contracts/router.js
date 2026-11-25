@@ -9,6 +9,7 @@ import { createClient } from '@supabase/supabase-js';
 import rateLimit from 'express-rate-limit';
 import { createContractPdf, ContractInputError } from './generator.js';
 import { registerSigningV2QaRoutes } from './signing-v2-qa.js';
+import { registerSigningV2QaViewRoute } from './signing-v2-qa-view.js';
 
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_ORIGINS=new Set(['https://www.llbrows.com','https://llbrows.com']);
@@ -120,6 +121,9 @@ export function createLLMKContractsRouter(){
   });
   router.use(rateLimit({windowMs:15*60*1000,max:20,standardHeaders:true,legacyHeaders:false,
     message:{error:'LLMK_RATE_LIMIT_EXCEEDED'}}));
+  // Phase C: scoped QA PDF viewing by the authenticated test-company owner
+  // or Media Kit admin. No signatures or user-identity bindings.
+  registerSigningV2QaViewRoute(router,{clientFor});
   router.use(requireAdmin);
 
   router.get('/readiness', (_req,res)=>{
