@@ -12,6 +12,7 @@ import { registerSigningV2QaViewRoute } from './signing-v2-qa-view.js';
 import { registerSigningV2QaOperatorRoutes } from './signing-v2-qa-operators.js';
 import { registerSigningV2QaReviewRoutes } from './signing-v2-qa-review.js';
 import { registerSigningV2QaCompletionRoutes } from './signing-v2-qa-completion.js';
+import { registerSigningV2LiveStagedRoutes } from './signing-v2-live-staged.js';
 
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_ORIGINS=new Set(['https://www.llbrows.com','https://llbrows.com']);
@@ -128,6 +129,8 @@ export function createLLMKContractsRouter(){
   registerSigningV2QaViewRoute(router,{clientFor});
   // C3: QA-only PDF presentation and simulated acknowledgement. No legal signature.
   registerSigningV2QaReviewRoutes(router,{clientFor});
+  // D1C: staged production routes remain hard-disabled.
+  registerSigningV2LiveStagedRoutes(router,{clientFor});
   router.use(requireAdmin);
 
   router.get('/readiness', (_req,res)=>{
