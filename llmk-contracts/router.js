@@ -13,6 +13,7 @@ import { registerSigningV2QaOperatorRoutes } from './signing-v2-qa-operators.js'
 import { registerSigningV2QaReviewRoutes } from './signing-v2-qa-review.js';
 import { registerSigningV2QaCompletionRoutes } from './signing-v2-qa-completion.js';
 import { registerSigningV2LiveStagedRoutes } from './signing-v2-live-staged.js';
+import { registerSigningV2PortalStatus } from './signing-v2-portal-status.js';
 import { registerSigningV2LiveArchiveStagedRoutes } from './signing-v2-live-archive-staged.js';
 
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -132,6 +133,8 @@ export function createLLMKContractsRouter(){
   registerSigningV2QaReviewRoutes(router,{clientFor});
   // D1C: staged production routes remain hard-disabled.
   registerSigningV2LiveStagedRoutes(router,{clientFor});
+  // D3B/C: authenticated, tenant-scoped, read-only portal status.
+  registerSigningV2PortalStatus(router,{clientFor,config,validConfig});
   router.use(requireAdmin);
 
   router.get('/readiness', (_req,res)=>{
