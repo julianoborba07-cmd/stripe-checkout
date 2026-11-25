@@ -32,8 +32,8 @@ function checkInput(b) {
 
 function config() {
   return {
-    url:s(process.env.SUPABASE_URL,250),
-    serviceKey:s(process.env.SUPABASE_SERVICE_ROLE_KEY,2000),
+    url:s(process.env.LLMK_SUPABASE_URL,250),
+    serviceKey:s(process.env.LLMK_SUPABASE_SERVICE_ROLE_KEY,2000),
     agencyLegal:s(process.env.LLMK_AGENCY_LEGAL_NAME),
     agencyAddress:s(process.env.LLMK_AGENCY_ADDRESS),
     agencyEmail:s(process.env.LLMK_AGENCY_EMAIL),
