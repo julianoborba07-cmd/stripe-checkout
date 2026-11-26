@@ -61,6 +61,26 @@ function formatDateOnly(value) {
 const app = express();
 app.set("trust proxy", 1);
 
+// LLTOUCH_CM_QA_HTTP_GUARD_V1: temporary QA-only isolation, remove prior to production merge.
+// Fail closed if the QA-only startup flag is not explicitly present.
+if (process.env.LLTOUCH_CM_QA_ISOLATED !== 'true') {
+  throw new Error('CAMPAIGN_STUDIO_QA_ISOLATION_REQUIRED');
+}
+// All other HTTP routes in the shared app are inaccessible on this QA branch.
+// The GHL readiness endpoint retains its existing Basic Auth middleware.
+const LL_CM_QA_EFFECT_READINESS_PATH =
+  /^\/lltouch\/campaigns\/admin\/api\/leads\/ghl-effect-readiness\/[a-z0-9][a-z0-9-]{3,95}$/;
+app.use((req, res, next) => {
+  if (req.method === 'GET' &&
+      (req.path === '/health' || LL_CM_QA_EFFECT_READINESS_PATH.test(req.path))) {
+    return next();
+  }
+  res.set('Cache-Control', 'no-store');
+  res.set('X-Robots-Tag', 'noindex, nofollow');
+  return res.status(404).json({ok: false, error: 'QA_ROUTE_DISABLED'});
+});
+// END LLTOUCH_CM_QA_HTTP_GUARD_V1.
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ==============================
