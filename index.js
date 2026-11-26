@@ -13497,6 +13497,7 @@ function llCm3C11JGhlGate(key){
   return process.env.LLTOUCH_CM_GHL_SYNC_ENABLED === 'true' &&
     process.env.LLTOUCH_CM_GHL_RELEASE_APPROVED === 'true' &&
     process.env.LLTOUCH_CM_GHL_03C11L_PILOT_APPROVED === 'true' &&
+    process.env.LLTOUCH_CM_GHL_03C11RE_EFFECTS_APPROVED === 'true' &&
     process.env.LLTOUCH_CM_GHL_TEST_CAMPAIGN_KEY === key &&
     !LL_CM_03C11_GHL_HARD_LOCK_OVERRIDE &&
     !!LL_GHL_TOKEN && !!LL_GHL_LOCATION &&
@@ -13542,6 +13543,16 @@ function llCm3C11JContactPayload(job){
   Object.assign(payload,llGhlNameParts(payload.name));
   return payload;
 }
+// 03C-11R-E: durable write-ahead checkpoints for all external GHL effects.
+// Any uncertain outcome is QUARANTINED for manual inspection by SQL 83.
+// Never automatically replay an external step for which its outcome is unknown.
+async function llCm3C11JEffectCheckpoint(job,expected,next){
+  const updated=await llCm3C11JRpc('lltouch_cm_ghl_effect_checkpoint',{
+    p_lead_id:job.lead_id,p_lease_token:job.lease_token,
+    p_expected_step:expected,p_next_step:next
+  });
+  if(updated!==true)throw new Error('GHL_DB_ACK_FAILED');
+}
 async function llCm3C11JProcessOne(key,version,authorize=llCm3C11JGhlGate){
   const rows=await llCm3C11JRpc('lltouch_cm_ghl_claim_one',{
     p_campaign_key:key,p_expected_version:version
@@ -13551,36 +13562,63 @@ async function llCm3C11JProcessOne(key,version,authorize=llCm3C11JGhlGate){
   try{
     if(!authorize(key)||job.campaign_key!==key||job.campaign_version!==version||job.contact_consent!==true)
       throw new Error('GHL_CAMPAIGN_BLOCKED');
-    // Read current authorization one more time before contacting GHL.
-    const [s,{data:c,error:e}]=await Promise.all([
+    const [s,{data:c,error:e},{data:checkpoint,error:checkpointError}]=await Promise.all([
       llCm3C11Setting(key),
-      academySupabase.from('lltouch_campaigns').select('version,status,offer_ends_at,service_title,marketing')
-        .eq('campaign_key',key).maybeSingle()
+      academySupabase.from('lltouch_campaigns')
+        .select('version,status,offer_ends_at,service_title,marketing')
+        .eq('campaign_key',key).maybeSingle(),
+      academySupabase.from('lltouch_cm_lead_outbox')
+        .select('external_step,reconciliation_required')
+        .eq('lead_id',job.lead_id).eq('lease_token',job.lease_token)
+        .eq('state','sending').maybeSingle()
     ]);
     if(e||!c||c.status!=='published'||c.version!==version||
        Date.now()>=Date.parse(c.offer_ends_at)||s?.enabled!==true||s.campaign_version!==version)
       throw new Error('GHL_CAMPAIGN_BLOCKED');
+    if(checkpointError||!checkpoint||checkpoint.reconciliation_required!==false)
+      throw new Error('GHL_DB_ACK_FAILED');
     const serviceTag=llCm3C11LTagForCampaign(c);
-    if(!serviceTag)throw new Error('GHL_CAMPAIGN_BLOCKED'); // category must be mapped first
-    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
+    if(!serviceTag)throw new Error('GHL_CAMPAIGN_BLOCKED');
+    let step=checkpoint.external_step;
     let contactId=job.ghl_contact_id;
-    if(!contactId){
+    if(!['none','upsert_recorded','lead_tag_recorded','service_tag_recorded'].includes(step)||
+       (step==='none'&&contactId)||
+       (step!=='none'&&!contactId))
+      throw new Error('GHL_DB_ACK_FAILED');
+    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
+    if(step==='none'){
+      // Commit this write-ahead state BEFORE making a nontransactional GHL call.
+      await llCm3C11JEffectCheckpoint(job,'none','upsert_started');
+      if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
       const upsert=await llGhlRequest('/contacts/upsert','POST',llCm3C11JContactPayload(job));
       contactId=upsert?.contact?.id;
       if(typeof contactId!=='string'||!/^[A-Za-z0-9_-]{6,120}$/.test(contactId))
         throw new Error('GHL_INVALID_RESPONSE');
+      // SQL atomically stores both the contactId and upsert_recorded checkpoint.
       const recorded=await llCm3C11JRpc('lltouch_cm_ghl_record_contact',{
         p_lead_id:job.lead_id,p_lease_token:job.lease_token,p_ghl_contact_id:contactId
       });
       if(recorded!==true)throw new Error('GHL_DB_ACK_FAILED');
+      step='upsert_recorded';
     }
-    // Adding tags can trigger external GHL workflows. They must be audited
-    // BEFORE release. Re-check kill-switch between each external side effect.
-    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
-    await llGhlAddTag(contactId,'lltouch-cm-lead');
-    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
-    await llGhlAddTag(contactId,serviceTag);
-    if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
+    if(step==='upsert_recorded'){
+      if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
+      await llCm3C11JEffectCheckpoint(job,'upsert_recorded','lead_tag_started');
+      if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
+      await llGhlAddTag(contactId,'lltouch-cm-lead');
+      await llCm3C11JEffectCheckpoint(job,'lead_tag_started','lead_tag_recorded');
+      step='lead_tag_recorded';
+    }
+    if(step==='lead_tag_recorded'){
+      if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
+      await llCm3C11JEffectCheckpoint(job,'lead_tag_recorded','service_tag_started');
+      if(!authorize(key))throw new Error('GHL_CAMPAIGN_BLOCKED');
+      await llGhlAddTag(contactId,serviceTag);
+      await llCm3C11JEffectCheckpoint(job,'service_tag_started','service_tag_recorded');
+      step='service_tag_recorded';
+    }
+    if(step!=='service_tag_recorded'||!authorize(key))
+      throw new Error('GHL_CAMPAIGN_BLOCKED');
     const finished=await llCm3C11JRpc('lltouch_cm_ghl_finish',{
       p_lead_id:job.lead_id,p_lease_token:job.lease_token
     });
@@ -13590,9 +13628,9 @@ async function llCm3C11JProcessOne(key,version,authorize=llCm3C11JGhlGate){
     const reason=llCm3C11JErrorCode(e);
     try{await llCm3C11JRpc('lltouch_cm_ghl_retry',{
       p_lead_id:job.lead_id,p_lease_token:job.lease_token,p_reason:reason
-    });}catch(err){console.error('Campaign Studio GHL retry state could not be saved');}
-    // Never print name, phone, email, GHL payload, bearer token or API response.
-    console.error('Campaign Studio GHL dispatch attempt rejected:',reason);
+    });}catch(_err){console.error('Campaign Studio GHL retry/quarantine state not confirmed');}
+    // No PII, bearer credentials, response body, lease token or GHL ID in logs.
+    console.error('Campaign Studio GHL dispatch rejected:',reason);
     return {claimed:1,sent:0,failed:1,errorCode:reason};
   }
 }
@@ -15080,6 +15118,7 @@ function llCm3C11RbGlobalGate(){
   return process.env.LLTOUCH_CM_GHL_AUTO_WORKER_ENABLED==='true' &&
     process.env.LLTOUCH_CM_GHL_AUTO_RELEASE_APPROVED==='true' &&
     process.env.LLTOUCH_CM_GHL_AUTO_WORKFLOW_SAFETY_APPROVED==='true' &&
+    process.env.LLTOUCH_CM_GHL_03C11RE_EFFECTS_APPROVED==='true' &&
     process.env.LLTOUCH_CM_GHL_SYNC_ENABLED==='true' &&
     process.env.LLTOUCH_CM_GHL_RELEASE_APPROVED==='true' &&
     process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='false' &&
@@ -15304,6 +15343,40 @@ if(llCm3C11RbGlobalGate()){
   kickoff.unref?.();
 }
 // END 03C-11R-B. Existing manual dispatch endpoint remains unchanged.
+
+// 03C-11R-E: read-only effect-state overview, never releases/retries jobs.
+app.get('/lltouch/campaigns/admin/api/leads/ghl-effect-readiness/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    res.set('Referrer-Policy','no-referrer');
+    res.set('X-Robots-Tag','noindex, nofollow');
+    const key=String(req.params.key||'');
+    if(!LL_CM_DISPLAY_KEY.test(key))
+      return res.status(422).json({ok:false,readOnly:true,error:'INVALID_CAMPAIGN_KEY'});
+    try{
+      const {data,error}=await academySupabase.rpc('lltouch_cm_ghl_effect_health',{
+        p_campaign_key:key
+      });
+      if(error||!Array.isArray(data)||data.length!==1)throw new Error('EFFECT_HEALTH_UNAVAILABLE');
+      const row=data[0];
+      return res.json({ok:true,readOnly:true,stage:'03C-11R-E',campaignKey:key,
+        total:Number(row.total_jobs),quarantined:Number(row.quarantined),
+        uncertainInFlight:Number(row.uncertain_in_flight),
+        checkpointed:Number(row.checkpointed),completed:Number(row.completed),
+        quarantinedWithoutContactId:Number(row.legacy_risk_quarantined),
+        auditEvents:Number(row.audit_events),
+        effectsReleaseApproved:process.env.LLTOUCH_CM_GHL_03C11RE_EFFECTS_APPROVED==='true',
+        automaticDispatchEnabled:llCm3C11RbGate(key),
+        humanReconciliationRequired:Number(row.quarantined)>0||Number(row.uncertain_in_flight)>0,
+        noGhlCall:true,noSms:true,noBooking:true,noPayment:true,noPersonalDataReturned:true,
+        note:'Read-only. Unknown outcomes stay blocked; no automatic reconciliation or replay.'});
+    }catch(_e){
+      console.error('Campaign Studio effect readiness unavailable');
+      return res.status(503).json({ok:false,readOnly:true,stage:'03C-11R-E',
+        error:'GHL_EFFECT_HEALTH_UNAVAILABLE',automaticDispatchEnabled:false,
+        noGhlCall:true,noSms:true,noBooking:true,noPayment:true});
+    }
+  });
 
 // LLMK AUTOMATED CONTRACTS / QA v2 - isolated routes; no Stripe/Vagaro changes.
 // Preview only until independent security, signature and legal sign-off.
