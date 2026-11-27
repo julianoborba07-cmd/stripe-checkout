@@ -7,6 +7,7 @@ import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
 import { buildHydraBridge, hydraBridgeHtml, makeHydraQaDraft } from "./lltouch-hydrafacial-bridge-qa.mjs";
 import { makeHydraStripeQaCheckout, verifyHydraStripeQaSession } from "./lltouch-hydra-stripe-qa.mjs";
+import { hydraQaFilteredSlots, hydraQaHeldIntervals } from "./lltouch-hydra-availability-qa.mjs";
 import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
 
 dotenv.config();
@@ -5652,6 +5653,85 @@ app.get('/lltouch/campaigns/admin/api/reuse/hydrafacial/stripe-test/status',
   }catch(e){console.error('Hydra QA session status:',String(e?.message||e).slice(0,80));
     return res.status(404).json({ok:false,error:'Sessão TEST não confirmada.'});}
 });
+
+// ===========================================================================
+// HYDRAFACIAL / QA — VERIFIED AVAILABILITY READ. NO HOLD, NO BOOKING.
+// Reuse mapped service, Vagaro provider availability, Google BUSY events and
+// Supabase appointment/hold conflicts. This does not authorize live bookings.
+// ===========================================================================
+const llCmHydraAvailabilityRate=rateLimit({windowMs:15*60*1000,max:8,
+  standardHeaders:'draft-7',legacyHeaders:false});
+app.get('/lltouch/campaigns/admin/api/reuse/hydrafacial/availability/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,llCmHydraAvailabilityRate,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+  if(!llCmHydraBridgeQaAllowed())return res.status(404).json({ok:false,error:'QA_NOT_AVAILABLE'});
+  const key=String(req.params.key||'');
+  const providerKey=String(req.query.provider||'');
+  const date=String(req.query.date||'');
+  if(key!=='hydrafacial-piloto-qa'||!['ludimilla','carol'].includes(providerKey)||
+     !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+     !Number.isFinite(Date.parse(date+'T12:00:00Z')))
+    return res.status(422).json({ok:false,error:'QA_PARAMETERS_INVALID'});
+  const today=llTouchGeneralTodayISO();
+  if(date<today||date>academyAddDaysISO(today,27))
+    return res.status(422).json({ok:false,error:'QA_DATE_OUTSIDE_28_DAY_BOOKING_HORIZON'});
+  try{
+    const bridge=await llCmHydraStripeQaBridge(key);
+    if(!bridge.configurationMapped ||bridge.campaignPurpose!=='internal_test'||
+       bridge.status!=='draft'||bridge.preview?.enabled!==false ||
+       bridge.preview?.priceCents!==14900||bridge.preview?.depositCents!==2500)
+      return res.status(409).json({ok:false,error:'HYDRA_QA_CAMPAIGN_NOT_COMPATIBLE'});
+    if(!llTouchAppointmentsReadiness())
+      return res.status(503).json({ok:false,error:'VAGARO_OR_GOOGLE_NOT_CONFIGURED'});
+    const prof=LLTOUCH_PROFESSIONALS[providerKey];
+    const service=resolveVagaroServiceFromSiteItem(bridge.preview.siteItem);
+    if(!prof?.providerId || !prof?.calendarId || !service?.serviceId ||
+       llTouchBookingNeedsManualScheduling(service) ||
+       !Number.isSafeInteger(service.bookingDurationMinutes))
+      return res.status(409).json({ok:false,error:'HYDRA_VAGARO_PROVIDER_MAPPING_INCOMPLETE'});
+    // Sunday is closed; no external queries are needed.
+    if(new Date(date+'T12:00:00Z').getUTCDay()===0)
+      return res.json({ok:true,qaOnly:true,readOnly:true,campaignKey:key,campaignVersion:bridge.version,
+        providerKey,date,timezone:'America/New_York',durationMinutes:service.bookingDurationMinutes,
+        slots:[],noHold:true,noBooking:true,noPayment:true,noGhlCall:true});
+    let vagaro;
+    try{vagaro=await searchVagaroAvailability({date,serviceId:service.serviceId,
+      addOnIds:service.addOnIds||[],serviceProviderId:prof.providerId});}
+    catch(e){
+      if(e?.vagaroPastDate===true)return res.status(409).json({ok:false,error:'VAGARO_DATE_ALREADY_PAST'});
+      throw e;
+    }
+    const [googleBusy,appointments,holds]=await Promise.all([
+      llTouchBusyEventsForCalendar(date,prof.calendarId,true),
+      academySupabase.from('lltouch_appointments').select('starts_at,ends_at')
+        .eq('provider_id',prof.providerId).eq('appointment_date',date)
+        .in('status',['pending','confirmed']),
+      academySupabase.from('lltouch_offer_claims')
+        .select('starts_at,ends_at,state,hold_expires_at')
+        .eq('provider_id',prof.providerId).eq('appointment_date',date)
+        .in('state',['held','checkout','paid','processing','confirmed','review'])
+    ]);
+    if(appointments.error||holds.error)throw new Error('QA_DATABASE_AVAILABILITY_READ_FAILED');
+    const days=Array.isArray(vagaro?.data)?vagaro.data:[];
+    if(days.length>100)throw new Error('QA_VAGARO_RESPONSE_TOO_LARGE');
+    const matching=days.find(day=>normalizeAcademyDateValue(day.appointmentDate,date)===date);
+    const raw=Array.isArray(matching?.timeSlot)?matching.timeSlot.map(x=>normalizeAcademyTime(x)):[];
+    const dbBusy=(appointments.data||[]).map(r=>({start:r.starts_at,end:r.ends_at}));
+    const holdBusy=hydraQaHeldIntervals(holds.data||[],Date.now());
+    const slots=hydraQaFilteredSlots({date,nowMs:Date.now(),durationMinutes:service.bookingDurationMinutes,
+      rawSlots:raw,calendarBusy:googleBusy,bookingBusy:dbBusy,holdBusy,
+      buildWindow:llTouchAppointmentWindow});
+    return res.json({ok:true,qaOnly:true,readOnly:true,campaignKey:key,
+      campaignVersion:bridge.version,providerKey,date,timezone:'America/New_York',
+      durationMinutes:service.bookingDurationMinutes,slots,
+      verifiedSources:['Vagaro','Google Calendar','Supabase'],
+      noHold:true,noBooking:true,noPayment:true,noGhlCall:true,
+      note:'Consulta privada de horários; revalidar antes de qualquer futura reserva.'});
+  }catch(e){console.error('Hydra QA availability read failed:',String(e?.message||e).slice(0,85));
+    return res.status(503).json({ok:false,error:'QA_AVAILABILITY_READ_UNAVAILABLE'});}
+});
+// END HYDRA QA READ-ONLY AVAILABILITY.
+
 // END HYDRAFACIAL STRIPE QA. Legacy /lltouch/offer/* handlers are untouched.
 
 // No checkout/booking/status release routes changed.
