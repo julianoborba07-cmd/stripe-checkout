@@ -5202,10 +5202,12 @@ app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
   const unavailable = {ok:true,enabled:false,campaignKey:null,bookingReady:false,offer:null};
   try {
     const {data:rows,error}=await academySupabase.from('lltouch_campaigns')
-      .select('id,campaign_key,version,status,service_title,site_item,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
+      .select('id,campaign_key,version,status,campaign_purpose,service_title,site_item,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
       .eq('status','published').limit(2);
     if(error)throw error;
     if(!rows?.length)return res.json(unavailable);
+    // 04A.04: se QUALQUER publicação é teste ou sem finalidade, falhar fechado.
+    if(rows.some(c=>c.campaign_purpose!=='commercial'))return res.json(unavailable);
     if(rows.length!==1)throw new Error('More than one campaign published');
     const c=rows[0],now=Date.now();
     const start=Date.parse(c.offer_starts_at),end=Date.parse(c.offer_ends_at);
@@ -5273,8 +5275,12 @@ app.get('/lltouch/campaigns/public-config', checkoutLimiter, async (_req, res) =
     // Manual AI publications are display-only: do not pass them to the legacy
     // Vagaro resolver, which intentionally rejects unmapped services.
     const {data:published,error:publicationError}=await academySupabase.from('lltouch_campaigns')
-      .select('campaign_key,site_item,marketing').eq('status','published').limit(2);
+      .select('campaign_key,campaign_purpose,site_item,marketing').eq('status','published').limit(2);
     if(publicationError)throw publicationError;
+    // 04A.04: propósito ausente ou teste nunca libera configuração pública.
+    if((published||[]).some(c=>c.campaign_purpose!=='commercial'))
+      return res.json({ok:true,enabled:false,campaignKey:null,bookingReady:false,
+        note:'Campaign purpose is not approved for public use.'});
     if(published?.length===1 && published[0].site_item?.type==='manual'){
       return res.json({ok:true,enabled:false,campaignKey:null,bookingReady:false,
         note:'Display-only Campaign Studio publication; legacy transactions are disabled.'});
@@ -5449,7 +5455,7 @@ app.get('/lltouch/campaigns/admin',LL_CM_ADMIN_LIMITER,llCmAdminAuth,(req,res)=>
 app.get('/lltouch/campaigns/admin/api/campaigns',LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
   try{
     const {data:campaigns,error}=await academySupabase.from('lltouch_campaigns')
-      .select('id,campaign_key,internal_name,status,version,service_title,offer_starts_at,offer_ends_at')
+      .select('id,campaign_key,internal_name,status,campaign_purpose,version,service_title,offer_starts_at,offer_ends_at')
       .order('created_at',{ascending:false}).limit(100);
     if(error)throw error;
     const {data:assets,error:assetError}=await academySupabase.from('lltouch_campaign_assets')
@@ -5460,6 +5466,7 @@ app.get('/lltouch/campaigns/admin/api/campaigns',LL_CM_ADMIN_LIMITER,llCmAdminAu
       const hero=(assets||[]).filter(a=>a.campaign_id===c.id);
       const image=device=>hero.find(a=>a.device===device)?.image_url||'';
       return {campaignKey:c.campaign_key,internalName:c.internal_name,status:c.status,
+        campaignPurpose:c.campaign_purpose,
         version:c.version,serviceTitle:c.service_title,
         offerStartsAt:c.offer_starts_at,offerEndsAt:c.offer_ends_at,
         desktopUrl:image('desktop'),mobileUrl:image('mobile')||image('tablet')};
@@ -5852,7 +5859,7 @@ app.get('/lltouch/campaigns/admin/api/campaigns/:key/details',LL_CM_ADMIN_LIMITE
   if(!LL_CM_KEY_RE.test(key))return res.status(422).json({ok:false,error:'Campanha inválida.'});
   try{
     const {data,error}=await academySupabase.from('lltouch_campaigns')
-      .select('campaign_key,internal_name,status,version,service_title,site_item,regular_price_cents,price_cents,deposit_cents,hold_minutes,treatment_duration_min,preferred_booking_enabled,preferred_max_days,preferred_start_time,preferred_end_time,provider_keys,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
+      .select('campaign_key,internal_name,status,campaign_purpose,version,service_title,site_item,regular_price_cents,price_cents,deposit_cents,hold_minutes,treatment_duration_min,preferred_booking_enabled,preferred_max_days,preferred_start_time,preferred_end_time,provider_keys,offer_starts_at,offer_ends_at,timezone,offer_label,marketing')
       .eq('campaign_key',key).maybeSingle();
     if(error)throw error;
     if(!data)return res.status(404).json({ok:false,error:'Campanha não encontrada.'});
@@ -7854,6 +7861,7 @@ function llCmDisplayPreflight(c, assets, otherPublished) {
   const desktop=asset('desktop'),mobile=asset('mobile');
   add(/^[a-z0-9][a-z0-9-]{3,95}$/.test(key),'Identificador inválido.');
   add(['draft','paused'].includes(c?.status),'A campanha não está em rascunho ou pausada.');
+  add(c?.campaign_purpose==='commercial','Campanha de teste: publicação pública bloqueada.');
   add(c?.site_item?.type==='manual'&&c.site_item.requiresVagaroMapping===true,'A publicação visual é restrita a campanhas IA sem mapeamento Vagaro.');
   add(!otherPublished,'Já existe outra campanha publicada. Pause-a antes de publicar esta.');
   add(c?.currency==='usd'&&Number.isSafeInteger(c?.price_cents)&&c.price_cents>=2500&&
@@ -7887,7 +7895,7 @@ function llCmDisplayPreflight(c, assets, otherPublished) {
 }
 async function llCmDisplayRead(key) {
   const {data:c,error}=await academySupabase.from('lltouch_campaigns')
-    .select('id,campaign_key,version,status,site_item,service_title,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,timezone,offer_starts_at,offer_ends_at,marketing')
+    .select('id,campaign_key,version,status,campaign_purpose,site_item,service_title,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,timezone,offer_starts_at,offer_ends_at,marketing')
     .eq('campaign_key',key).maybeSingle();
   if(error)throw error;
   if(!c)return null;
@@ -9593,7 +9601,8 @@ function llCm3C11PublicGate(){
 function llCm3C11SafeCampaign(c){
   const meta=c?.marketing?.campaignMeta;
   const starts=Date.parse(c?.offer_starts_at),ends=Date.parse(c?.offer_ends_at);
-  return c?.status==='published' && c?.site_item?.type==='manual' &&
+  return c?.campaign_purpose==='commercial' && c?.status==='published' &&
+    c?.site_item?.type==='manual' &&
     meta?.releaseMode==='display-only' &&
     meta?.checkoutReady===false && meta?.bookingReady===false &&
     Number.isSafeInteger(c?.version) && c.version>0 &&
@@ -9605,7 +9614,8 @@ function llCm3C11SafeCampaign(c){
 function llCm3C11PreauthorizationEligible(c){
   const meta=c?.marketing?.campaignMeta;
   const starts=Date.parse(c?.offer_starts_at),ends=Date.parse(c?.offer_ends_at);
-  return c?.status==='published' && c?.site_item?.type==='manual' &&
+  return c?.campaign_purpose==='commercial' && c?.status==='published' &&
+    c?.site_item?.type==='manual' &&
     meta?.releaseMode==='display-only' &&
     meta?.checkoutReady===false && meta?.bookingReady===false &&
     Number.isSafeInteger(c?.version) && c.version>0 &&
@@ -9639,7 +9649,7 @@ app.get('/lltouch/campaigns/admin/api/leads/readiness/:key',
   if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'Invalid campaign key.'});
   try{
     const {data:c,error:cError}=await academySupabase.from('lltouch_campaigns')
-      .select('campaign_key,version,status,site_item,marketing,offer_starts_at,offer_ends_at')
+      .select('campaign_key,version,status,campaign_purpose,site_item,marketing,offer_starts_at,offer_ends_at')
       .eq('campaign_key',key).maybeSingle();
     if(cError)throw cError;
     if(!c)return res.status(404).json({ok:false,error:'Campaign not found.'});
@@ -9681,7 +9691,7 @@ app.post('/lltouch/campaigns/admin/api/leads/configure/:key',
     });
     if(error)throw error;
     const {data:after,error:afterError}=await academySupabase.from('lltouch_campaigns')
-      .select('campaign_key,version,status,site_item,marketing,offer_starts_at,offer_ends_at')
+      .select('campaign_key,version,status,campaign_purpose,site_item,marketing,offer_starts_at,offer_ends_at')
       .eq('campaign_key',key).maybeSingle();
     if(afterError)throw afterError;
     return res.json({ok:true,configured:true,...data,
@@ -9713,7 +9723,7 @@ app.post('/lltouch/campaigns/leads',LL_CM_03C11_LEAD_RATE,async(req,res)=>{
     if(!LL_CM_DISPLAY_KEY.test(key)||!Number.isSafeInteger(version)||version<1)
       return res.status(422).json({ok:false,error:'Invalid campaign identity.'});
     const {data:campaign,error:campaignError}=await academySupabase.from('lltouch_campaigns')
-      .select('id,campaign_key,version,status,site_item,marketing,offer_starts_at,offer_ends_at')
+      .select('id,campaign_key,version,status,campaign_purpose,site_item,marketing,offer_starts_at,offer_ends_at')
       .eq('campaign_key',key).maybeSingle();
     if(campaignError)throw campaignError;
     if(!campaign || campaign.version!==version || !await llCm3C11CaptureReady(campaign))
@@ -15044,7 +15054,7 @@ app.get('/lltouch/campaigns/admin/api/leads/offer-bridge-readiness/:key',
       return res.status(422).json({ok:false,readOnly:true,error:'INVALID_CAMPAIGN_KEY'});
     try{
       const {data:c,error:ce}=await academySupabase.from('lltouch_campaigns')
-        .select('id,campaign_key,version,status,site_item,marketing,offer_starts_at,offer_ends_at')
+        .select('id,campaign_key,version,status,campaign_purpose,site_item,marketing,offer_starts_at,offer_ends_at')
         .eq('campaign_key',key).maybeSingle();
       if(ce)throw ce;
       if(!c)return res.status(404).json({ok:false,readOnly:true,error:'CAMPAIGN_NOT_FOUND'});
