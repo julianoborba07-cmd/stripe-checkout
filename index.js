@@ -387,6 +387,11 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    // Mapped Campaign Studio sessions must never fall through to loyalty or legacy offer logic.
+    if (event.data?.object?.metadata?.cm_scope === 'lltouch-cm-mapped-v1') {
+      try { await llCmMappedHandleSignedEvent(event); return res.json({received:true}); }
+      catch (_error) { console.error('CM mapped webhook reconciliation failed'); return res.status(503).json({received:false}); }
+    }
     // Reusable LL Touch /offer funnel, isolated from PWYC and legacy HydraFacial orders.
     if (event.data.object?.metadata?.offer_flow === 'lltouch-offer-v2') {
       try {
@@ -8001,6 +8006,212 @@ function llCmMappedReconcileCheckoutContract({snapshot,hold,session,paymentInten
 }
 // END CM MAPPED CHECKOUT CONTRACT
 
+// BEGIN CM MAPPED CHECKOUT EMISSION — candidate, no commercial release.
+const LL_CM_MAPPED_CHECKOUT_RELEASED=false;
+const LL_CM_MAPPED_EVENTS=new Set(['checkout.session.completed','checkout.session.async_payment_succeeded','checkout.session.async_payment_failed','checkout.session.expired']);
+function llCmMappedIssueInput(b){
+  if(!b||typeof b!=='object'||Array.isArray(b)||Object.keys(b).some(k=>!['campaignKey','campaignVersion','holdId','snapshotId','leadId','clientNonce'].includes(k))||
+    !LL_CM_DISPLAY_KEY.test(b.campaignKey||'')||!Number.isSafeInteger(b.campaignVersion)||b.campaignVersion<1||
+    !['holdId','snapshotId','leadId','clientNonce'].every(k=>LL_CM_03C4_UUID.test(b[k]||'')))throw Error('CM_MAPPED_CHECKOUT_INPUT_INVALID');
+  return b;
+}
+async function llCmMappedIssueRpc(name,args){
+  const {data,error}=await academySupabase.rpc(name,args);
+  if(error||data?.ok!==true)throw Error('CM_MAPPED_ISSUE_RPC_FAILED');
+  return data;
+}
+function llCmMappedAssertCreatedSession(session,expected){
+  const m=session?.metadata||{},p=expected.params.metadata;
+  if(session?.object!=='checkout.session'||session.livemode!==true||!/^cs_live_[A-Za-z0-9_]{12,200}$/.test(session.id||'')||
+    session.mode!=='payment'||session.currency!=='usd'||session.amount_total!==expected.amountCents||
+    !Object.keys(p).every(k=>p[k]===m[k]))throw Error('CM_MAPPED_STRIPE_SESSION_MISMATCH');
+}
+async function llCmMappedIssueCheckout(input,c){
+  if(c.campaign_key!==input.campaignKey||c.version!==input.campaignVersion)throw Error('CM_MAPPED_CAMPAIGN_CHANGED');
+  // DB transaction owns the slot before the first Stripe request. No failure path
+  // releases this slot unless a retrieved Stripe session is definitively closed.
+  const row=await llCmMappedIssueRpc('lltouch_cm_mapped_issue_begin_v1',{
+    p_hold:input.holdId,p_snapshot:input.snapshotId,p_nonce:input.clientNonce,p_lead:input.leadId});
+  const h=row.hold,s=row.snapshot;
+  if(!h||!s||h.id!==input.holdId||s.id!==input.snapshotId||h.campaign_key!==input.campaignKey||h.campaign_version!==input.campaignVersion||h.state!=='checkout'||!['issuing','bound'].includes(row.state)||h.quote_snapshot?.leadId!==input.leadId||h.client_nonce!==input.clientNonce)throw Error('CM_MAPPED_ISSUE_RESPONSE_INVALID');
+  // The preexisting pure builder expects the pre-issuance state. Only SQL's
+  // successfully reserved state may be projected back into that validator.
+  const plan=llCmMappedBuildCheckoutContract(s,{...h,state:'held'});
+  let session;
+  if(row.state==='bound'){
+    if(!row.sessionId||row.sessionId!==h.stripe_session_id)throw Error('CM_MAPPED_BIND_CONFLICT');
+    session=await stripe.checkout.sessions.retrieve(row.sessionId);
+  }else{
+    if(row.sessionId!=null||h.stripe_session_id!=null)throw Error('CM_MAPPED_BIND_CONFLICT');
+    session=await stripe.checkout.sessions.create(plan.params,{idempotencyKey:plan.idempotencyKey});
+  }
+  llCmMappedAssertCreatedSession(session,plan);
+  if(row.state==='issuing')await llCmMappedIssueRpc('lltouch_cm_mapped_issue_bind_v1',{p_snapshot:s.id,p_hold:h.id,p_session:session.id});
+  if(session.status!=='open'||session.payment_status!=='unpaid'||Date.now()>=Date.parse(h.expires_at))throw Error('CM_MAPPED_CHECKOUT_NOT_OPEN');
+  const url=new URL(session.url||'');
+  if(url.protocol!=='https:'||url.hostname!=='checkout.stripe.com'||url.username||url.password)throw Error('CM_MAPPED_CHECKOUT_URL_INVALID');
+  return {ok:true,url:url.href,expiresAt:h.expires_at,bookingReady:false};
+}
+app.post('/lltouch/campaigns/mapped-checkout',LL_CM_MAPPED_RATE,async(req,res)=>{
+  res.set('Cache-Control','no-store');
+  if(!LL_CM_MAPPED_CHECKOUT_RELEASED||!LL_CM_MAPPED_RESERVATION_RELEASED||process.env.LLTOUCH_CM_MAPPED_CHECKOUT_ENABLED!=='true')return res.status(403).json({ok:false,error:'CM_MAPPED_CHECKOUT_NOT_RELEASED'});
+  if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))return res.status(403).json({ok:false,error:'CM_MAPPED_REQUEST_INVALID'});
+  try{
+    const input=llCmMappedIssueInput(req.body),c=await llCmMappedReadCampaign(input.campaignKey);
+    if(!llCmMappedReleaseGate(c)||c.marketing?.campaignMeta?.mappedCheckoutAuthorized!==true)throw Error('CM_MAPPED_CHECKOUT_GATE_CLOSED');
+    llCmMappedContract(c);
+    return res.json(await llCmMappedIssueCheckout(input,c));
+  }catch(e){return res.status(409).json({ok:false,error:/^CM_MAPPED_[A-Z_]+$/.test(e?.message||'')?e.message:'CM_MAPPED_CHECKOUT_FAILED'});}
+});
+// Read by immutable IDs only; never accept prices from a Stripe event or browser.
+async function llCmMappedIssueRead(table,id){
+  const {data,error}=await academySupabase.from(table).select('*').eq('id',id).maybeSingle();
+  if(error||!data)throw Error('CM_MAPPED_EVENT_READ_FAILED');return data;
+}
+// Called only AFTER the existing /webhook signature has been verified.
+// Must continue settling existing sessions even if the release switches are off.
+async function llCmMappedHandleSignedEvent(event){
+  if(!LL_CM_MAPPED_EVENTS.has(event.type))return;
+  const source=event.data?.object;
+  if(event.livemode!==true||source?.livemode!==true||source?.object!=='checkout.session'||!/^cs_live_[A-Za-z0-9_]{12,200}$/.test(source.id||'')||!/^evt_[A-Za-z0-9_]{8,200}$/.test(event.id||''))throw Error('CM_MAPPED_EVENT_INVALID');
+  const session=await stripe.checkout.sessions.retrieve(source.id);
+  const m=session?.metadata||{};
+  if(m.cm_scope!=='lltouch-cm-mapped-v1'||!LL_CM_03C4_UUID.test(m.hold_id||'')||!LL_CM_03C4_UUID.test(m.snapshot_id||''))throw Error('CM_MAPPED_EVENT_METADATA_INVALID');
+  let h=await llCmMappedIssueRead('lltouch_cm_universal_holds',m.hold_id);
+  const s=await llCmMappedIssueRead('lltouch_cm_universal_checkout_snapshots',m.snapshot_id);
+  if(s.hold_id!==h.id||s.campaign_id!==h.campaign_id||s.campaign_version!==h.campaign_version||s.campaign_key!==h.campaign_key||s.immutable_terms?.mode!=='mapped-service-v1')throw Error('CM_MAPPED_EVENT_TERMS_INVALID');
+  llCmMappedAssertCreatedSession(session,{amountCents:s.deposit_cents,params:{metadata:{cm_scope:'lltouch-cm-mapped-v1',hold_id:h.id,snapshot_id:s.id,campaign_key:s.campaign_key,campaign_version:String(s.campaign_version)}}});
+  // A webhook can arrive before the issuing HTTP request has persisted the ID.
+  if(!h.stripe_session_id){await llCmMappedIssueRpc('lltouch_cm_mapped_issue_bind_v1',{p_snapshot:s.id,p_hold:h.id,p_session:session.id});h=await llCmMappedIssueRead('lltouch_cm_universal_holds',h.id);}
+  if(h.stripe_session_id!==session.id)throw Error('CM_MAPPED_BIND_CONFLICT');
+  let intent=null;
+  if(typeof session.payment_intent==='string')intent=await stripe.paymentIntents.retrieve(session.payment_intent,{expand:['latest_charge']});
+  else if(session.payment_intent!==null)throw Error('CM_MAPPED_INTENT_INVALID');
+  const r=llCmMappedReconcileCheckoutContract({snapshot:s,hold:h,session,paymentIntent:intent,expectedLiveMode:true});
+  await llCmMappedIssueRpc('lltouch_cm_mapped_issue_event_v1',{p_snapshot:s.id,p_hold:h.id,p_session:session.id,p_event:event.id,p_action:r.action,p_reason:r.reason,p_paid_at:r.paidAt||null});
+}
+// END CM MAPPED CHECKOUT EMISSION
+
+// BEGIN CM MAPPED EXPIRY WORKER — candidate, independent of new sales gates.
+// Do not enable until SQL and integrated Stripe tests are complete.
+const LL_CM_MAPPED_EXPIRY_WORKER_RELEASED=false;
+let llCmMappedExpiryRunning=false;
+async function llCmMappedPollBoundIssue(row,now=Date.now()){
+  const h=await llCmMappedIssueRead('lltouch_cm_universal_holds',row.hold_id);
+  const s=await llCmMappedIssueRead('lltouch_cm_universal_checkout_snapshots',row.snapshot_id);
+  if(h.state!=='checkout'||h.stripe_session_id!==row.session_id||s.hold_id!==h.id||
+     s.campaign_id!==h.campaign_id||s.campaign_key!==h.campaign_key||s.campaign_version!==h.campaign_version||
+     s.immutable_terms?.mode!=='mapped-service-v1'||!Number.isFinite(Date.parse(h.expires_at))||Date.parse(h.expires_at)>now)return;
+  const expected={amountCents:s.deposit_cents,params:{metadata:{cm_scope:'lltouch-cm-mapped-v1',hold_id:h.id,snapshot_id:s.id,campaign_key:s.campaign_key,campaign_version:String(s.campaign_version)}}};
+  let session=await stripe.checkout.sessions.retrieve(row.session_id);
+  llCmMappedAssertCreatedSession(session,expected);
+  if(session.id!==row.session_id)throw Error('CM_MAPPED_POLL_SESSION_MISMATCH');
+  if(session.status==='open'&&session.payment_status==='unpaid'){
+    // Expire by Stripe, not by locally clearing the hold. A concurrent payment
+    // can win this race. Retrieve authoritative state even if expire fails.
+    try{await stripe.checkout.sessions.expire(session.id)}catch(_e){}
+    session=await stripe.checkout.sessions.retrieve(row.session_id);
+    llCmMappedAssertCreatedSession(session,expected);
+    if(session.id!==row.session_id)throw Error('CM_MAPPED_POLL_SESSION_MISMATCH');
+  }
+  let intent=null;
+  if(typeof session.payment_intent==='string')intent=await stripe.paymentIntents.retrieve(session.payment_intent,{expand:['latest_charge']});
+  else if(session.payment_intent!==null)throw Error('CM_MAPPED_POLL_INTENT_INVALID');
+  const result=llCmMappedReconcileCheckoutContract({snapshot:s,hold:h,session,paymentIntent:intent,expectedLiveMode:true});
+  await llCmMappedIssueRpc('lltouch_cm_mapped_poll_result_v1',{p_snapshot:s.id,p_hold:h.id,p_session:session.id,p_action:result.action,p_reason:result.reason,p_paid_at:result.paidAt||null});
+}
+async function llCmMappedExpiryTick(){
+  if(!LL_CM_MAPPED_EXPIRY_WORKER_RELEASED||process.env.LLTOUCH_CM_MAPPED_EXPIRY_WORKER_ENABLED!=='true'||llCmMappedExpiryRunning)return;
+  llCmMappedExpiryRunning=true;
+  try{
+    const {data,error}=await academySupabase.rpc('lltouch_cm_mapped_due_issues_v1');
+    if(error||!Array.isArray(data)||data.length>20)throw Error('CM_MAPPED_DUE_READ_FAILED');
+    for(const row of data){try{await llCmMappedPollBoundIssue(row)}catch(_e){console.error('CM mapped poll failed; hold retained');}}
+    // No session ID means that Stripe issuance may have succeeded but its
+    // response was lost. Never expire or recreate such a hold after deadline.
+  }catch(_e){console.error('CM mapped expiry worker failed; holds retained');}
+  finally{llCmMappedExpiryRunning=false;}
+}
+if(LL_CM_MAPPED_EXPIRY_WORKER_RELEASED&&process.env.LLTOUCH_CM_MAPPED_EXPIRY_WORKER_ENABLED==='true'){
+  const t=setInterval(()=>{void llCmMappedExpiryTick()},15000);t.unref?.();
+}
+// END CM MAPPED EXPIRY WORKER
+
+// BEGIN CM MAPPED BOOKING WORKER — candidate. No automatic customer message.
+const LL_CM_MAPPED_BOOKING_RELEASED=false;
+const LL_CM_MAPPED_BOOKING_CONTEXT=Symbol('mapped-paid-booking');
+let llCmMappedBookingRunning=false;
+function llCmMappedBookingContextValid(ctx,session){
+  const h=ctx?.hold,s=ctx?.snapshot,q=s?.immutable_terms||{},m=session?.metadata||{};
+  return !!(h&&s&&h.state==='processing'&&h.id===s.hold_id&&h.stripe_session_id===session.id&&
+    q.mode==='mapped-service-v1'&&m.cm_scope==='lltouch-cm-mapped-v1'&&m.hold_id===h.id&&m.snapshot_id===s.id&&
+    m.campaign_key===s.campaign_key&&m.campaign_version===String(s.campaign_version)&&session.livemode===true&&
+    session.payment_status==='paid'&&session.amount_total===s.deposit_cents&&q.providerKey===h.provider_key);
+}
+function llCmMappedBookingSelection(ctx){
+  const h=ctx.hold,s=ctx.snapshot,q=s.immutable_terms;
+  const option=LL_CM_SERVICE_OPTIONS.find(x=>x.key===q.serviceKey);
+  const svc=option?resolveVagaroServiceFromSiteItem(option.siteItem):null;
+  const pro=LLTOUCH_PROFESSIONALS[h.provider_key];
+  if(!option||!svc||!pro?.calendarId||!pro?.providerId||q.providerId!==pro.providerId||
+    !['ludimilla','carol'].includes(h.provider_key)||svc.serviceId!==q.serviceId||svc.bookingDurationMinutes!==q.durationMinutes||
+    !q.siteItem||Object.keys(option.siteItem).length!==Object.keys(q.siteItem).length||!Object.keys(option.siteItem).every(k=>q.siteItem[k]===option.siteItem[k])||
+    llTouchBookingNeedsManualScheduling(svc)||(svc.addOnIds||[]).length)throw Error('CM_MAPPED_BOOKING_MAPPING_CHANGED');
+  const date=String(h.requested_date||''),time=String(h.requested_time||'').slice(0,5);
+  const w=llTouchAppointmentWindow(date,time,q.durationMinutes);
+  if(!w||w.start.getTime()!==Date.parse(h.appointment_start)||w.end.getTime()!==Date.parse(h.appointment_end)||
+    w.start.getTime()!==Date.parse(q.appointmentStart)||w.end.getTime()!==Date.parse(q.appointmentEnd))throw Error('CM_MAPPED_BOOKING_WINDOW_CHANGED');
+  return {index:0,siteItem:option.siteItem,vagaroService:svc,date,time,professional:{key:h.provider_key,...pro}};
+}
+async function llCmMappedConfirmClaim(ctx){
+  const h=ctx.hold,s=ctx.snapshot;
+  const session=await stripe.checkout.sessions.retrieve(h.stripe_session_id);
+  if(!llCmMappedBookingContextValid(ctx,session)||typeof session.payment_intent!=='string')throw Error('CM_MAPPED_BOOKING_PAYMENT_INVALID');
+  const pi=await stripe.paymentIntents.retrieve(session.payment_intent,{expand:['latest_charge']});
+  const verification=llCmMappedReconcileCheckoutContract({snapshot:s,hold:h,session,paymentIntent:pi,expectedLiveMode:true});
+  if(verification.action!=='already_reconciled'||verification.reason!=='REPLAY_OR_IN_PROGRESS')throw Error('CM_MAPPED_BOOKING_PAYMENT_INVALID');
+  const selection=llCmMappedBookingSelection(ctx);
+  // Recheck legacy ledger. Separate legacy writer races are not eliminated by this read.
+  const legacy=await academySupabase.from('lltouch_offer_claims').select('state,hold_expires_at')
+    .eq('provider_id',selection.professional.providerId).in('state',['held','checkout','paid','processing','confirmed','review'])
+    .lt('starts_at',h.appointment_end).gt('ends_at',h.appointment_start).limit(501);
+  if(legacy.error||!Array.isArray(legacy.data)||legacy.data.length>=501||legacy.data.some(x=>x.state!=='held'||!Number.isFinite(Date.parse(x.hold_expires_at))||Date.parse(x.hold_expires_at)>Date.now()))throw Error('CM_MAPPED_BOOKING_LEGACY_CONFLICT');
+  let code=200,result=null;
+  const fakeRes={status(n){code=n;return this;},json(body){result=body;return this;}};
+  await llTouchHandleAppointmentConfirmation({[LL_CM_MAPPED_BOOKING_CONTEXT]:ctx,body:{session_id:session.id,item_index:0,
+    professional_key:h.provider_key,date:selection.date,time:selection.time,appointment_customer:{name:h.customer_name,email:h.customer_email,phone:h.customer_phone}}},fakeRes);
+  if(code<200||code>=300||result?.ok!==true||!LL_CM_03C4_UUID.test(result.appointment?.bookingId||''))throw Error('CM_MAPPED_BOOKING_REVIEW_REQUIRED');
+  const id=result.appointment.bookingId;
+  const row=await llCmMappedIssueRead('lltouch_appointments',id);
+  if(row.status!=='confirmed'||row.stripe_session_id!==session.id||row.provider_id!==selection.professional.providerId||row.service_id!==selection.vagaroService.serviceId||
+    Date.parse(row.starts_at)!==Date.parse(h.appointment_start)||Date.parse(row.ends_at)!==Date.parse(h.appointment_end)||!row.google_event_id)throw Error('CM_MAPPED_BOOKING_RECORD_INVALID');
+  const event=await googleCalendarRequest(`/calendars/${encodeURIComponent(selection.professional.calendarId)}/events/${encodeURIComponent(row.google_event_id)}`);
+  if(event?.id!==row.google_event_id||event.status!=='confirmed'||event.transparency!=='opaque'||event.extendedProperties?.private?.llTouchBookingId!==id||
+    event.extendedProperties?.private?.stripeSessionId!==session.id||Date.parse(event.start?.dateTime)!==Date.parse(h.appointment_start)||Date.parse(event.end?.dateTime)!==Date.parse(h.appointment_end))throw Error('CM_MAPPED_BOOKING_GOOGLE_UNVERIFIED');
+  // Google event verified; does NOT assert a native Vagaro appointment or mirror sync.
+  await llCmMappedIssueRpc('lltouch_cm_mapped_booking_finish_v1',{p_hold:h.id,p_snapshot:s.id,p_booking:id,p_outcome:'calendar_verified'});
+}
+async function llCmMappedBookingTick(){
+  if(!LL_CM_MAPPED_BOOKING_RELEASED||process.env.LLTOUCH_CM_MAPPED_BOOKING_ENABLED!=='true'||llCmMappedBookingRunning)return;
+  llCmMappedBookingRunning=true;
+  try{
+    const row=await llCmMappedIssueRpc('lltouch_cm_mapped_booking_claim_v1',{});
+    if(!row.claimed)return;
+    try{await llCmMappedConfirmClaim(row)}catch(_e){
+      // Never automatically replay a possibly partially written external booking.
+      await llCmMappedIssueRpc('lltouch_cm_mapped_booking_finish_v1',{p_hold:row.hold.id,p_snapshot:row.snapshot.id,p_booking:null,p_outcome:'review'});
+    }
+  }catch(_e){console.error('CM mapped booking worker requires review; slot retained');}
+  finally{llCmMappedBookingRunning=false;}
+}
+if(LL_CM_MAPPED_BOOKING_RELEASED&&process.env.LLTOUCH_CM_MAPPED_BOOKING_ENABLED==='true'){
+  const timer=setInterval(()=>{void llCmMappedBookingTick()},15000);timer.unref?.();
+}
+// END CM MAPPED BOOKING WORKER
+
+
+
+
 
 
 app.get('/lltouch/campaigns/admin/api/transactions/vagaro-catalog/:key',
@@ -12031,7 +12242,15 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
 
   if (session.metadata?.offer_flow === 'lltouch-offer-v2' && !req.llTouchOfferAutoBooking)
     return res.status(403).json({ok:false,code:'OFFER_AUTO_CONFIRM_ONLY',error:'This offer is confirmed automatically after payment.'});
-  const options = buildBookingOptionsFromSession(session);
+  const mapped=session.metadata?.cm_scope==='lltouch-cm-mapped-v1';
+  const mappedContext=req[LL_CM_MAPPED_BOOKING_CONTEXT];
+  if(mapped && (!LL_CM_MAPPED_BOOKING_RELEASED || !llCmMappedBookingContextValid(mappedContext,session)))
+    return res.status(403).json({ok:false,code:'MAPPED_AUTO_CONFIRM_ONLY',error:'Campaign booking is processed by the clinic.'});
+  if(mappedContext && !mapped)return res.status(403).json({ok:false,error:'Invalid campaign context.'});
+  const mappedSelection=mapped?llCmMappedBookingSelection(mappedContext):null;
+  if(mapped && (selectedIndex!==0||professionalKey!==mappedContext.hold.provider_key||date!==mappedSelection.date||selectedTime!==mappedSelection.time))
+    return res.status(403).json({ok:false,error:'Invalid campaign booking selection.'});
+  const options = mapped?[mappedSelection]:buildBookingOptionsFromSession(session);
   const selected = options[selectedIndex];
   if (!selected) {
     return res.status(400).json({
@@ -12039,7 +12258,7 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
     });
   }
 
-  const professional = llTouchGetProfessional(session, selected, professionalKey);
+  const professional = mapped?mappedSelection.professional:llTouchGetProfessional(session, selected, professionalKey);
   if (!professional) return res.status(422).json({ok:false,code:"PROFESSIONAL_UNAVAILABLE",error:"Choose an available professional for this treatment."});
   const service = selected.vagaroService;
   if (llTouchBookingNeedsManualScheduling(service)) {
@@ -12330,7 +12549,7 @@ async function llTouchHandleAppointmentConfirmation(req, res) {
   clearAcademyAvailableDatesCache();
   // Keep the recipient separate from the Stripe payer and payment details.
   // Metadata sync errors never change a confirmed reservation to failed.
-  if (!llTouchIsCampaign(session)) await llTouchRememberAppointmentRecipient(session, recipient);
+  if (!mapped && !llTouchIsCampaign(session)) await llTouchRememberAppointmentRecipient(session, recipient);
   return res.status(201).json(llTouchBookedResponse(confirmed));
 }
 app.post("/lltouch/confirm-appointment", checkoutLimiter, llTouchHandleAppointmentConfirmation);
