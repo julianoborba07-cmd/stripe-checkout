@@ -7705,8 +7705,7 @@ function llCmAuditSafeError(e,res,label){
 // BEGIN CM RELEASE AVAILABILITY AUDIT — admin only; no writes or Stripe.
 const LL_CM_RELEASE_AVAIL_RATE = rateLimit({windowMs:15*60*1000,max:10,
   standardHeaders:'draft-7',legacyHeaders:false});
-app.get('/lltouch/campaigns/admin/api/availability-audit',
-  LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_RELEASE_AVAIL_RATE,async(req,res)=>{
+async function llCmReleaseAvailabilityAudit(req,res){
     res.set('Cache-Control','private,no-store');
     res.set('Referrer-Policy','no-referrer');
     const fail=(status,error)=>res.status(status).json({ok:false,readOnly:true,error});
@@ -7786,8 +7785,223 @@ app.get('/lltouch/campaigns/admin/api/availability-audit',
       return result(slots,['Vagaro','Google Calendar','Supabase'],{candidateCount:candidates.length});
     }catch(_e){console.error('CM release availability audit failed:',stage);
       return fail(503,'AVAILABILITY_'+stage+'_UNAVAILABLE');}
-});
+}
+app.get('/lltouch/campaigns/admin/api/availability-audit',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_RELEASE_AVAIL_RATE,llCmReleaseAvailabilityAudit);
 // END CM RELEASE AVAILABILITY AUDIT
+
+// CM MAPPED RESERVATION BRIDGE — CANDIDATE; hard locked pending payment/booking integration.
+const LL_CM_MAPPED_RESERVATION_RELEASED = false;
+const LL_CM_MAPPED_RATE = rateLimit({windowMs:15*60*1000,max:8,standardHeaders:'draft-7',legacyHeaders:false});
+function llCmMappedContract(c) {
+  const m=c?.marketing?.campaignMeta||{},p=m.automationPlan;
+  const option=LL_CM_SERVICE_OPTIONS.find(x=>x.key===p?.serviceKey);
+  const svc=option?resolveVagaroServiceFromSiteItem(option.siteItem):null;
+  const valid=!!(c && p && p.mappingStatus==='local-catalog-match' && option &&
+    [normalizeKey(option.key),normalizeKey(option.label)].includes(normalizeKey(c.service_title)) &&
+    ['med-spa','facial'].includes(option.siteItem.type) &&
+    Object.keys(option.siteItem).every(k=>p.siteItem?.[k]===option.siteItem[k]) &&
+    Object.keys(p.siteItem||{}).length===Object.keys(option.siteItem).length &&
+    svc?.serviceId && !svc.unsupportedAddOn && !llTouchBookingNeedsManualScheduling(svc) &&
+    !(svc.addOnIds||[]).length && Number.isSafeInteger(svc.bookingDurationMinutes) &&
+    svc.bookingDurationMinutes>=10 && svc.bookingDurationMinutes<=240 && p.durationMinutes===svc.bookingDurationMinutes &&
+    JSON.stringify(p.providerKeys)==='["ludimilla","carol"]' &&
+    c.timezone==='America/New_York' && c.currency==='usd' && c.hold_minutes===10 && p.holdMinutes===10 &&
+    Number.isSafeInteger(c.version) && c.version>0 && Number.isSafeInteger(c.regular_price_cents) &&
+    Number.isSafeInteger(c.price_cents) && Number.isSafeInteger(c.deposit_cents) &&
+    c.regular_price_cents>=c.price_cents && c.price_cents>=c.deposit_cents && c.deposit_cents>0 &&
+    p.priceCents===c.price_cents && p.depositCents===c.deposit_cents && p.balanceCents===c.price_cents-c.deposit_cents);
+  if(!valid)throw Error('CM_MAPPED_PLAN_INVALID');
+  return {serviceKey:option.key,serviceId:svc.serviceId,durationMinutes:svc.bookingDurationMinutes,
+    regularPriceCents:c.regular_price_cents,priceCents:c.price_cents,depositCents:c.deposit_cents,
+    balanceCents:c.price_cents-c.deposit_cents,currency:'usd',providerKeys:['ludimilla','carol']};
+}
+async function llCmMappedReadCampaign(key) {
+  const {data,error}=await academySupabase.from('lltouch_campaigns')
+    .select('id,campaign_key,version,status,service_title,site_item,marketing,currency,regular_price_cents,price_cents,deposit_cents,hold_minutes,timezone,offer_starts_at,offer_ends_at')
+    .eq('campaign_key',key).maybeSingle();
+  if(error)throw Error('CM_MAPPED_CAMPAIGN_READ_FAILED');
+  if(!data)throw Error('CM_MAPPED_CAMPAIGN_NOT_FOUND');
+  return data;
+}
+function llCmMappedReleaseGate(c,now=Date.now()) {
+  const m=c?.marketing?.campaignMeta||{};
+  return LL_CM_MAPPED_RESERVATION_RELEASED && process.env.LLTOUCH_CM_MAPPED_RESERVATION_ENABLED==='true' &&
+    c?.status==='published' && m.releaseMode==='display-only' && m.mappedReservationAuthorized===true &&
+    m.checkoutReady===false && m.bookingReady===false &&
+    Date.parse(c.offer_starts_at)<=now && now+600000<=Date.parse(c.offer_ends_at);
+}
+function llCmMappedSelection(input) {
+  if(!input || typeof input!=='object' || Array.isArray(input) ||
+    Object.keys(input).some(k=>!['campaignKey','campaignVersion','leadId','clientNonce','providerKey','date','time'].includes(k)) ||
+    !LL_CM_DISPLAY_KEY.test(input.campaignKey||'') || !Number.isSafeInteger(input.campaignVersion) || input.campaignVersion<1 ||
+    !LL_CM_03C4_UUID.test(input.leadId||'') || !LL_CM_03C4_UUID.test(input.clientNonce||'') ||
+    !LL_CM_CAMPAIGN_PROVIDER_KEYS.includes(input.providerKey) ||
+    typeof input.date!=='string' || !/^\d{4}-\d{2}-\d{2}$/.test(input.date) ||
+    typeof input.time!=='string' || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(input.time))throw Error('CM_MAPPED_INPUT_INVALID');
+  return input;
+}
+// Calls the identical verified read-only audit, not a client-supplied quote or slot.
+async function llCmMappedVerifySlot(contract,input) {
+  let status=200,body=null;
+  const response={set(){return this},status(n){status=n;return this},json(v){body=v;return v}};
+  await llCmReleaseAvailabilityAudit({query:{service:contract.serviceKey,provider:input.providerKey,date:input.date}},response);
+  if(status!==200 || body?.ok!==true || body.readOnly!==true || body.serviceKey!==contract.serviceKey ||
+    body.providerKey!==input.providerKey || body.date!==input.date || body.durationMinutes!==contract.durationMinutes ||
+    !['Vagaro','Google Calendar','Supabase'].every(s=>body.verifiedSources?.includes(s)) ||
+    !Array.isArray(body.slots) || !body.slots.includes(input.time))throw Error('CM_MAPPED_SLOT_UNAVAILABLE');
+}
+async function llCmMappedReserveCandidate(c,input,contract) {
+  // Called only by the guarded handler. SQL independently enforces campaign/lead/quote/gates.
+  if(c.campaign_key!==input.campaignKey || c.version!==input.campaignVersion)throw Error('CM_MAPPED_CAMPAIGN_CHANGED');
+  const pro=LLTOUCH_PROFESSIONALS[input.providerKey];
+  if(!pro?.providerId || !pro?.calendarId)throw Error('CM_MAPPED_PROVIDER_INVALID');
+  const w=llTouchAppointmentWindow(input.date,input.time,contract.durationMinutes);
+  if(!w || !Number.isFinite(w.start?.getTime()) || w.start.getTime()<=Date.now()+600000)throw Error('CM_MAPPED_SLOT_UNAVAILABLE');
+  // A retry can find its own active hold. Never skip the remote audit for a new or changed request.
+  const {data:prior,error:pe}=await academySupabase.from('lltouch_cm_universal_holds')
+    .select('state,expires_at,quote_snapshot').eq('campaign_id',c.id).eq('client_nonce',input.clientNonce).maybeSingle();
+  if(pe)throw Error('CM_MAPPED_HOLD_READ_FAILED');
+  if(prior){const q=prior.quote_snapshot||{};
+    if(prior.state!=='held'||Date.parse(prior.expires_at)<=Date.now()||q.mode!=='mapped-service-v1'||
+       q.leadId!==input.leadId||q.providerKey!==input.providerKey||q.serviceId!==contract.serviceId||
+       Date.parse(q.appointmentStart)!==w.start.getTime())throw Error('CM_MAPPED_NONCE_CONFLICT');
+  }else await llCmMappedVerifySlot(contract,input);
+  const {data,error}=await academySupabase.rpc('lltouch_cm_mapped_reserve_v1',{
+    p_campaign_key:c.campaign_key,p_campaign_version:c.version,p_lead_id:input.leadId,
+    p_client_nonce:input.clientNonce,p_provider_key:input.providerKey,p_provider_id:pro.providerId,
+    p_service_id:contract.serviceId,p_start:w.start.toISOString()});
+  if(error)throw Error(/^CM_MAPPED_[A-Z_]+$/.test(error.message||'')?error.message:'CM_MAPPED_RPC_FAILED');
+  if(data?.ok!==true||data.checkoutReady!==false||!LL_CM_03C4_UUID.test(data.holdId||'')||
+    !LL_CM_03C4_UUID.test(data.snapshotId||'')||!Number.isFinite(Date.parse(data.expiresAt)))throw Error('CM_MAPPED_RPC_RESPONSE_INVALID');
+  return {ok:true,holdId:data.holdId,snapshotId:data.snapshotId,expiresAt:data.expiresAt,
+    idempotent:data.idempotent===true,checkoutReady:false,bookingReady:false};
+}
+// A future Stripe caller must read this immutable snapshot from the DB, never from request JSON.
+function llCmMappedCheckoutTerms(snapshot,hold) {
+  const q=snapshot?.immutable_terms||{};
+  if(!snapshot||!hold||hold.id!==snapshot.hold_id||hold.campaign_id!==snapshot.campaign_id||
+    hold.campaign_version!==snapshot.campaign_version||hold.campaign_key!==snapshot.campaign_key||
+    hold.state!=='held'||Date.parse(hold.expires_at)<=Date.now()||!Number.isFinite(Date.parse(hold.expires_at))||
+    q.mode!=='mapped-service-v1'||q.campaignKey!==snapshot.campaign_key||q.campaignVersion!==snapshot.campaign_version||
+    q.currency!=='usd'||snapshot.currency!=='usd'||snapshot.sessions!==1||
+    !Number.isSafeInteger(snapshot.price_cents)||!Number.isSafeInteger(snapshot.deposit_cents)||
+    snapshot.deposit_cents<=0||snapshot.deposit_cents>snapshot.price_cents||q.priceCents!==snapshot.price_cents||
+    q.depositCents!==snapshot.deposit_cents||q.balanceCents!==snapshot.price_cents-snapshot.deposit_cents||
+    !LL_CM_03C4_UUID.test(hold.id)||!LL_CM_03C4_UUID.test(snapshot.id))throw Error('CM_MAPPED_CHECKOUT_TERMS_INVALID');
+  return {amountCents:snapshot.deposit_cents,currency:'usd',
+    idempotencyKey:'llt-cm-mapped-'+snapshot.id,
+    metadata:{cm_scope:'lltouch-cm-mapped-v1',hold_id:hold.id,snapshot_id:snapshot.id,campaign_key:snapshot.campaign_key,
+      campaign_version:String(snapshot.campaign_version)},holdExpiresAt:hold.expires_at};
+}
+app.post('/lltouch/campaigns/mapped-reservation',LL_CM_MAPPED_RATE,async(req,res)=>{
+  res.set('Cache-Control','no-store');
+  // Hard lock: cannot be opened by changing Render variables or campaign metadata alone.
+  if(!LL_CM_MAPPED_RESERVATION_RELEASED)return res.status(403).json({ok:false,error:'CM_MAPPED_RESERVATION_NOT_RELEASED'});
+  if(!llCm3C4PublicOrigin(req)||!llCm3C4Body(req))return res.status(403).json({ok:false,error:'CM_MAPPED_REQUEST_INVALID'});
+  try{const input=llCmMappedSelection(req.body);const c=await llCmMappedReadCampaign(input.campaignKey);
+    if(!llCmMappedReleaseGate(c))return res.status(403).json({ok:false,error:'CM_MAPPED_RESERVATION_DISABLED'});
+    const contract=llCmMappedContract(c);const result=await llCmMappedReserveCandidate(c,input,contract);
+    return res.status(result.idempotent?200:201).json(result);
+  }catch(e){const code=/^CM_MAPPED_[A-Z_]+$/.test(e?.message||'')?e.message:'CM_MAPPED_REQUEST_FAILED';
+    return res.status(409).json({ok:false,error:code});}
+});
+// Administrative, read-only inspection of the persisted campaign plan. No client data.
+app.get('/lltouch/campaigns/admin/api/transactions/mapped-readiness/:key',LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');
+  const key=String(req.params.key||'');if(!LL_CM_DISPLAY_KEY.test(key))return res.status(422).json({ok:false,error:'CM_MAPPED_INPUT_INVALID'});
+  try{const c=await llCmMappedReadCampaign(key);const {serviceId,...contract}=llCmMappedContract(c);
+    return res.json({ok:true,readOnly:true,campaignKey:key,campaignVersion:c.version,status:c.status,contract,
+      reservationReleased:LL_CM_MAPPED_RESERVATION_RELEASED,checkoutReady:false,bookingReady:false,ghlDispatched:false});
+  }catch(e){const code=/^CM_MAPPED_[A-Z_]+$/.test(e?.message||'')?e.message:'CM_MAPPED_REQUEST_FAILED';
+    return res.status(code==='CM_MAPPED_CAMPAIGN_NOT_FOUND'?404:409).json({ok:false,readOnly:true,error:code});}
+});
+// END CM MAPPED RESERVATION BRIDGE
+
+// CM MAPPED CHECKOUT CONTRACT — pure preparation/reconciliation only.
+// No route, Stripe network call, database mutation or release flag is added.
+// The caller must durably reserve issuance, bind the resulting session and
+// reconcile expiry before releasing the slot. Never use directly from HTTP.
+function llCmMappedBuildCheckoutContract(snapshot,hold,now=Date.now()) {
+  const q=snapshot?.immutable_terms||{};
+  const h=hold||{};
+  const start=Date.parse(h.appointment_start),end=Date.parse(h.appointment_end);
+  const expiry=Date.parse(h.expires_at),created=Date.parse(h.created_at);
+  if(!snapshot||h.state!=='held'||h.id!==snapshot.hold_id||h.campaign_id!==snapshot.campaign_id||
+    h.campaign_key!==snapshot.campaign_key||h.campaign_version!==snapshot.campaign_version||
+    !LL_CM_03C4_UUID.test(h.id||'')||!LL_CM_03C4_UUID.test(snapshot.id||'')||
+    !LL_CM_DISPLAY_KEY.test(snapshot.campaign_key||'')||!Number.isSafeInteger(snapshot.campaign_version)||snapshot.campaign_version<1||
+    q.mode!=='mapped-service-v1'||q.campaignKey!==snapshot.campaign_key||q.campaignVersion!==snapshot.campaign_version||
+    q.currency!=='usd'||snapshot.currency!=='usd'||snapshot.sessions!==1||
+    !Number.isSafeInteger(snapshot.price_cents)||!Number.isSafeInteger(snapshot.deposit_cents)||
+    snapshot.deposit_cents<=0||snapshot.price_cents<snapshot.deposit_cents||
+    q.priceCents!==snapshot.price_cents||q.depositCents!==snapshot.deposit_cents||q.balanceCents!==snapshot.price_cents-snapshot.deposit_cents||
+    !Number.isSafeInteger(q.durationMinutes)||q.durationMinutes<10||q.durationMinutes>240||
+    !Number.isFinite(start)||!Number.isFinite(end)||end-start!==q.durationMinutes*60000||
+    Date.parse(q.appointmentStart)!==start||Date.parse(q.appointmentEnd)!==end||
+    q.providerKey!==h.provider_key||!['ludimilla','carol'].includes(h.provider_key)||
+    !Number.isFinite(now)||!Number.isFinite(expiry)||!Number.isFinite(created)||expiry<=now||start<=expiry||
+    q.holdMinutes!==10||expiry-created<599000||expiry-created>900000||!LL_CM_03C4_UUID.test(q.leadId||'')||
+    typeof q.serviceName!=='string'||q.serviceName.trim().length<3||q.serviceName.length>160||
+    !isValidEmail(String(h.customer_email||''))) throw Error('CM_MAPPED_CHECKOUT_CONTRACT_INVALID');
+  // Stable expiry derived from the immutable hold, not from wall clock on retry.
+  // Checkout may remain open beyond the ten-minute offer timer. A durable
+  // expiry/reconciliation worker is mandatory; do not free the slot on timer alone.
+  const stripeExpiresAt=Math.floor(expiry/1000)+1860;
+  const metadata={cm_scope:'lltouch-cm-mapped-v1',hold_id:h.id,snapshot_id:snapshot.id,
+    campaign_key:snapshot.campaign_key,campaign_version:String(snapshot.campaign_version)};
+  return {holdExpiresAt:h.expires_at,stripeExpiresAt,amountCents:snapshot.deposit_cents,
+    idempotencyKey:'llt-cm-mapped-'+snapshot.id,
+    params:{mode:'payment',payment_method_types:['card'],expires_at:stripeExpiresAt,
+      customer_email:h.customer_email,allow_promotion_codes:false,
+      line_items:[{quantity:1,price_data:{currency:'usd',unit_amount:snapshot.deposit_cents,
+        product_data:{name:q.serviceName+' — reservation deposit',description:'Deposit toward your promotional treatment. Appointment confirmation follows payment verification.'}}}],
+      metadata,payment_intent_data:{metadata:{...metadata}},
+      success_url:'https://lltouch.com/offer-reserve?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url:'https://lltouch.com/offer-reserve?cancelled=1'}};
+}
+function llCmMappedReconcileCheckoutContract({snapshot,hold,session,paymentIntent,expectedLiveMode}) {
+  // This is a classification, not a booking or refund authorization. Inputs
+  // must be retrieved by the backend after signed webhook authentication.
+  const review=reason=>({action:'review',reason,bookingAuthorized:false});
+  const q=snapshot?.immutable_terms||{};
+  const h=hold||{},s=session||{},pi=paymentIntent||{},m=s.metadata||{},pm=pi.metadata||{};
+  if(typeof expectedLiveMode!=='boolean'||s.livemode!==expectedLiveMode||s.object!=='checkout.session'||
+    typeof s.id!=='string'||!s.id.startsWith(expectedLiveMode?'cs_live_':'cs_test_')||
+    !h.stripe_session_id||s.id!==h.stripe_session_id||!snapshot||h.id!==snapshot.hold_id||
+    h.campaign_id!==snapshot.campaign_id||h.campaign_key!==snapshot.campaign_key||h.campaign_version!==snapshot.campaign_version||
+    q.mode!=='mapped-service-v1'||q.campaignKey!==snapshot.campaign_key||q.campaignVersion!==snapshot.campaign_version||
+    snapshot.currency!=='usd'||q.currency!=='usd'||!Number.isSafeInteger(snapshot.price_cents)||
+    !Number.isSafeInteger(snapshot.deposit_cents)||snapshot.deposit_cents<=0||snapshot.price_cents<snapshot.deposit_cents||
+    q.priceCents!==snapshot.price_cents||q.depositCents!==snapshot.deposit_cents||q.balanceCents!==snapshot.price_cents-snapshot.deposit_cents||
+    s.mode!=='payment'||s.currency!=='usd'||s.amount_total!==snapshot.deposit_cents||
+    m.cm_scope!=='lltouch-cm-mapped-v1'||m.hold_id!==h.id||m.snapshot_id!==snapshot.id||
+    m.campaign_key!==snapshot.campaign_key||m.campaign_version!==String(snapshot.campaign_version))return review('SESSION_OR_TERMS_MISMATCH');
+  if(s.payment_status!=='paid') {
+    // Even an expired Checkout may have a processing payment. Only a
+    // definitively cancelled/no-payment Intent can be considered for release.
+    if(s.status==='expired'&&s.payment_status==='unpaid'&&((s.payment_intent===null)||(pi.id===s.payment_intent&&pi.status==='canceled'&&pi.livemode===expectedLiveMode&&pi.amount_received===0)))
+      return {action:'expiry_candidate',reason:'STRIPE_CLOSED_UNPAID',bookingAuthorized:false};
+    return {action:'wait',reason:'PAYMENT_NOT_CONFIRMED',bookingAuthorized:false};
+  }
+  if(s.status!=='complete'||!['checkout','paid','processing','confirmed','review','expired','cancelled','refunded'].includes(h.state)||
+    typeof s.payment_intent!=='string'||pi.id!==s.payment_intent||pi.livemode!==expectedLiveMode||
+    pi.status!=='succeeded'||pi.currency!=='usd'||pi.amount_received!==snapshot.deposit_cents||
+    !Object.keys(m).filter(k=>['cm_scope','hold_id','snapshot_id','campaign_key','campaign_version'].includes(k)).every(k=>pm[k]===m[k]))return review('PAYMENT_INTENT_MISMATCH');
+  const charge=pi.latest_charge;
+  if(!charge||typeof charge==='string'||charge.paid!==true||charge.captured!==true||charge.status!=='succeeded'||
+    charge.livemode!==expectedLiveMode||charge.amount!==snapshot.deposit_cents||charge.currency!=='usd'||charge.refunded!==false||charge.amount_refunded!==0||
+    !Number.isSafeInteger(charge.created)||charge.created<=0)return review('CHARGE_NOT_VERIFIED');
+  const paidAt=charge.created*1000,expires=Date.parse(h.expires_at),created=Date.parse(h.created_at);
+  if(!Number.isFinite(expires)||!Number.isFinite(created)||paidAt<Math.floor(created/1000)*1000||paidAt>=expires||['expired','cancelled','refunded','review'].includes(h.state))return review('LATE_OR_CLOSED_HOLD_PAYMENT');
+  if(['paid','processing','confirmed'].includes(h.state))return {action:'already_reconciled',reason:'REPLAY_OR_IN_PROGRESS',bookingAuthorized:false};
+  // A DB transaction must transition checkout -> paid exactly once and a
+  // worker must revalidate the slot before booking. No booking here.
+  return {action:'paid_candidate',reason:'VERIFIED_DEPOSIT_IN_WINDOW',paidAt:new Date(paidAt).toISOString(),bookingAuthorized:false};
+}
+// END CM MAPPED CHECKOUT CONTRACT
+
+
 
 app.get('/lltouch/campaigns/admin/api/transactions/vagaro-catalog/:key',
   LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_REMOTE_AUDIT_LIMITER,async(req,res)=>{
