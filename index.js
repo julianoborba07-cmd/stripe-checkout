@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
+import { buildHydraBridge, hydraBridgeHtml, makeHydraQaDraft } from "./lltouch-hydrafacial-bridge-qa.mjs";
 import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
 
 dotenv.config();
@@ -5464,7 +5465,7 @@ const LL_CM_LIFECYCLE_HTML = String.raw`<!doctype html>
 *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;line-height:1.5}a{color:inherit}button,select,input{font:inherit}button{cursor:pointer}.shell{max-width:1240px;margin:auto;padding:36px 24px 90px}.top{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}.brand{font-size:12px;font-weight:700;letter-spacing:.18em;color:var(--copper)}.nav{display:flex;gap:10px;flex-wrap:wrap}.nav a{padding:9px 13px;text-decoration:none;border:1px solid var(--stroke);border-radius:30px;background:var(--surface);font-size:12px}.nav a:hover{border-color:var(--copper)}h1,h2{font-family:Georgia,"Times New Roman",serif;font-weight:500}h1{font-size:clamp(30px,4vw,52px);line-height:1.1;margin:23px 0 10px}h2{font-size:23px;margin:0}.sub{max-width:700px;color:var(--muted);font-size:14px;margin:0 0 20px}.notice{border-left:3px solid var(--copper);background:#ebe4db;padding:13px 17px;font-size:13px;margin:22px 0 26px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:0 0 28px}.stat,.panel{background:var(--surface);border:1px solid var(--stroke);border-radius:10px}.stat{padding:18px 20px}.stat .n{font-family:Georgia,serif;font-size:35px;line-height:1.1}.stat .l{font-size:12px;color:var(--muted);margin-top:5px}.workspace{display:grid;grid-template-columns:minmax(330px,1.15fr) minmax(320px,.85fr);gap:18px;align-items:start}.panel{padding:23px}.panelhead{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:18px}.muted{color:var(--muted)}.small{font-size:12px}.filters{display:grid;grid-template-columns:1fr 170px 170px;gap:9px;margin:0 0 12px}.filters input,.filters select{min-width:0;width:100%;border:1px solid var(--stroke);background:#fff;padding:10px 11px;border-radius:6px;font-size:13px;color:var(--ink)}.btn{padding:9px 14px;border:1px solid var(--stroke);border-radius:6px;background:var(--surface);color:var(--ink);font-weight:600;font-size:12px}.btn:hover{border-color:var(--copper)}.list{display:grid;gap:10px}.item{width:100%;text-align:left;border:1px solid var(--stroke);background:#fff;border-radius:8px;padding:15px 16px;display:grid;gap:8px}.item:hover,.item.selected{border-color:var(--copper);background:#faf6f1}.itemtitle{font-weight:700;font-size:14px}.itemmeta{font-size:12px;color:var(--muted);overflow-wrap:anywhere}.chips{display:flex;gap:7px;flex-wrap:wrap}.chip{display:inline-flex;align-items:center;border-radius:20px;border:1px solid #ddd2c6;padding:3px 9px;font-size:11px;color:#514139}.chip.test{background:#f1ece5}.chip.commercial{background:#e6eee7;color:var(--ok);border-color:#c8dfcb}.chip.published{background:#e7efe8;color:var(--ok)}.chip.archived{color:#6b6b6b}.chip.scheduled{background:#f5eee1;color:#855e25}.chip.paused{background:#f2e6de;color:#815132}.empty{font-size:13px;color:var(--muted);padding:24px;border:1px dashed var(--stroke);border-radius:8px}.detailgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0 20px}.detailcell{padding:12px;background:#f8f5f1;border-radius:6px;min-width:0}.detailcell .label{font-size:11px;color:var(--muted)}.detailcell .value{font-size:13px;font-weight:600;word-break:break-word;margin-top:3px}.preflight{border-top:1px solid var(--stroke);padding-top:18px;margin-top:18px}.issue{margin:8px 0 0;padding:9px 12px;border-radius:6px;background:#f6efe8;color:#7b4e2f;font-size:12px}.good{color:var(--ok)}.warning{color:var(--warn)}.foot{margin-top:28px;color:var(--muted);font-size:11px}.error{color:#9b3830}.sr{position:absolute;width:1px;height:1px;clip:rect(0,0,0,0);overflow:hidden}
 @media(max-width:980px){.workspace{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.shell{padding:25px 14px 70px}.filters{grid-template-columns:1fr}.detailgrid{grid-template-columns:1fr 1fr}.panel{padding:17px}}
 </style></head><body><div class="shell">
-<header class="top"><div class="brand">LL TOUCH · CAMPAIGN STUDIO</div><nav class="nav" aria-label="Ferramentas existentes"><a href="/lltouch/campaigns/admin">Capas</a><a href="/lltouch/campaigns/admin/editor">Editor</a></nav></header>
+<header class="top"><div class="brand">LL TOUCH · CAMPAIGN STUDIO</div><nav class="nav" aria-label="Ferramentas existentes"><a href="/lltouch/campaigns/admin">Capas</a><a href="/lltouch/campaigns/admin/editor">Editor</a><a href="/lltouch/campaigns/admin/hydrafacial">HydraFacial QA</a></nav></header>
 <main><h1>Campaign Lifecycle</h1><p class="sub">Visão centralizada das campanhas cadastradas, sua finalidade e o estado de publicação. Os dados vêm do Supabase configurado para este serviço.</p>
 <div class="notice"><strong>04A.13A — Painel somente leitura.</strong> Não publica ofertas, não cria campanhas, não altera status nem aciona Stripe, GHL, Vagaro ou calendários. Nesta etapa, a URL é exclusiva do serviço QA.</div>
 <section class="stats" aria-label="Indicadores"><div class="stat"><div class="n" id="total">—</div><div class="l">Campanhas cadastradas</div></div><div class="stat"><div class="n" id="internal">—</div><div class="l">Testes internos</div></div><div class="stat"><div class="n" id="commercial">—</div><div class="l">Finalidade comercial</div></div><div class="stat"><div class="n" id="published">—</div><div class="l">Status publicada</div></div></section>
@@ -5499,6 +5500,89 @@ app.get('/lltouch/campaigns/admin/lifecycle',LL_CM_ADMIN_LIMITER,llCmAdminAuth,(
   res.type('html').send(LL_CM_LIFECYCLE_HTML.replace('__NONCE__',nonce));
 });
 // END 04A.13A — No writes, status changes or integrations.
+
+// ===========================================================================
+// RECOVERY HYDRAFACIAL / QA: campaign DB -> original legacy offer contract.
+// PRIVATE adapter. ONLY writes a test draft, NEVER touches legacy checkout, GHL, webhooks or calendar.
+// ===========================================================================
+function llCmHydraBridgeQaAllowed(){
+  return process.env.LLTOUCH_CM_QA_ISOLATED==='true' &&
+    process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true' &&
+    process.env.LLTOUCH_CM_GHL_SYNC_ENABLED!=='true' &&
+    process.env.LLTOUCH_CM_PUBLIC_LEADS_ENABLED!=='true' &&
+    process.env.LLTOUCH_OFFER_ENABLED!=='true' &&
+    process.env.LLTOUCH_GHL_ENABLED!=='true' &&
+    /^sk_test_/.test(String(process.env.STRIPE_SECRET_KEY||''));
+}
+app.get('/lltouch/campaigns/admin/hydrafacial',LL_CM_ADMIN_LIMITER,llCmAdminAuth,(_req,res)=>{
+  if(!llCmHydraBridgeQaAllowed())return res.status(404).end();
+  const nonce=crypto.randomBytes(18).toString('base64');
+  res.set('Cache-Control','private, no-store, max-age=0');
+  res.set('X-Robots-Tag','noindex, nofollow');
+  res.set('Referrer-Policy','no-referrer');
+  res.set('Content-Security-Policy',`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`);
+  return res.type('html').send(hydraBridgeHtml().replace('__NONCE__',nonce));
+});
+app.get('/lltouch/campaigns/admin/api/reuse/hydrafacial/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private, no-store, max-age=0');
+  if(!llCmHydraBridgeQaAllowed())return res.status(404).json({ok:false});
+  const key=String(req.params.key||'');
+  if(!/^[a-z0-9][a-z0-9-]{3,95}$/.test(key))return res.status(422).json({ok:false,error:'Chave inválida.'});
+  try{
+    const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+      .select('id,campaign_key,internal_name,version,status,campaign_purpose,service_title,site_item,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing,provider_keys,preferred_booking_enabled')
+      .eq('campaign_key',key).maybeSingle();
+    if(error)throw error;
+    if(!c)return res.status(404).json({ok:false,error:'Campanha não encontrada.'});
+    const {data:assets,error:assetError}=await academySupabase.from('lltouch_campaign_assets')
+      .select('asset_type,device,position,image_url')
+      .eq('campaign_id',c.id).eq('asset_type','hero');
+    if(assetError)throw assetError;
+    let svc;
+    try{svc=resolveVagaroServiceFromSiteItem(c.site_item);}catch{svc=null;}
+    return res.json(buildHydraBridge(c,assets||[],{
+      vagaroMappingReady:!!svc?.serviceId && svc?.unsupportedAddOn!==true &&
+        Number.isSafeInteger(svc?.bookingDurationMinutes)&&svc.bookingDurationMinutes>0,
+      legacyCampaignKey:LLTOUCH_OFFER.campaignKey
+    }));
+  }catch(e){console.error('HydraFacial QA bridge read failed:',String(e?.message||e).slice(0,100));
+    return res.status(503).json({ok:false,error:'Consulta de compatibilidade indisponível.'});}
+});
+// The ONLY QA write: create a new, isolated INTERNAL_TEST DRAFT.
+// This never changes status to published and does not call any integration.
+app.post('/lltouch/campaigns/admin/api/reuse/hydrafacial/draft',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private, no-store');
+  if(!llCmHydraBridgeQaAllowed())return res.status(404).json({ok:false});
+  if(!llCmAdminSameOrigin(req))return res.status(403).json({ok:false,error:'Origem inválida.'});
+  if(!/^application\/json(?:;|$)/i.test(String(req.get('content-type')||'')))
+    return res.status(415).json({ok:false,error:'Envie JSON.'});
+  let row;
+  try{
+    const service=resolveVagaroServiceFromSiteItem(LLTOUCH_OFFER.siteItem);
+    row=makeHydraQaDraft(req.body,LLTOUCH_OFFER,{
+      bookingDurationMinutes:service?.bookingDurationMinutes
+    });
+  }catch(e){return res.status(422).json({ok:false,error:String(e?.message||e).slice(0,130)});}
+  try{
+    const {data,error}=await academySupabase.from('lltouch_campaigns')
+      .insert(row).select('campaign_key,version,status,campaign_purpose').single();
+    if(error){
+      if(String(error?.code)==='23505')return res.status(409).json({ok:false,error:'Identificador já existe. Escolha outro.'});
+      throw error;
+    }
+    if(data?.campaign_purpose!=='internal_test'||data?.status!=='draft')
+      throw Error('Unexpected draft status');
+    return res.status(201).json({ok:true,campaignKey:data.campaign_key,
+      version:data.version,status:data.status,campaignPurpose:data.campaign_purpose,
+      published:false,checkoutReady:false,bookingReady:false});
+  }catch(e){console.error('Hydra QA draft creation failed:',String(e?.message||e).slice(0,110));
+    return res.status(503).json({ok:false,error:'Rascunho não confirmado no PREVIEW.'});}
+});
+// No checkout/booking/status release routes changed.
+// ===========================================================================
+
 
 app.get('/lltouch/campaigns/admin/api/campaigns',LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
   try{
