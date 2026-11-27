@@ -6,6 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
 import { buildHydraBridge, hydraBridgeHtml, makeHydraQaDraft } from "./lltouch-hydrafacial-bridge-qa.mjs";
+import { makeHydraStripeQaCheckout, verifyHydraStripeQaSession } from "./lltouch-hydra-stripe-qa.mjs";
 import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
 
 dotenv.config();
@@ -388,6 +389,13 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    // QA Hydra checkout sessions are NOT legacy /offer bookings. Never let
+    // payment events fall into the generic business booking/CRM webhook.
+    if (event.data.object?.metadata?.cm_scope === 'lltouch-hydra-bridge-test-qa-v1') {
+      if(event.livemode!==false || event.data.object?.livemode!==false)
+        return res.status(400).json({received:false,error:'QA_MODE_MISMATCH'});
+      return res.json({received:true,qaOnly:true,noBooking:true,noGhlCall:true});
+    }
     // Reusable LL Touch /offer funnel, isolated from PWYC and legacy HydraFacial orders.
     if (event.data.object?.metadata?.offer_flow === 'lltouch-offer-v2') {
       try {
@@ -5580,6 +5588,72 @@ app.post('/lltouch/campaigns/admin/api/reuse/hydrafacial/draft',
   }catch(e){console.error('Hydra QA draft creation failed:',String(e?.message||e).slice(0,110));
     return res.status(503).json({ok:false,error:'Rascunho não confirmado no PREVIEW.'});}
 });
+
+// ===========================================================================
+// HYDRAFACIAL 149 / QA — STRIPE TEST ONLY. Reuses a verified Campaign Studio
+// quote. No public intake, legacy claim mutation, Vagaro/Calendar or GHL.
+// No authorization for production checkout/booking is implied.
+// ===========================================================================
+const llCmHydraStripeTestLimiter=rateLimit({windowMs:15*60*1000,max:3,
+  standardHeaders:'draft-7',legacyHeaders:false});
+function llCmHydraStripeQaEnabled(){
+  return llCmHydraBridgeQaAllowed() &&
+    process.env.LLTOUCH_CM_HYDRA_STRIPE_TEST_ENABLED==='true';
+}
+async function llCmHydraStripeQaBridge(key){
+  if(key!=='hydrafacial-piloto-qa')throw new Error('QA_PILOT_KEY_MISMATCH');
+  const {data:c,error}=await academySupabase.from('lltouch_campaigns')
+    .select('id,campaign_key,version,status,campaign_purpose,service_title,site_item,regular_price_cents,price_cents,deposit_cents,hold_minutes,offer_starts_at,offer_ends_at,timezone,offer_label,marketing,provider_keys,preferred_booking_enabled')
+    .eq('campaign_key',key).maybeSingle();
+  if(error||!c)throw new Error('QA_CAMPAIGN_UNAVAILABLE');
+  const {data:assets,error:assetError}=await academySupabase.from('lltouch_campaign_assets')
+    .select('asset_type,device,position,image_url')
+    .eq('campaign_id',c.id).eq('asset_type','hero');
+  if(assetError)throw new Error('QA_CAMPAIGN_MEDIA_UNAVAILABLE');
+  let svc;
+  try{svc=resolveVagaroServiceFromSiteItem(c.site_item);}catch{svc=null;}
+  return buildHydraBridge(c,assets||[],{
+    vagaroMappingReady:!!svc?.serviceId && svc?.unsupportedAddOn!==true &&
+      Number.isSafeInteger(svc?.bookingDurationMinutes)&&svc.bookingDurationMinutes>0,
+    legacyCampaignKey:LLTOUCH_OFFER.campaignKey
+  });
+}
+app.post('/lltouch/campaigns/admin/api/reuse/hydrafacial/stripe-test/:key',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,llCmHydraStripeTestLimiter,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');
+  if(!llCmHydraStripeQaEnabled())return res.status(403).json({ok:false,error:'Stripe TEST ainda não está habilitado neste QA.'});
+  if(!llCmAdminSameOrigin(req))return res.status(403).json({ok:false,error:'Origem inválida.'});
+  if(!/^application\/json(?:;|$)/i.test(String(req.get('content-type')||'')) ||
+     !req.body || Array.isArray(req.body) || Object.keys(req.body).length!==0)
+    return res.status(422).json({ok:false,error:'Envie JSON vazio: {}.'});
+  try{
+    const bridge=await llCmHydraStripeQaBridge(String(req.params.key||''));
+    const q=makeHydraStripeQaCheckout(bridge,{nonce:crypto.randomUUID()});
+    const session=await stripe.checkout.sessions.create(q.payload,{idempotencyKey:q.idempotencyKey});
+    const checked=verifyHydraStripeQaSession(session);
+    if(!/^https:\/\/checkout\.stripe\.com\//.test(String(session.url||'')))
+      throw new Error('QA_CHECKOUT_URL_UNEXPECTED');
+    return res.json({ok:true,qaOnly:true,testMode:true,url:session.url,
+      sessionId:checked.sessionId,campaignKey:checked.campaignKey,
+      campaignVersion:checked.campaignVersion,depositCents:2500,offerCents:14900,
+      bookingReady:false,checkoutLive:false,noGhlCall:true});
+  }catch(e){console.error('Hydra Stripe QA TEST rejected:',String(e?.message||e).slice(0,110));
+    return res.status(409).json({ok:false,error:'Stripe TEST indisponível: confira o contrato de US$149, as datas e o isolamento QA.'});}
+});
+app.get('/lltouch/campaigns/admin/api/reuse/hydrafacial/stripe-test/status',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');
+  if(!llCmHydraStripeQaEnabled())return res.status(403).json({ok:false,error:'QA desabilitado.'});
+  const id=String(req.query.session_id||'');
+  if(!/^cs_test_[A-Za-z0-9_]{10,180}$/.test(id))
+    return res.status(422).json({ok:false,error:'Sessão TEST inválida.'});
+  try{
+    return res.json(verifyHydraStripeQaSession(await stripe.checkout.sessions.retrieve(id)));
+  }catch(e){console.error('Hydra QA session status:',String(e?.message||e).slice(0,80));
+    return res.status(404).json({ok:false,error:'Sessão TEST não confirmada.'});}
+});
+// END HYDRAFACIAL STRIPE QA. Legacy /lltouch/offer/* handlers are untouched.
+
 // No checkout/booking/status release routes changed.
 // ===========================================================================
 
