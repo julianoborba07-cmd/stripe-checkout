@@ -8189,6 +8189,93 @@ function llCmAuditSafeError(e,res,label){
   return res.status(Number.isInteger(e?.status)?e.status:503)
     .json({ok:false,error:e?.status?e.message:'Falha na consulta remota. Verifique os logs seguros do Render.'});
 }
+// BEGIN CM RELEASE AVAILABILITY AUDIT — admin only; no writes or Stripe.
+const LL_CM_RELEASE_AVAIL_RATE = rateLimit({windowMs:15*60*1000,max:10,
+  standardHeaders:'draft-7',legacyHeaders:false});
+app.get('/lltouch/campaigns/admin/api/availability-audit',
+  LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_RELEASE_AVAIL_RATE,async(req,res)=>{
+    res.set('Cache-Control','private,no-store');
+    res.set('Referrer-Policy','no-referrer');
+    const fail=(status,error)=>res.status(status).json({ok:false,readOnly:true,error});
+    const serviceKey=String(req.query.service||''),providerKey=String(req.query.provider||''),date=String(req.query.date||'');
+    const option=LL_CM_SERVICE_OPTIONS.find(s=>s.key===serviceKey);
+    const t=Date.parse(date+'T12:00:00Z');
+    const today=llCmTodayNY();
+    if(!option||!LL_CM_CAMPAIGN_PROVIDER_KEYS.includes(providerKey)||
+       !/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isFinite(t)||
+       new Date(t).toISOString().slice(0,10)!==date||date<today||date>academyAddDaysISO(today,27))
+      return fail(422,'INVALID_SERVICE_PROVIDER_OR_DATE');
+    if(!llTouchAppointmentsReadiness())return fail(503,'INTEGRATIONS_NOT_CONFIGURED');
+    const pro=LLTOUCH_PROFESSIONALS[providerKey];
+    const svc=resolveVagaroServiceFromSiteItem(option.siteItem);
+    const duration=svc?.bookingDurationMinutes;
+    if(!pro?.providerId||!pro?.calendarId||!svc?.serviceId||llTouchBookingNeedsManualScheduling(svc)||
+       !Number.isSafeInteger(duration)||duration<10||duration>240||(svc.addOnIds||[]).length)
+      return fail(409,'SERVICE_OR_PROVIDER_MAPPING_INCOMPLETE');
+    const result=(slots,verifiedSources,extra={})=>res.json({ok:true,readOnly:true,serviceKey,providerKey,date,
+      timezone:'America/New_York',durationMinutes:duration,slots,verifiedSources,
+      noHold:true,noBooking:true,noPayment:true,noGhlCall:true,...extra});
+    if(new Date(t).getUTCDay()===0)return result([],[],{closed:true,reason:'SUNDAY_CLOSED'});
+    let stage='VAGARO_CATALOG';
+    try{
+      const {rows}=await llCmReadVagaroCatalog();
+      const matches=rows.filter(r=>r.id===svc.serviceId);
+      if(matches.length!==1)return fail(409,'VAGARO_SERVICE_NOT_UNIQUE');
+      const performers=matches[0].performers.filter(p=>p.id===pro.providerId);
+      if(performers.length!==1)return fail(409,'VAGARO_PROVIDER_NOT_UNIQUE_OR_NOT_ASSIGNED');
+      if(performers[0].minutes!==duration)
+        return res.status(409).json({ok:false,readOnly:true,error:'VAGARO_DURATION_MISMATCH',
+          configuredMinutes:duration,vagaroMinutes:Number.isFinite(performers[0].minutes)?performers[0].minutes:null});
+      stage='TIMEZONE';
+      const from=zonedAcademyDateToUtc(date,'00:00','America/New_York');
+      const until=zonedAcademyDateToUtc(academyAddDaysISO(date,1),'00:00','America/New_York');
+      if(!Number.isFinite(from?.getTime())||!Number.isFinite(until?.getTime())||until<=from)throw Error('invalid window');
+      const start=from.toISOString(),end=until.toISOString();
+      stage='VAGARO_AVAILABILITY';
+      const vagaro=await searchVagaroAvailability({date,serviceId:svc.serviceId,addOnIds:[],serviceProviderId:pro.providerId});
+      if(!Array.isArray(vagaro?.data)||vagaro.data.length>100)throw Error('unexpected availability');
+      stage='GOOGLE_CALENDAR';
+      const busy=await llTouchBusyEventsForCalendar(date,pro.calendarId,true);
+      stage='SUPABASE_LEDGER';
+      const ledger=await llCm3C3ReadOccupiedWindows(providerKey,start,end);
+      stage='SUPABASE_LEGACY_HOLDS';
+      const legacy=await academySupabase.from('lltouch_offer_claims')
+        .select('state,hold_expires_at,starts_at,ends_at').eq('provider_id',pro.providerId)
+        .in('state',['held','checkout','paid','processing','confirmed','review'])
+        .lt('starts_at',end).gt('ends_at',start).limit(501);
+      if(legacy.error||!Array.isArray(legacy.data)||legacy.data.length>=501)throw Error('legacy ledger unavailable');
+      stage='FILTER';
+      const now=Date.now();
+      const ranges=[];
+      const add=(a,b)=>{if(a==null||b==null)throw Error('missing interval');
+        const x=new Date(a).getTime(),y=new Date(b).getTime();
+        if(!Number.isFinite(x)||!Number.isFinite(y)||y<=x)throw Error('invalid interval');
+        ranges.push([x,y]);};
+      const active=(state,expiry)=>{if(state!=='held')return true;
+        const x=Date.parse(expiry||'');if(!Number.isFinite(x))throw Error('invalid expiry');return x>now;};
+      if(!Array.isArray(busy)||busy.length>3000)throw Error('invalid calendar response');
+      for(const b of busy)add(b.start,b.end);
+      for(const a of ledger.appointments)add(a.starts_at,a.ends_at);
+      for(const h of ledger.holds)if(active(h.state,h.expires_at))add(h.appointment_start,h.appointment_end);
+      for(const h of legacy.data)if(active(h.state,h.hold_expires_at))add(h.starts_at,h.ends_at);
+      const candidates=llCm3C3DeduplicateTimes(vagaro,date);
+      if(candidates.length>288)throw Error('too many candidates');
+      const minute=s=>{if(!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(s||''))return NaN;
+        const [h,m]=s.split(':').map(Number);return h*60+m;};
+      const slots=candidates.filter(time=>{
+        const m=minute(time);if(!Number.isFinite(m)||m<540||m>=1080)return false;
+        const w=llTouchAppointmentWindow(date,time,duration);
+        if(!w||w.endWallClock?.date!==date||!Number.isFinite(w.start?.getTime())||!Number.isFinite(w.end?.getTime())||w.end<=w.start)return false;
+        const last=minute(w.endWallClock.time);
+        if(!Number.isFinite(last)||last>1080||w.start.getTime()<now+600000)return false;
+        return !ranges.some(([a,b])=>w.start.getTime()<b&&w.end.getTime()>a);
+      });
+      return result(slots,['Vagaro','Google Calendar','Supabase'],{candidateCount:candidates.length});
+    }catch(_e){console.error('CM release availability audit failed:',stage);
+      return fail(503,'AVAILABILITY_'+stage+'_UNAVAILABLE');}
+});
+// END CM RELEASE AVAILABILITY AUDIT
+
 app.get('/lltouch/campaigns/admin/api/transactions/vagaro-catalog/:key',
   LL_CM_ADMIN_LIMITER,llCmAdminAuth,LL_CM_REMOTE_AUDIT_LIMITER,async(req,res)=>{
   try{
