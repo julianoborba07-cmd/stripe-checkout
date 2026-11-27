@@ -88,8 +88,8 @@ export function makeHydraQaDraft(input,legacy,opts={}){
     new Date(d+'T12:00:00Z').toISOString().slice(0,10)===d;
   const start=input.startDate.trim(),end=input.endDate.trim();
   if(!validDate(start)||!validDate(end)||end<start||
-    Date.parse(end+'T00:00:00Z')-Date.parse(start+'T00:00:00Z')>31*86400000)
-    throw Error('Invalid campaign dates');
+    Date.parse(end+'T00:00:00Z')-Date.parse(start+'T00:00:00Z')>44*86400000)
+    throw Error('Período inválido: escolha datas válidas, com até 45 dias corridos incluindo o último dia.');
   const now=Number.isFinite(opts.nowMs)?opts.nowMs:Date.now();
   const parts=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(now);
   const p=Object.fromEntries(parts.map(x=>[x.type,x.value]));
