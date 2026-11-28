@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import {createRecoverySeedWorker} from "./lltouch-cm-recovery-seed-v1.mjs";
 import {recoveryBase as llCmRecoveryBase,classifyMappedEvidence as llCmRecoveryEvidence,recoveryFinal as llCmRecoveryFinal} from "./lltouch-cm-recovery-v1.mjs";
 import {externalPaymentEvidence as llCmExternalPaymentEvidence} from "./lltouch-cm-external-payment-v1.mjs";
+import {bookingLedgerEvidence as llCmBookingLedgerEvidence} from "./lltouch-cm-booking-evidence-v1.mjs";
 import { fileURLToPath as llCmWebflowFileURLToPath } from "node:url";
 import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
 
@@ -15489,6 +15490,10 @@ async function llCmRecoveryMappedAudit(c,leadId){
   const [holds,legacyBindings]=await Promise.all([
     many('lltouch_cm_universal_holds','*',{campaign_id:c.id,'quote_snapshot->>leadId':leadId}),
     many('lltouch_cm_lead_stripe_sessions','stripe_session_id',{lead_id:leadId})]);
+  // Positive suppression only: reuse existing paid appointment ledger; no booking mutation.
+  const booking=await llCmBookingLedgerEvidence({db:academySupabase,campaign:c,lead:l,holds,legacyBindings});
+  if(booking.status!=='unknown'||booking.reason!=='BOOKING_LEDGER_NO_MATCH_NOT_PROOF')return booking;
+  // Absence of a ledger row does not establish absence of a native Vagaro appointment.
   let payment=llCmRecoveryEvidence({holds,legacyBindings,verdicts:[]});
   if(payment.reason!=='PAYMENT_UNKNOWN_OR_IN_PROGRESS'||holds.some(h=>h.state!=='expired'||!h.stripe_session_id))return payment;
   const verdicts=[];
