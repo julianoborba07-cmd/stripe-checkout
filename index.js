@@ -9,6 +9,7 @@ import {createRecoverySeedWorker} from "./lltouch-cm-recovery-seed-v1.mjs";
 import {recoveryBase as llCmRecoveryBase,classifyMappedEvidence as llCmRecoveryEvidence,recoveryFinal as llCmRecoveryFinal} from "./lltouch-cm-recovery-v1.mjs";
 import {externalPaymentEvidence as llCmExternalPaymentEvidence} from "./lltouch-cm-external-payment-v1.mjs";
 import {bookingLedgerEvidence as llCmBookingLedgerEvidence} from "./lltouch-cm-booking-evidence-v1.mjs";
+import {authorizeRecoveryCallback as llCmAuthorizeRecoveryCallback} from "./lltouch-cm-recovery-authorize-v1.mjs";
 import { fileURLToPath as llCmWebflowFileURLToPath } from "node:url";
 import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
 
@@ -15550,6 +15551,47 @@ if(llCmMappedRecoverySeedEnabled()){
   const startup=setTimeout(()=>{void run();},15000);startup.unref?.();
 }
 // END CM MAPPED RECOVERY SEED WORKER
+
+// BEGIN CM FINAL04 RECOVERY AUTHORIZATION CANDIDATE — no live release.
+const LL_CM_RECOVERY_CALLBACK_RELEASED=false;
+const llCmRecoveryCallbackLiveEnabled=()=>LL_CM_RECOVERY_CALLBACK_RELEASED &&
+  process.env.LLTOUCH_CM_RECOVERY_CALLBACK_ENABLED==='true' &&
+  process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='false' &&
+  process.env.LLTOUCH_CM_RECOVERY_CALLBACK_QA_ENABLED!=='true' &&
+  process.env.LLTOUCH_CM_WEBFLOW_QA_ENABLED!=='true' &&
+  process.env.LLTOUCH_CM_03C11G_PRIVATE_QA_ENABLED!=='true';
+const llCmRecoveryCallbackLimiter=rateLimit({windowMs:60000,max:60,standardHeaders:'draft-7',legacyHeaders:false,
+  message:{authorized:false,mapping_only:false,reason:'RATE_LIMITED',recovery_message:''}});
+app.post('/lltouch/campaigns/recovery/authorize/v1',llCmRecoveryCallbackLimiter,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+  const one=async(table,columns,filters)=>{let q=academySupabase.from(table).select(columns);for(const [k,v] of Object.entries(filters))q=q.eq(k,v);const {data,error}=await q.maybeSingle();if(error)throw Error('RECOVERY_CONTEXT_UNAVAILABLE');return data;};
+  const result=await llCmAuthorizeRecoveryCallback({
+    body:req.is('application/json')?req.body:null,authorization:req.get('authorization'),
+    callbackKey:process.env.LLTOUCH_CM_RECOVERY_CALLBACK_TOKEN,
+    ticketKey:process.env.LLTOUCH_CM_RECOVERY_TICKET_KEY,
+    qaEnabled:()=>process.env.LLTOUCH_CM_RECOVERY_CALLBACK_QA_ENABLED==='true'&&process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='true'&&!llCmRecoveryCallbackLiveEnabled(),
+    liveEnabled:llCmRecoveryCallbackLiveEnabled,
+    loadContext:async(t)=>{
+      const [campaign,lead,outbox,approval,message]=await Promise.all([
+        one('lltouch_campaigns','id,campaign_key,version,status,offer_starts_at,offer_ends_at,service_title',{id:t.campaign_id}),
+        one('lltouch_cm_leads','id,campaign_id,campaign_version,customer_name,contact_consent,sms_marketing_consent',{id:t.lead_id,campaign_id:t.campaign_id}),
+        one('lltouch_cm_lead_outbox','ghl_contact_id',{lead_id:t.lead_id}),
+        one('lltouch_cm_recovery_message_approvals','message_version_id,campaign_version',{campaign_id:t.campaign_id}),
+        one('lltouch_cm_recovery_message_versions','id,campaign_id,campaign_version,template_en',{id:t.message_version_id})]);
+      return {campaign,lead,outbox,approval,message};
+    },
+    audit:llCmRecoveryMappedAudit,
+    reserve:async(t)=>{
+      const {data,error}=await academySupabase.rpc('lltouch_cm_recovery_reserve_mapped_v1',{
+        p_lead:t.lead_id,p_campaign:t.campaign_id,p_version:t.campaign_version,p_message:t.message_version_id});
+      if(error)throw Error('RECOVERY_RESERVATION_UNAVAILABLE');return data;
+    }
+  });
+  return res.status(result.http).json(result.body);
+});
+// END CM FINAL04 RECOVERY AUTHORIZATION CANDIDATE
+
+
 
 app.use('/llmk/contracts', createLLMKContractsRouter());
 
