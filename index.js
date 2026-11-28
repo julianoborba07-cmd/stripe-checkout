@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
+import {createRecoverySeedWorker} from "./lltouch-cm-recovery-seed-v1.mjs";
 import {recoveryBase as llCmRecoveryBase,classifyMappedEvidence as llCmRecoveryEvidence,recoveryFinal as llCmRecoveryFinal} from "./lltouch-cm-recovery-v1.mjs";
 import { fileURLToPath as llCmWebflowFileURLToPath } from "node:url";
 import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
@@ -15523,6 +15524,32 @@ app.post('/lltouch/campaigns/admin/api/leads/recovery/mapped-audit/:key',LL_CM_0
   }catch(_e){return res.status(503).json({ok:false,readOnly:true,error:'RECOVERY_AUDIT_UNAVAILABLE',recoveryAuthorized:false,noSms:true,noWrites:true,personalDataReturned:false});}
 });
 // END LLTOUCH_CM_RECOVERY_MAPPED_CANDIDATE_V1
+
+// BEGIN CM MAPPED RECOVERY SEED WORKER — schedules blocked jobs only.
+const LL_CM_MAPPED_RECOVERY_SEED_RELEASED=false;
+const llCmMappedRecoverySeedEnabled=()=>LL_CM_MAPPED_RECOVERY_SEED_RELEASED &&
+  process.env.LLTOUCH_CM_MAPPED_RECOVERY_SEED_ENABLED==='true' &&
+  process.env.LLTOUCH_CM_GHL_EMERGENCY_STOP==='false' &&
+  process.env.LLTOUCH_CM_WEBFLOW_QA_ENABLED!=='true' &&
+  process.env.LLTOUCH_CM_03C11G_PRIVATE_QA_ENABLED!=='true';
+const llCmMappedRecoverySeedTick=createRecoverySeedWorker({
+  enabled:llCmMappedRecoverySeedEnabled,
+  listCampaigns:async()=>{
+    const {data,error}=await academySupabase.from('lltouch_campaigns')
+      .select('campaign_key,version,status,offer_starts_at,offer_ends_at,marketing').eq('status','published').limit(2);
+    if(error)throw Error('RECOVERY_SEED_READ_FAILED');return data;
+  },
+  seed:async(key,version)=>{
+    const {data,error}=await academySupabase.rpc('lltouch_cm_recovery_seed_mapped_v1',{p_key:key,p_version:version});
+    if(error)throw Error('RECOVERY_SEED_RPC_FAILED');return data;
+  }
+});
+if(llCmMappedRecoverySeedEnabled()){
+  const run=async()=>{const r=await llCmMappedRecoverySeedTick();if(r.status==='unavailable')console.error('Campaign Studio recovery seed unavailable');};
+  const interval=setInterval(()=>{void run();},60000);interval.unref?.();
+  const startup=setTimeout(()=>{void run();},15000);startup.unref?.();
+}
+// END CM MAPPED RECOVERY SEED WORKER
 
 app.use('/llmk/contracts', createLLMKContractsRouter());
 
