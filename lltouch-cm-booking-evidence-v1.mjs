@@ -38,3 +38,16 @@ export async function bookingLedgerEvidence({db,campaign,lead,holds,legacyBindin
     return classify(rows)||result('BOOKING_LEDGER_NO_MATCH_NOT_PROOF','unknown');
   }catch(_e){return result('BOOKING_LEDGER_EVIDENCE_UNAVAILABLE');}
 }
+// This verifies the Google calendar block associated with the SQL appointment.
+// Native Vagaro identity requires independent evidence.
+export function mappedGoogleBookingMatches(event,booking){
+  if(!event||!booking||!booking.id||!booking.google_event_id||!booking.stripe_session_id||!booking.service_id)
+    return false;
+  const details=event.extendedProperties?.private;
+  const start=Date.parse(booking.starts_at),end=Date.parse(booking.ends_at);
+  return Number.isFinite(start)&&Number.isFinite(end)&&end>start&&
+    event.id===booking.google_event_id&&event.status==='confirmed'&&event.transparency==='opaque'&&
+    details?.llTouchBooking==='1'&&details.llTouchBookingId===booking.id&&
+    details.stripeSessionId===booking.stripe_session_id&&details.serviceId===booking.service_id&&
+    Date.parse(event.start?.dateTime)===start&&Date.parse(event.end?.dateTime)===end;
+}

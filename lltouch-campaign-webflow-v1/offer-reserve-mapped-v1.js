@@ -15,8 +15,12 @@ function mappedReady(c){const p=c?.mappedOperationalPlan,o=c?.offer;
  Number.isSafeInteger(p.priceCents)&&Number.isSafeInteger(p.depositCents)&&p.depositCents>0&&p.priceCents>=p.depositCents&&
  p.priceCents===o?.priceCents&&p.depositCents===o?.depositCents&&p.balanceCents===p.priceCents-p.depositCents&&o.holdMinutes===10;
 }
-function mappedRead(c){try{const a=JSON.parse(sessionStorage.getItem(MAPPED_STORE)||'null');
- return a?.campaignKey===c?.campaignKey&&a.campaignVersion===c.campaignVersion&&mappedUuid(a.leadId)&&mappedUuid(a.clientNonce)?a:null;
+function mappedRead(c,sessionId){try{const archived=sessionId?sessionStorage.getItem(MAPPED_STORE+':'+sessionId):null;
+ const a=JSON.parse(archived??sessionStorage.getItem(MAPPED_STORE)??'null');
+ if(!a||!/^[a-z0-9][a-z0-9-]{3,95}$/.test(a.campaignKey||'')||
+    !Number.isSafeInteger(a.campaignVersion)||a.campaignVersion<1||!mappedUuid(a.leadId)||!mappedUuid(a.clientNonce))return null;
+ if(c&&(a.campaignKey!==c.campaignKey||a.campaignVersion!==c.campaignVersion))return null;
+ return a;
 }catch{return null}}
 function mappedSave(a){sessionStorage.setItem(MAPPED_STORE,JSON.stringify(a));}
 
@@ -85,12 +89,38 @@ function apply(c){cfg=c;const o=c.offer,terms=o.serviceTerms||{},pending=!c.book
  if(L)set('ll-provider-ludimilla',L.name);if(C)set('ll-provider-carol',C.name);
 }
 function showReceiptTitle(title,note){$('ll-receipt')?.classList.remove('hidden');set('ll-result-title',title);set('ll-result-message',note)}
-async function verifyReceipt(){const sessionId=query.get('session_id');if(!sessionId||!/^cs_(test|live)_[A-Za-z0-9]+$/.test(sessionId))return;
- showReceiptTitle('Verifying your payment…','Please do not pay again while your payment is being checked.');
- try{const r=await fetch(API+'/lltouch/campaigns/receipt?session_id='+encodeURIComponent(sessionId),{cache:'no-store'});
-  const x=await r.json();if(!r.ok||!x.ok)throw new Error(x.error||'Receipt not available');
-  showReceiptTitle(x.paid?'Payment received':'Awaiting payment verification',x.message||'Please contact LL Touch if you need help.');
- }catch{showReceiptTitle('We cannot verify this payment here','Please do not pay again. Contact LL Touch with your Stripe receipt.');}
+async function verifyReceipt(){
+ for(const id of ['ll-reserve-controls','ll-timerstrip','ll-availability-pending'])$(id)?.classList.add('hidden');
+ const sessionId=query.get('session_id');
+ const pending='Please do not pay again. Contact LL Touch with your Stripe receipt if you need help.';
+ showReceiptTitle('Checking your reservation',pending);
+ try{
+  if(query.has('session_id')&&!/^cs_live_[A-Za-z0-9_]{12,200}$/.test(sessionId||''))throw Error('Receipt unavailable');
+  const lead=mappedRead(null,sessionId);
+  if(!lead||!mappedHoldValid(lead.hold))throw Error('Receipt unavailable');
+  const x=await post('/lltouch/campaigns/mapped-receipt',{
+   campaignKey:lead.campaignKey,campaignVersion:lead.campaignVersion,leadId:lead.leadId,clientNonce:lead.clientNonce,
+   holdId:lead.hold.holdId,snapshotId:lead.hold.snapshotId,...(sessionId?{sessionId}:{})
+  });
+  if(x.appointmentConfirmed!==false||typeof x.paid!=='boolean'||typeof x.calendarVerified!=='boolean')throw Error('Receipt unverified');
+  if(x.status==='calendar-verified'&&x.paid&&x.calendarVerified){
+   showReceiptTitle('Deposit received. Calendar time blocked.','LL Touch will confirm your appointment details. Keep your Stripe receipt.');
+   return;
+  }
+  if(x.status==='review'){
+   showReceiptTitle(x.paid?'Deposit received. Booking needs review.':'Payment or reservation needs review',pending);
+   return;
+  }
+  if(x.status==='paid'&&x.paid){
+   showReceiptTitle('Deposit received','LL Touch is verifying your appointment. Keep your Stripe receipt.');
+   return;
+  }
+  if(x.status==='expired'&&!x.paid){
+   showReceiptTitle('Reservation window ended','Your time is no longer held. Contact LL Touch if the payment appears on your statement.');
+   return;
+  }
+  showReceiptTitle('Awaiting payment verification',pending);
+ }catch{showReceiptTitle('Payment status unavailable',pending);}
 }
 function getClaim(){try{return JSON.parse(sessionStorage.getItem(STORE)||'null')}catch{return null}}
 async function post(endpoint,payload,qa){const headers={'Content-Type':'application/json'};if(qa)headers['X-LL-CM-QA']=qa;const r=await fetch(API+endpoint,{method:'POST',headers,cache:'no-store',body:JSON.stringify(payload)});
@@ -244,28 +274,35 @@ async function mappedInit(c){if(preview||qaAuthorized||!mappedReady(c))return;
  mappedLead=mappedRead(c);if(!mappedLead){message('Please start with your contact details on the offer page.');return;}
  if(mappedLead.selection&&!mappedSelectionValid(mappedLead.selection)||mappedLead.hold&&!mappedHoldValid(mappedLead.hold)){mappedLead=null;message('We cannot verify your previous request. Please contact LL Touch before paying.');return;}
  $('ll-availability-pending').classList.add('hidden');$('ll-reserve-controls').classList.remove('hidden');$('ll-suggested-calendar').classList.remove('hidden');$('ll-booking-mode').classList.add('hidden');$('ll-preferred-calendar').classList.add('hidden');
- set('ll-person','Your contact information is securely linked to this request.');set('ll-reserve-lead','Choose a verified available time. Your deposit will count toward your treatment.');set('ll-reservation-label','Live calendar');set('ll-booking-explainer','A reservation window starts only after a verified time is selected. Appointment confirmation follows payment and calendar verification.');
+ set('ll-person','Your contact information is securely linked to this request.');set('ll-reserve-lead','Choose a verified available time. Your deposit will count toward your treatment.');set('ll-reservation-label','Live calendar');set('ll-booking-explainer','A reservation window starts after you select a verified time. LL Touch will confirm your appointment details after payment and booking verification.');
  const wrap=$('ll-dates');wrap.replaceChildren();const input=document.createElement('input');input.type='date';input.id='ll-mapped-date';input.className='field';input.min=mappedDay();input.max=mappedDay(27);input.value=mappedDay();const b=document.createElement('button');b.id='ll-mapped-check';b.className='btn alt small';b.type='button';b.textContent='Check times';wrap.append(input,b);b.onclick=()=>void mappedAvailability();input.onchange=()=>void mappedAvailability();
  provider='ludimilla';if(mappedLead.selection){const s=mappedLead.selection;provider=s.providerKey;date=s.date;time=s.time;input.value=s.date;set('ll-selection','Previous request: '+s.date+' · '+s.time+' Eastern. Resume the same request or contact LL Touch.');if(mappedLead.hold)mappedStartTimer();}
  for(const id of ['ll-provider-ludimilla','ll-provider-carol'])$(id).setAttribute('aria-pressed',String($(id).dataset.provider===provider));mappedUpdate();
  if(!mappedLead.selection)void mappedAvailability();
 }
-function mappedStartTimer(){if(!mappedHoldValid(mappedLead?.hold))return;clearInterval(countdown);$('ll-timerstrip').classList.remove('hidden');const tick=()=>{const n=Math.max(0,Math.floor((Date.parse(mappedLead.hold.expiresAt)-Date.now())/1000));set('ll-mm',String(Math.floor(n/60)).padStart(2,'0'));set('ll-ss',String(n%60).padStart(2,'0'));if(!n){clearInterval(countdown);message('The reservation window ended. Do not make another payment. Contact LL Touch if payment was attempted.');}mappedUpdate();};tick();countdown=setInterval(tick,1000);}
+function mappedStartTimer(){if(!mappedHoldValid(mappedLead?.hold))return;clearInterval(countdown);$('ll-timerstrip').classList.remove('hidden');const tick=()=>{const n=Math.max(0,Math.ceil((Date.parse(mappedLead.hold.expiresAt)-Date.now())/1000));set('ll-mm',String(Math.floor(n/60)).padStart(2,'0'));set('ll-ss',String(n%60).padStart(2,'0'));if(!n){clearInterval(countdown);message('The reservation window ended. Do not make another payment. Contact LL Touch if payment was attempted.');}mappedUpdate();};countdown=setInterval(tick,1000);tick();}
 async function mappedCheckout(){mappedUpdate();if(!mappedLead||$('ll-pay').disabled)return;mappedBusy=true;mappedUpdate();message('Securing your selected time…');
  try{const a=mappedLead;if(!a.selection){a.selection={providerKey:provider,date,time};mappedSave(a);}const identity={campaignKey:a.campaignKey,campaignVersion:a.campaignVersion,leadId:a.leadId,clientNonce:a.clientNonce};
- if(!a.hold){const h=await post('/lltouch/campaigns/mapped-reservation',{...identity,...a.selection});if(!mappedHoldValid(h)||h.bookingReady!==false||h.checkoutReady!==false)throw Error('Reservation response not verified');a.hold={holdId:h.holdId,snapshotId:h.snapshotId,expiresAt:h.expiresAt};mappedSave(a);mappedStartTimer();}
+ if(!a.hold){const h=await post('/lltouch/campaigns/mapped-reservation',{...identity,...a.selection});if(!mappedHoldValid(h)||h.bookingReady!==false||h.checkoutReady!==true)throw Error('Reservation response not verified');a.hold={holdId:h.holdId,snapshotId:h.snapshotId,expiresAt:h.expiresAt};mappedSave(a);mappedStartTimer();}
  if(Date.parse(a.hold.expiresAt)<=Date.now())throw Error('Reservation expired');
- const x=await post('/lltouch/campaigns/mapped-checkout',{...identity,holdId:a.hold.holdId,snapshotId:a.hold.snapshotId});const url=new URL(x.url);if(x.bookingReady!==false||url.protocol!=='https:'||url.hostname!=='checkout.stripe.com'||url.username||url.password||url.port)throw Error('Checkout response not verified');
- // Save identifiers before navigation. A later receipt must be verified by the server.
- a.checkoutOpened=true;mappedSave(a);location.assign(url.href);return;
- }catch{message('We could not verify this request. Retry the same request only, or contact LL Touch before paying again.');}finally{mappedBusy=false;mappedUpdate();}
+ const x=await post('/lltouch/campaigns/mapped-checkout',{...identity,holdId:a.hold.holdId,snapshotId:a.hold.snapshotId});const url=new URL(x.url);
+ if(x.bookingReady!==false||!/^cs_live_[A-Za-z0-9_]{12,200}$/.test(x.sessionId||'')||
+   Date.parse(x.expiresAt)!==Date.parse(a.hold.expiresAt)||url.protocol!=='https:'||url.hostname!=='checkout.stripe.com'||url.username||url.password||url.port)throw Error('Checkout response not verified');
+ // Retain the exact checkout proof if a newer campaign later replaces the current reservation.
+ sessionStorage.setItem(MAPPED_STORE+':'+x.sessionId,JSON.stringify({...identity,hold:a.hold}));
+ location.assign(url.href);return;
+ }catch(error){
+  if(!mappedLead.hold&&['CM_MAPPED_SLOT_UNAVAILABLE','CM_MAPPED_SLOT_CONFLICT'].includes(error.message)){
+   delete mappedLead.selection;mappedSave(mappedLead);time='';mappedSlots=[];
+   $('ll-times').replaceChildren();set('ll-selection','');
+   message('This time is unavailable. Check available times and choose another.');
+  }else message('We could not verify this request. Retry the same request only, or contact LL Touch before paying again.');
+ }finally{mappedBusy=false;mappedUpdate();}
 }
 
-async function main(){try{const raw=await load();const c=raw?await qaAuthorize(raw):null;if(!c){empty('none');if(query.has('session_id')||query.has('cancelled'))showReceiptTitle('Verification pending','Please do not make another payment. Contact LL Touch with your Stripe receipt.');return}apply(c);
- if(query.has('session_id')||query.has('cancelled')){
-   $('ll-reserve-controls').classList.add('hidden');$('ll-timerstrip').classList.add('hidden');
-   showReceiptTitle('Payment or reservation verification pending','Please do not make another payment. Contact LL Touch with your Stripe receipt if payment was attempted.');return;
- }
+async function main(){try{
+ if(!preview&&(query.has('session_id')||query.has('cancelled'))){await verifyReceipt();return;}
+ const raw=await load();const c=raw?await qaAuthorize(raw):null;if(!c){empty('none');return}apply(c);
  if(!preview&&!qaAuthorized&&!qaToken&&mappedReady(c)){await mappedInit(c);return;}
  await initializeContactPilot(c);if(!c.mappedOperationalPlan)await initializeBooking(c);
  }catch(e){if(!cfg)empty('error');else message(e.message||'Could not verify booking at this time.')}}

@@ -141,7 +141,8 @@ set('ll-hold-explainer',pending?'Online reservations are not enabled yet.':
 set('ll-primary-action',pending?'View the offer':'Claim the offer');
 set('ll-nav-action',pending?'View the offer':'Claim offer');
 if(!preview&&!qaAuthorized&&!qaToken&&mappedReady(c)){
- set('ll-claim-description','Share your details to continue to verified appointment times.');set('ll-start','Continue to available dates');set('ll-deal-note','No deposit is collected on this page.');
+ set('ll-claim-description','Share your details to check appointment times for this offer.');
+ set('ll-start','Check availability');set('ll-deal-note','Choose a time before continuing to the deposit.');
 }
 const consentText=$('ll-sms-offer-name');if(consentText)consentText.textContent='LL Touch services';
 }
