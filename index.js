@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
+import {recoveryBase as llCmRecoveryBase,classifyMappedEvidence as llCmRecoveryEvidence,recoveryFinal as llCmRecoveryFinal} from "./lltouch-cm-recovery-v1.mjs";
 import { fileURLToPath as llCmWebflowFileURLToPath } from "node:url";
 import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
 
@@ -15475,6 +15476,54 @@ app.get('/lltouch/campaigns/admin/api/leads/ghl-effect-readiness/:key',
 
 // LLMK AUTOMATED CONTRACTS / QA v2 - isolated routes; no Stripe/Vagaro changes.
 // Preview only until independent security, signature and legal sign-off.
+// BEGIN LLTOUCH_CM_RECOVERY_MAPPED_CANDIDATE_V1 — private read-only audit. No dispatch.
+async function llCmRecoveryMappedAudit(c,leadId){
+  const one=async(table,columns,filters)=>{let q=academySupabase.from(table).select(columns);for(const [k,v] of Object.entries(filters))q=q.eq(k,v);const {data,error}=await q.maybeSingle();if(error)throw Error('RECOVERY_READ_FAILED');return data;};
+  const many=async(table,columns,filters)=>{let q=academySupabase.from(table).select(columns);for(const [k,v] of Object.entries(filters))q=q.eq(k,v);const {data,error}=await q.limit(21);if(error||!Array.isArray(data)||data.length>20)throw Error('RECOVERY_EVIDENCE_UNAVAILABLE');return data;};
+  const [l,s,j,o,a,attempt]=await Promise.all([
+    one('lltouch_cm_leads','id,campaign_id,campaign_key,campaign_version,created_at,contact_consent,sms_marketing_consent,customer_email,customer_phone',{id:leadId,campaign_id:c.id}),
+    one('lltouch_cm_lead_capture_settings','campaign_id,campaign_key,campaign_version,enabled',{campaign_id:c.id}),
+    one('lltouch_cm_recovery_jobs','lead_id,campaign_id,campaign_key,campaign_version,state,due_at',{lead_id:leadId}),
+    one('lltouch_cm_lead_outbox','lead_id,campaign_key,state,external_step,reconciliation_required,ghl_contact_id',{lead_id:leadId}),
+    one('lltouch_cm_recovery_message_approvals','campaign_id,campaign_version,message_version_id',{campaign_id:c.id}),
+    one('lltouch_cm_recovery_delivery_attempts','lead_id',{lead_id:leadId})]);
+  const m=a?await one('lltouch_cm_recovery_message_versions','id,campaign_id,campaign_key,campaign_version,template_en',{id:a.message_version_id}):null;
+  const base=llCmRecoveryBase({campaign:c,lead:l,setting:s,job:j,outbox:o,approval:a,message:m,attempt});
+  if(base.status!=='inspect')return base;
+  const [holds,legacyBindings]=await Promise.all([
+    many('lltouch_cm_universal_holds','*',{campaign_id:c.id,'quote_snapshot->>leadId':leadId}),
+    many('lltouch_cm_lead_stripe_sessions','stripe_session_id',{lead_id:leadId})]);
+  let payment=llCmRecoveryEvidence({holds,legacyBindings,verdicts:[]});
+  if(payment.reason!=='PAYMENT_UNKNOWN_OR_IN_PROGRESS'||holds.some(h=>h.state!=='expired'||!h.stripe_session_id))return payment;
+  const verdicts=[];
+  for(const h of holds){
+    const snapshot=await one('lltouch_cm_universal_checkout_snapshots','*',{hold_id:h.id});
+    const issue=await one('lltouch_cm_mapped_issue_v1','snapshot_id,hold_id,session_id,state',{hold_id:h.id});
+    if(!snapshot||!issue||issue.snapshot_id!==snapshot.id||issue.session_id!==h.stripe_session_id||issue.state!=='expired'||snapshot.immutable_terms?.leadId!==leadId||h.quote_snapshot?.mode!=='mapped-service-v1'||h.campaign_version!==c.version||snapshot.campaign_id!==c.id||snapshot.campaign_version!==c.version||!/^cs_live_[A-Za-z0-9_]{12,200}$/.test(h.stripe_session_id))throw Error('RECOVERY_BINDING_INVALID');
+    const session=await stripe.checkout.sessions.retrieve(h.stripe_session_id);
+    if(session?.id!==h.stripe_session_id)throw Error('RECOVERY_SESSION_MISMATCH');
+    const intent=typeof session.payment_intent==='string'?await stripe.paymentIntents.retrieve(session.payment_intent,{expand:['latest_charge']}):null;
+    if(session.payment_intent!==null&&!intent)throw Error('RECOVERY_INTENT_UNKNOWN');
+    verdicts.push(llCmMappedReconcileCheckoutContract({snapshot,hold:h,session,paymentIntent:intent,expectedLiveMode:true}));
+  }
+  payment=llCmRecoveryEvidence({holds,legacyBindings,verdicts});
+  if(payment.status!=='mapped_closed_unpaid_only')return payment;
+  const dnd=await llCm3C11PFreshGhlSmsDnd({contactId:o.ghl_contact_id,leadEmail:l.customer_email,leadPhone:l.customer_phone});
+  return llCmRecoveryFinal({payment,dnd});
+}
+app.post('/lltouch/campaigns/admin/api/leads/recovery/mapped-audit/:key',LL_CM_03C11PC_RATE,llCmAdminAuth,async(req,res)=>{
+  res.set('Cache-Control','private,no-store');res.set('Referrer-Policy','no-referrer');
+  const key=String(req.params.key||''),b=req.body||{};
+  if(!LL_CM_DISPLAY_KEY.test(key)||!llCmAdminSameOrigin(req)||!llCm3C4Body(req)||Object.keys(b).some(k=>!['leadId','expectedVersion'].includes(k))||!LL_CM_03C4_UUID.test(b.leadId||'')||!Number.isSafeInteger(b.expectedVersion)||b.expectedVersion<1)return res.status(422).json({ok:false,error:'RECOVERY_AUDIT_INPUT_INVALID',recoveryAuthorized:false});
+  try{
+    const {data:c,error}=await academySupabase.from('lltouch_campaigns').select('id,campaign_key,version,status,offer_starts_at,offer_ends_at').eq('campaign_key',key).maybeSingle();
+    if(error||!c||c.version!==b.expectedVersion)return res.status(409).json({ok:false,error:'CAMPAIGN_VERSION_UNAVAILABLE',recoveryAuthorized:false});
+    const audit=await llCmRecoveryMappedAudit(c,b.leadId);
+    return res.json({ok:true,readOnly:true,...audit,recoveryAuthorized:false,noSms:true,noWrites:true,personalDataReturned:false});
+  }catch(_e){return res.status(503).json({ok:false,readOnly:true,error:'RECOVERY_AUDIT_UNAVAILABLE',recoveryAuthorized:false,noSms:true,noWrites:true,personalDataReturned:false});}
+});
+// END LLTOUCH_CM_RECOVERY_MAPPED_CANDIDATE_V1
+
 app.use('/llmk/contracts', createLLMKContractsRouter());
 
 // ==============================
