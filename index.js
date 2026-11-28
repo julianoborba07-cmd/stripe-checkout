@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
+import { fileURLToPath as llCmWebflowFileURLToPath } from "node:url";
 import { createLLMKContractsRouter } from "./llmk-contracts/router.js";
 
 dotenv.config();
@@ -5201,6 +5202,16 @@ function llCmBookingReuseContract(c){
 // A campaign must be published and inside its Massachusetts validity window.
 // The independent legacy /lltouch/offer/* flow is deliberately NOT modified.
 // ============================================================================
+// LLTOUCH_WEBFLOW_MAPPED_ASSETS_V1 — immutable public JS files, no PII or configuration secrets.
+for(const name of ['offer','offer-reserve']){
+  app.get('/lltouch/campaigns/assets/'+name+'-mapped-v1.js',(_req,res)=>{
+    res.set('Cache-Control','no-cache');
+    res.set('X-Content-Type-Options','nosniff');
+    res.type('application/javascript');
+    return res.sendFile(llCmWebflowFileURLToPath(new URL('./lltouch-campaign-webflow-v1/'+name+'-mapped-v1.js',import.meta.url)));
+  });
+}
+
 app.get('/lltouch/campaigns/active-page',checkoutLimiter,async(_req,res)=>{
   res.set('Cache-Control','no-store, max-age=0');
   res.set('X-Robots-Tag','noindex, nofollow');
